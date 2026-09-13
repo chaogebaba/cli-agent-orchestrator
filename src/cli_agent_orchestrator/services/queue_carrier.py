@@ -36,6 +36,7 @@ from cli_agent_orchestrator.core.delivery import (
     AttemptOutcome,
     InjectionResult,
     LegacyAdoption,
+    PersistentEnqueueRejection,
     ReceiverResolution,
     WakeEmission,
 )
@@ -54,6 +55,7 @@ __all__ = [
     "write_through_enqueue",
     "NativeSeatCarrier",
     "PaneWorkerInjector",
+    "PersistentEnqueueRejection",
     "queue_owns_delivery",
     "queue_owns_receiver_delivery",
 ]
@@ -169,7 +171,11 @@ def adopt_enqueue(fact: Any) -> str | None:
         from cli_agent_orchestrator.app.delivery.wiring import adopt_legacy_row
 
         return adopt_legacy_row(fact)
-    except Exception:  # noqa: BLE001 — the net may never break the tick
+    except PersistentEnqueueRejection:
+        # The scanner owns durable quarantine and operator diagnostics.  This is
+        # the sole exception allowed through the legacy/new-tree bridge.
+        raise
+    except Exception:  # noqa: BLE001 — retryable failure may never break the tick
         logger.debug("wp_arch adopt_legacy_row unavailable", exc_info=True)
         return None
 

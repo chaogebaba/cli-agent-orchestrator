@@ -451,7 +451,9 @@ class QueueStore(Protocol):
         the row already stored rather than a second row or an error, so a
         retried caller sees the same outcome it saw the first time.  A repeat
         carrying a DIFFERENT payload digest is a genuine conflict and raises,
-        because that is a caller reusing one key for two messages.
+        because that is a caller reusing one key for two messages.  A durable,
+        row-specific store refusal raises ``PersistentEnqueueRejection``;
+        availability and contention retain their native, retryable failures.
         """
         ...
 

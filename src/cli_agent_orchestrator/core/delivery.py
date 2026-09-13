@@ -55,6 +55,7 @@ __all__ = [
     "MsgKind",
     "MsgState",
     "NON_DELIVERY_OUTCOMES",
+    "PersistentEnqueueRejection",
     "QueueMessage",
     "QueueMode",
     "ReceiverResolution",
@@ -81,6 +82,17 @@ __all__ = [
     "resolve_wake_sender",
     "spends_attempt",
 ]
+
+
+class PersistentEnqueueRejection(RuntimeError):
+    """The store rejected this enqueue for a durable, row-specific reason.
+
+    This is deliberately narrower than an arbitrary store exception.  A caller
+    may quarantine the offending input and let later work progress, while
+    availability failures and otherwise-unclassified exceptions remain
+    retryable.  The message must preserve the adapter's concrete reason because
+    an operator needs it before resetting that quarantine.
+    """
 
 
 class QueueMode(StrEnum):

@@ -555,6 +555,129 @@ def test_a_poison_row_does_not_starve_the_rows_behind_it(env) -> None:
     assert len(carrier.writes) == 1
 
 
+def test_a_persistent_sqlite_rejection_is_bounded_and_operator_recoverable(
+    env, monkeypatch, caplog
+) -> None:
+    """A real store rejection crosses both wrappers without retiring the row.
+
+    The trigger is row-specific and persistent rather than a mock of either
+    production wrapper.  With a scan window of ONE, the rejected lowest id must
+    be quarantined after one attempt, the healthy row behind it must progress,
+    and removing the fault must not silently erase the operator-visible state.
+    The explicit reset retries and delivers the still-durable PENDING row.
+    """
+    import logging
+
+    from cli_agent_orchestrator.app.delivery import tick as tick_mod
+    from cli_agent_orchestrator.clients import database as dbmod
+
+    sessions, store, tick, carrier, _injector, _findings = env
+    with sessions.begin() as db:
+        _receiver(db, terminal_id=SEAT, mailbox_id=SEAT_MAILBOX, role="supervisor")
+        poison = _legacy_row(db, receiver=SEAT, mailbox_id=SEAT_MAILBOX, message="POISON_ENQUEUE")
+        poison_id = int(poison.id)
+        good = _legacy_row(
+            db, receiver=SEAT, mailbox_id=SEAT_MAILBOX, message="BEHIND_SQLITE_POISON"
+        )
+        good_id = int(good.id)
+        assert poison_id < good_id
+
+    conn = store._pool.connection()  # noqa: SLF001 — the trigger IS the production fault
+    conn.execute(
+        "CREATE TRIGGER test_adoption_poison BEFORE INSERT ON delivery_msg "
+        "WHEN NEW.payload = 'POISON_ENQUEUE' BEGIN "
+        "SELECT RAISE(ABORT, 'row-specific persistent enqueue fault'); END"
+    )
+    monkeypatch.setattr(tick_mod, "ADOPT_LIMIT", 1)
+
+    with caplog.at_level(logging.WARNING):
+        first = tick.run_once()
+        second = tick.run_once()
+        conn.execute("DROP TRIGGER test_adoption_poison")
+        removed_but_not_reset = tick.run_once()
+
+    assert first.adopted == ()
+    assert [item.legacy_message_id for item in second.adopted] == [good_id]
+    assert removed_but_not_reset.adopted == ()
+    assert _status(sessions, poison_id) == MessageStatus.PENDING.value
+    assert _status(sessions, good_id) == MessageStatus.ADOPTED.value
+    assert poison_id in dbmod._ADOPTION_POISON_IDS
+    persistent_warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "wp_arch adoption persistently rejected legacy row" in record.getMessage()
+    ]
+    assert len(persistent_warnings) == 1, "a quarantined row was retried without reset"
+    assert str(poison_id) in persistent_warnings[0]
+    assert "row-specific persistent enqueue fault" in persistent_warnings[0]
+
+    dbmod.reset_adoption_poison_ids()
+    recovered = tick.run_once()
+
+    assert [item.legacy_message_id for item in recovered.adopted] == [poison_id]
+    assert _status(sessions, poison_id) == MessageStatus.ADOPTED.value
+    assert store.count() == 2
+    assert len(carrier.writes) == 2, "the successful control was lost or duplicated"
+
+
+def test_sqlite_busy_is_retryable_and_does_not_enter_the_poison_set(env) -> None:
+    """Writer contention is availability, not a durable property of the row."""
+    import sqlite3
+
+    from cli_agent_orchestrator.clients import database as dbmod
+
+    sessions, store, _tick, _carrier, _injector, _findings = env
+    with sessions.begin() as db:
+        _receiver(db, terminal_id=SEAT, mailbox_id=SEAT_MAILBOX, role="supervisor")
+        row = _legacy_row(db, receiver=SEAT, mailbox_id=SEAT_MAILBOX, message="RETRY_BUSY")
+        row_id = int(row.id)
+
+    queue_conn = store._pool.connection()  # noqa: SLF001 — configure the tested wait path
+    queue_conn.execute("PRAGMA busy_timeout=0")
+    blocker = sqlite3.connect(str(store._pool.db_path), isolation_level=None)  # noqa: SLF001
+    blocker.execute("PRAGMA busy_timeout=0")
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        first = dbmod.adopt_orphaned_legacy_rows(limit=1)
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+
+    assert first == []
+    assert row_id not in dbmod._ADOPTION_POISON_IDS
+    assert _status(sessions, row_id) == MessageStatus.PENDING.value
+
+    recovered = dbmod.adopt_orphaned_legacy_rows(limit=1)
+    assert [legacy_id for legacy_id, _msg_id, _receiver_id in recovered] == [row_id]
+    assert _status(sessions, row_id) == MessageStatus.ADOPTED.value
+
+
+def test_unclassified_enqueue_failure_is_retryable(env, monkeypatch) -> None:
+    """Unknown exceptions do not acquire permanent poison meaning by accident."""
+    from cli_agent_orchestrator.clients import database as dbmod
+
+    sessions, store, _tick, _carrier, _injector, _findings = env
+    with sessions.begin() as db:
+        _receiver(db, terminal_id=SEAT, mailbox_id=SEAT_MAILBOX, role="supervisor")
+        row = _legacy_row(db, receiver=SEAT, mailbox_id=SEAT_MAILBOX, message="RETRY_UNKNOWN")
+        row_id = int(row.id)
+
+    real_enqueue = store.enqueue
+
+    def _unknown(_draft):
+        raise ValueError("unclassified test failure")
+
+    monkeypatch.setattr(store, "enqueue", _unknown)
+    assert dbmod.adopt_orphaned_legacy_rows(limit=1) == []
+    assert row_id not in dbmod._ADOPTION_POISON_IDS
+    assert _status(sessions, row_id) == MessageStatus.PENDING.value
+
+    monkeypatch.setattr(store, "enqueue", real_enqueue)
+    recovered = dbmod.adopt_orphaned_legacy_rows(limit=1)
+    assert [legacy_id for legacy_id, _msg_id, _receiver_id in recovered] == [row_id]
+    assert _status(sessions, row_id) == MessageStatus.ADOPTED.value
+
+
 # -- r2 N3: the receiver that no longer exists -------------------------------
 
 

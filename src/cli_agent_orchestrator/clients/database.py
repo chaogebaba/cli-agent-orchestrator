@@ -11143,8 +11143,8 @@ def _pending_receiver_predicate(receiver_id: str, mailbox_schema: bool):
 #: WP-ARCH 3c r2 N2: without this, the scan takes the first ``limit`` PENDING
 #: rows by id ASC and leaves an un-adoptable one PENDING, so it reoccupies a slot
 #: on every tick FOREVER -- and ``limit`` of them starve everything behind them.
-#: The two ways in are a row with no resolvable receiver and an enqueue that
-#: keeps raising for that one row. Both are unlikely; neither may be able to
+#: The two ways in are a row with no resolvable receiver and a typed persistent
+#: enqueue rejection for that one row. Both are unlikely; neither may be able to
 #: block the queue, and neither may be silent.
 _ADOPTION_POISON_IDS: set[int] = set()
 
@@ -11193,11 +11193,13 @@ def adopt_orphaned_legacy_rows(limit: int = 64) -> list[tuple[int, str, str]]:
     scan takes the first ``limit`` PENDING ids ascending, so a row that fails
     every pass would reoccupy a slot indefinitely and ``limit`` of them would
     starve everything behind. A row whose receiver cannot be named, or whose
-    enqueue raises, is recorded in ``_ADOPTION_POISON_IDS`` and excluded from
-    later scans, with a WARNING naming the id -- a stuck row must reach the
-    journal rather than fail at debug level. A failed RETIRE is NOT skipped: its
-    enqueue succeeded, so the queue already carries the message and retrying the
-    retire is both correct and idempotent.
+    enqueue is persistently rejected, is recorded in ``_ADOPTION_POISON_IDS``
+    and excluded from later scans, with a WARNING naming the id and the concrete
+    reason -- a stuck row must reach the journal rather than fail at debug level.
+    Availability, SQLite contention and unclassified failures are retryable and
+    do not enter that set. A failed RETIRE is NOT skipped: its enqueue succeeded,
+    so the queue already carries the message and retrying the retire is both
+    correct and idempotent.
 
     **HELD rows are deliberately out of scope.** A barrier member is not owed to
     anyone yet; it becomes PENDING when its barrier completes, and the tick after
@@ -11206,6 +11208,7 @@ def adopt_orphaned_legacy_rows(limit: int = 64) -> list[tuple[int, str, str]]:
     adopted: list[tuple[int, str, str]] = []
     try:
         from cli_agent_orchestrator.services.queue_carrier import (
+            PersistentEnqueueRejection,
             adopt_enqueue,
             legacy_enqueue_fact,
         )
@@ -11283,12 +11286,22 @@ def adopt_orphaned_legacy_rows(limit: int = 64) -> list[tuple[int, str, str]]:
                     supersede_key=supersede_key,
                 )
             )
-        except Exception:  # noqa: BLE001 -- one bad row must not stop the pass
+        except PersistentEnqueueRejection as exc:
             _ADOPTION_POISON_IDS.add(legacy_id)
             logger.warning(
-                "wp_arch adoption enqueue raised for legacy row %s; skipping it on "
+                "wp_arch adoption persistently rejected legacy row %s: %s; skipping it on "
                 "later passes so it cannot hold the scan window. The row stays "
-                "PENDING and uncarried -- this needs an operator.",
+                "PENDING and uncarried -- fix the cause, then reset the adoption "
+                "poison ids to retry.",
+                legacy_id,
+                exc,
+                exc_info=True,
+            )
+            continue
+        except Exception:  # noqa: BLE001 -- an unknown failure remains retryable
+            logger.warning(
+                "wp_arch adoption enqueue failed transiently for legacy row %s; "
+                "it stays PENDING and eligible for the next pass",
                 legacy_id,
                 exc_info=True,
             )

@@ -54,6 +54,7 @@ from cli_agent_orchestrator.core.delivery import (
     EnqueueDraft,
     MsgKind,
     MsgState,
+    PersistentEnqueueRejection,
     QueueMessage,
     QueueMode,
     ReclaimResult,
@@ -74,7 +75,7 @@ from cli_agent_orchestrator.core.timing import (
 __all__ = ["IdempotencyConflict", "SqliteQueueStore"]
 
 
-class IdempotencyConflict(RuntimeError):
+class IdempotencyConflict(PersistentEnqueueRejection):
     """One idempotency key, two different payloads.
 
     A replay must return the existing message; a CHANGED body under the same key
@@ -133,53 +134,58 @@ class SqliteQueueStore:
         digest = _payload_digest(draft.payload)
         conn = self._pool.connection()
 
-        with immediate_transaction(conn):
-            conn.execute(
-                f"INSERT INTO delivery_msg ({_MSG_COLUMNS}) VALUES "
-                "(" + ", ".join(["?"] * 29) + ") "
-                "ON CONFLICT(idempotency_key) DO NOTHING",
-                (
-                    new_ulid(),
-                    draft.idempotency_key,
-                    digest,
-                    draft.receiver_id,
-                    draft.sender_id,
-                    draft.kind.value,
-                    draft.payload,
-                    MsgState.READY.value,
-                    draft.mode.value,
-                    0,
-                    None,
-                    None,
-                    0,
-                    draft.max_attempts,
-                    render_timestamp(now),
-                    render_timestamp(
-                        compute_dead_by(
-                            created_at=now,
-                            available_at=now,
-                            expire_after_s=draft.expire_after_s,
-                        )
+        try:
+            with immediate_transaction(conn):
+                conn.execute(
+                    f"INSERT INTO delivery_msg ({_MSG_COLUMNS}) VALUES "
+                    "(" + ", ".join(["?"] * 29) + ") "
+                    "ON CONFLICT(idempotency_key) DO NOTHING",
+                    (
+                        new_ulid(),
+                        draft.idempotency_key,
+                        digest,
+                        draft.receiver_id,
+                        draft.sender_id,
+                        draft.kind.value,
+                        draft.payload,
+                        MsgState.READY.value,
+                        draft.mode.value,
+                        0,
+                        None,
+                        None,
+                        0,
+                        draft.max_attempts,
+                        render_timestamp(now),
+                        render_timestamp(
+                            compute_dead_by(
+                                created_at=now,
+                                available_at=now,
+                                expire_after_s=draft.expire_after_s,
+                            )
+                        ),
+                        None,
+                        draft.expire_after_s,
+                        draft.supersede_key,
+                        draft.content_hash,
+                        int(draft.park_warm),
+                        draft.barrier_id,
+                        draft.barrier_member_key,
+                        draft.enqueue_generation,
+                        int(draft.cancel_on_complete),
+                        int(draft.is_notice),
+                        draft.legacy_message_id,
+                        render_timestamp(now),
+                        None,
                     ),
-                    None,
-                    draft.expire_after_s,
-                    draft.supersede_key,
-                    draft.content_hash,
-                    int(draft.park_warm),
-                    draft.barrier_id,
-                    draft.barrier_member_key,
-                    draft.enqueue_generation,
-                    int(draft.cancel_on_complete),
-                    int(draft.is_notice),
-                    draft.legacy_message_id,
-                    render_timestamp(now),
-                    None,
-                ),
-            )
-            row = conn.execute(
-                f"SELECT {_MSG_COLUMNS} FROM delivery_msg WHERE idempotency_key = ?",
-                (draft.idempotency_key,),
-            ).fetchone()
+                )
+                row = conn.execute(
+                    f"SELECT {_MSG_COLUMNS} FROM delivery_msg WHERE idempotency_key = ?",
+                    (draft.idempotency_key,),
+                ).fetchone()
+        except sqlite3.IntegrityError as exc:
+            raise PersistentEnqueueRejection(
+                f"SQLite rejected enqueue for key {draft.idempotency_key!r}: {exc}"
+            ) from exc
 
         if row is None:  # pragma: no cover — the insert either wrote or conflicted
             raise RuntimeError(f"delivery_msg row vanished for key {draft.idempotency_key!r}")

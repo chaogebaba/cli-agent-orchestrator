@@ -23,8 +23,10 @@ nothing for a second position to mean.  What used to be "is the resolved positio
 check was already asking.
 
 **A queue write never breaks the send it serves.**  §7a states it directly: the
-enqueue call sits behind the switch and does not raise into its caller.  Every
-function here swallows ``Exception`` and returns.  The stake is higher than
+enqueue call sits behind the switch and does not raise into its caller.  New
+message write-through swallows ``Exception`` and returns.  Adoption additionally
+propagates the store's explicit persistent-rejection type to its bounded scanner;
+availability and unclassified failures still return ``None``.  The stake is higher than
 phase 1's, because what is at risk is message delivery: a write that could raise
 into ``_create_inbox_message_unfenced`` would turn a queue fault into lost
 messages, which is the failure class the whole phase exists to remove.
@@ -42,7 +44,12 @@ import threading
 from dataclasses import dataclass
 
 from cli_agent_orchestrator.app.delivery.facts import LegacyEnqueue
-from cli_agent_orchestrator.core.delivery import EnqueueDraft, MsgKind, QueueMode
+from cli_agent_orchestrator.core.delivery import (
+    EnqueueDraft,
+    MsgKind,
+    PersistentEnqueueRejection,
+    QueueMode,
+)
 from cli_agent_orchestrator.core.ports import Clock, QueueStore
 from cli_agent_orchestrator.core.timing import DELIVERY_DEDUP_WINDOW_S
 
@@ -225,8 +232,10 @@ def adopt_legacy_row(fact: LegacyEnqueue) -> str | None:
       has no counterpart yet, and "suppressing" it would drop the only copy —
       the exact loss adoption exists to prevent.
 
-    Never raises into the caller: an adoption that cannot be written returns
-    ``None``, the legacy row stays PENDING, and the next tick tries again.
+    An unavailable or transient adoption returns ``None`` so the legacy row
+    stays PENDING and the next tick tries again.  Only a typed, row-specific
+    :class:`PersistentEnqueueRejection` escapes so the scanner can quarantine
+    that id without letting it starve healthy rows.
     """
     runtime = _runtime
     if runtime is None:
@@ -251,7 +260,14 @@ def adopt_legacy_row(fact: LegacyEnqueue) -> str | None:
             )
         )
         return message.msg_id
-    except Exception:  # noqa: BLE001 — the net may never break the tick
+    except PersistentEnqueueRejection:
+        logger.warning(
+            "delivery adoption persistently rejected legacy row %s",
+            fact.legacy_message_id,
+            exc_info=True,
+        )
+        raise
+    except Exception:  # noqa: BLE001 — retryable failure may never break the tick
         logger.warning(
             "delivery adoption failed for legacy row %s; it stays pending for the next tick",
             fact.legacy_message_id,
