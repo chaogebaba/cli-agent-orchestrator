@@ -6,8 +6,8 @@ supports the three R2 run shapes:
     plain       — a plain findings prompt, no attachment.
     attach      — a prompt PLUS a ~text-file attachment via input#upload-files;
                   the answer must quote the attached bytes.
-    findings    — the design_findings position's real shape: the F862 blueprint
-                  uploaded as context + a findings prompt -> parsed findings.
+    findings    — an explicitly supplied text bundle uploaded as context plus
+                  a findings prompt -> parsed findings. Requires attach_path.
 
 Usage:
     uv run python -m cli_agent_orchestrator.chatgpt_web_runner.live_spike \
@@ -41,7 +41,6 @@ from cli_agent_orchestrator.chatgpt_web_runner.snapshot_upload import sha256_byt
 from cli_agent_orchestrator.chatgpt_web_runner.submit_ids import new_run_id
 
 _SCRATCH = Path("/data/cao-scratch/worker-scratch/f862-build")
-_SCRATCH.mkdir(parents=True, exist_ok=True)
 
 # A tiny snippet for the plain run.
 _PLAIN_SNIPPET = "def add(a, b):\n    return a - b   # BUG: subtracts instead of adds\n"
@@ -130,15 +129,15 @@ async def _run(mode: str, attach_path: Optional[str]) -> RunnerOutcome:
         canary = "CANARY-f862r2-50k"
         prompt = _attach_prompt(run_id, bundle_sha, canary)
     elif mode == "findings":
-        src = Path(
-            attach_path
-            or "/home/chao/VScode_projects/cli-subagents/orchestrator/blueprints/f862-chatgpt-web-findings-lane.md"
-        )
+        if not attach_path:
+            raise ValueError("findings mode requires an explicit attach_path")
+        src = Path(attach_path)
         # The design_findings bundle is a curated TEXT bundle (D8: one text
         # file). Upload it as .txt — that is the file type the upload-probe
         # calibrated the two readiness signals against (a .md chip shows no
         # "Document" label; the label is file-type dependent — F862 r2 finding).
-        bundle_txt = _SCRATCH / "f862-blueprint-bundle.txt"
+        _SCRATCH.mkdir(parents=True, exist_ok=True)
+        bundle_txt = _SCRATCH / "f862-context-bundle.txt"
         bundle_txt.write_bytes(src.read_bytes())
         attach = bundle_txt
         data = attach.read_bytes()
@@ -242,6 +241,7 @@ async def _run(mode: str, attach_path: Optional[str]) -> RunnerOutcome:
 def main() -> int:
     import logging
 
+    _SCRATCH.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.DEBUG,
         filename=str(_SCRATCH / "live-run.log"),
