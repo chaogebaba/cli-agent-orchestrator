@@ -13,6 +13,10 @@ from cli_agent_orchestrator.chatgpt_web_runner.api_drive import (
     rewrite_first_use_body,
     validate_impersonation,
 )
+from cli_agent_orchestrator.chatgpt_web_runner.detached_transport import (
+    DetachedGetResult,
+    reconcile_ack_unknown,
+)
 from cli_agent_orchestrator.chatgpt_web_runner.in_page_transport import (
     HeldRoute,
     RouteCustodyError,
@@ -178,3 +182,120 @@ def test_canonicaliser_keeps_tool_result_but_ignores_volatile_fields():
     changed_result = json.loads(json.dumps(base))
     changed_result["mapping"]["n2"]["message"]["result_digest"] = "xyz"
     assert canonical_conversation_digest(base) != canonical_conversation_digest(changed_result)
+
+
+def test_ack_unknown_finds_nonce_bearing_user_without_any_resend():
+    body = {
+        "conversation_id": "c",
+        "current_node": "u",
+        "mapping": {
+            "u": {
+                "message": {
+                    "id": "user-landed",
+                    "author": {"role": "user"},
+                    "content": {"parts": ["work nonce-123"]},
+                }
+            }
+        },
+    }
+
+    async def get(_conversation_id):
+        return DetachedGetResult(200, body)
+
+    result = asyncio.run(
+        reconcile_ack_unknown(
+            conversation_id="c",
+            pre_send_current_node="old",
+            attempt_nonce="nonce-123",
+            user_message_id=None,
+            deadline=10,
+            get_conversation=get,
+            clock=lambda: 0,
+        )
+    )
+    assert result.delivery_seen is True
+    assert result.user_message_id == "user-landed"
+
+
+def test_ack_unknown_brand_new_missed_intercept_is_immediately_irreconcilable():
+    calls = 0
+
+    async def get(_conversation_id):
+        nonlocal calls
+        calls += 1
+        return DetachedGetResult(200, {})
+
+    result = asyncio.run(
+        reconcile_ack_unknown(
+            conversation_id=None,
+            pre_send_current_node=None,
+            attempt_nonce="n",
+            user_message_id=None,
+            deadline=10,
+            get_conversation=get,
+        )
+    )
+    assert result.irreconcilable is True
+    assert calls == 0  # no forbidden conversation-list fallback
+
+
+def test_ack_unknown_absence_is_observed_not_called_non_delivery():
+    now = 0.0
+
+    async def get(_conversation_id):
+        return DetachedGetResult(
+            200, {"conversation_id": "c", "current_node": "old", "mapping": {}}
+        )
+
+    async def sleep(seconds):
+        nonlocal now
+        now += seconds
+
+    result = asyncio.run(
+        reconcile_ack_unknown(
+            conversation_id="c",
+            pre_send_current_node="old",
+            attempt_nonce="missing",
+            user_message_id=None,
+            deadline=10,
+            get_conversation=get,
+            sleep=sleep,
+            clock=lambda: now,
+        )
+    )
+    assert result.delivery_seen is False
+    assert result.absence_observed is True
+    assert result.irreconcilable is False
+
+
+def test_ack_unknown_honours_retry_after_and_pending_backoff():
+    now = 0.0
+    sleeps = []
+    results = iter(
+        [
+            DetachedGetResult(429, None, retry_after=7),
+            DetachedGetResult(200, {"current_node": "old", "mapping": {}}),
+        ]
+    )
+
+    async def get(_conversation_id):
+        return next(results)
+
+    async def sleep(seconds):
+        nonlocal now
+        sleeps.append(seconds)
+        now += seconds
+
+    asyncio.run(
+        reconcile_ack_unknown(
+            conversation_id="c",
+            pre_send_current_node="old",
+            attempt_nonce="missing",
+            user_message_id=None,
+            deadline=17,
+            get_conversation=get,
+            sleep=sleep,
+            clock=lambda: now,
+        )
+    )
+    assert sleeps == [7, 10]
