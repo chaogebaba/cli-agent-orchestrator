@@ -257,6 +257,12 @@ class ConnectorServer:
             {
                 "service": "cao-workspace-connector",
                 "workspaceId": self.workspace_id,
+                # The runner's reachability self-check compares this against the
+                # attempt it just bound. Without it, a health 200 proves only
+                # that SOMETHING answered the public URL — which is exactly the
+                # failure mode the funnel had: it pointed at a port where a
+                # previous attempt's listener, or nothing, lived.
+                "attemptId": self.attempt_id,
                 "status": "ok",
             }
         )

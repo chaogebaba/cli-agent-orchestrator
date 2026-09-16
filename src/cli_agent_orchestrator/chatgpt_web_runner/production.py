@@ -46,6 +46,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -85,6 +86,118 @@ _GET_TIMEOUT_S = 420.0
 #: into a second, unclassified failure on top of the first.
 _PAGE_DISPOSITION_ON_FAILURE = "closed"
 
+#: D5/D7: the pull plane's bind port. It must be FIXED, not OS-assigned: the
+#: operator's tunnel points at one port, and a fresh random port per attempt
+#: meant the funnel front door led to a port where nothing listened. Overridable
+#: for tests and for a second concurrent attempt.
+_PULL_BIND_PORT_ENV = "CHATGPT_PULL_BIND_PORT"
+_PULL_BIND_PORT_DEFAULT = 18795
+
+#: The URL the MODEL uses. It goes into the OAuth metadata, the bearer challenge
+#: and the prompt, so a connector advertising a loopback issuer is unreachable
+#: from ChatGPT no matter how the tunnel is configured.
+_PULL_PUBLIC_BASE_URL_ENV = "CHATGPT_PULL_PUBLIC_BASE_URL"
+
+#: How long the reachability self-check waits for the public URL.
+_PULL_SELF_CHECK_TIMEOUT_S = 15.0
+
+
+def _marker(text: str) -> None:
+    """Print one operator-facing line to the pane, like __main__ does.
+
+    The pairing code has to reach a human. Logging alone would bury it in the
+    debug file, and the ledger alone would require the operator to know where to
+    look before the turn has produced anything.
+    """
+    sys.stdout.write(f"[chatgpt_web] {text}\n")
+    sys.stdout.flush()
+
+
+def pull_bind_port() -> int:
+    raw = os.environ.get(_PULL_BIND_PORT_ENV, "").strip()
+    if not raw:
+        return _PULL_BIND_PORT_DEFAULT
+    try:
+        port = int(raw)
+    except ValueError as exc:
+        raise RunnerError(
+            RunnerErrorCode.ACCESS_DENIED,
+            f"{_PULL_BIND_PORT_ENV}={raw!r} is not a port number",
+            delivery_state=DeliveryState.NOTHING_SENT,
+        ) from exc
+    if not 1 <= port <= 65535:
+        raise RunnerError(
+            RunnerErrorCode.ACCESS_DENIED,
+            f"{_PULL_BIND_PORT_ENV}={port} is out of range",
+            delivery_state=DeliveryState.NOTHING_SENT,
+        )
+    return port
+
+
+def pull_public_base_url() -> str:
+    """The operator-configured public base URL, or a typed refusal.
+
+    Fail-closed and BEFORE the browser: a turn whose model cannot reach the pull
+    plane ends in `source_correlation` with no report, after having spent a mint
+    and opened the logged-in profile. Refusing here costs nothing.
+    """
+    raw = os.environ.get(_PULL_PUBLIC_BASE_URL_ENV, "").strip().rstrip("/")
+    if not raw:
+        raise RunnerError(
+            RunnerErrorCode.ACCESS_DENIED,
+            f"{_PULL_PUBLIC_BASE_URL_ENV} is unset — the model would have no way to reach "
+            "this attempt's connector, so the turn is refused before the browser opens",
+            delivery_state=DeliveryState.NOTHING_SENT,
+        )
+    if not raw.startswith(("http://", "https://")):
+        raise RunnerError(
+            RunnerErrorCode.ACCESS_DENIED,
+            f"{_PULL_PUBLIC_BASE_URL_ENV}={raw!r} is not an http(s) URL",
+            delivery_state=DeliveryState.NOTHING_SENT,
+        )
+    return raw
+
+
+def check_pull_plane_reachable(
+    public_base_url: str, attempt_id: str, *, timeout: float = _PULL_SELF_CHECK_TIMEOUT_S
+) -> None:
+    """Prove the public URL reaches THIS attempt's listener. Typed refusal if not.
+
+    A 200 alone is not enough — the funnel can front a stale port where a
+    previous attempt, or an unrelated service, answers. The health payload
+    carries the attempt id precisely so this check can tell those apart.
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    url = f"{public_base_url}/health"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            status = int(response.status)
+            body = _json.loads(response.read().decode())
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise RunnerError(
+            RunnerErrorCode.ACCESS_DENIED,
+            f"the pull plane is not reachable at {url} ({type(exc).__name__}) — refusing the "
+            "turn before the browser opens",
+            delivery_state=DeliveryState.NOTHING_SENT,
+        ) from exc
+    if status != 200:
+        raise RunnerError(
+            RunnerErrorCode.ACCESS_DENIED,
+            f"the pull plane answered {status} at {url}; refusing the turn",
+            delivery_state=DeliveryState.NOTHING_SENT,
+        )
+    served = str(body.get("attemptId") or "")
+    if served != attempt_id:
+        raise RunnerError(
+            RunnerErrorCode.ACCESS_DENIED,
+            f"{url} is fronted by a DIFFERENT attempt ({served or 'unidentified'}, expected "
+            f"{attempt_id}) — the tunnel points somewhere else; refusing the turn",
+            delivery_state=DeliveryState.NOTHING_SENT,
+        )
+
 
 def _artifacts_dir() -> Path:
     return Path(
@@ -115,27 +228,73 @@ def _verify_pin_real(file_path: str) -> bool:
     return bool(verdict.get("verdict") in ("VALID", "SUPERSEDED"))
 
 
+def resolve_callback_target(endpoint: str, own_terminal_id: str, headers: dict[str, str]) -> str:
+    """Resolve the recorded caller, the same way ``send_message`` does.
+
+    ``CAO_CALLBACK_TERMINAL_ID`` is injected only on the CROSS-NODE path, so a
+    worker created locally — which is every worker a supervisor spawns through
+    the REST API or the ``assign`` tool — has an empty env var and a perfectly
+    good ``caller_id`` on its terminal row. Reading only the env var meant such a
+    worker refused to call back at all, which is what the live-turn prep lane
+    hit when it had a seat, a worker and no way to connect them.
+
+    Order mirrors ``mcp_server.send_message`` with ``receiver_id`` omitted:
+    the cross-node env var first, then ``/terminals/{id}/callback-target``
+    (which resolves conversation-root owner first, so a RESUMED worker replies
+    to the original caller), then the terminal row's
+    ``caller_mailbox_id`` / ``caller_id``. Never guessed.
+    """
+    import requests
+
+    recorded = os.environ.get("CAO_CALLBACK_TERMINAL_ID") or os.environ.get("CAO_CALLER_ID", "")
+    if recorded:
+        return recorded
+    if not own_terminal_id:
+        return ""
+    base = endpoint.rstrip("/")
+    try:
+        target = requests.get(
+            f"{base}/terminals/{own_terminal_id}/callback-target", headers=headers, timeout=30
+        )
+        if target.ok:
+            receiver = str((target.json() or {}).get("receiver_id") or "")
+            if receiver:
+                return receiver
+    except Exception as exc:  # noqa: BLE001 — fall through to the terminal row
+        logger.debug("callback-target lookup failed for %s: %s", own_terminal_id, exc)
+    try:
+        row = requests.get(f"{base}/terminals/{own_terminal_id}", headers=headers, timeout=30)
+        if row.ok:
+            payload = row.json() or {}
+            return str(payload.get("caller_mailbox_id") or payload.get("caller_id") or "")
+    except Exception as exc:  # noqa: BLE001 — the caller reports the refusal
+        logger.debug("caller_id lookup failed for %s: %s", own_terminal_id, exc)
+    return ""
+
+
 def _callback_as_worker(message: str) -> None:
     """Deliver the worker-scoped callback to the recorded caller (D2).
 
     Posts to ``POST /terminals/{caller}/inbox/messages`` as the worker
     (``X-CAO-Terminal-Token`` from env), mirroring what the ``send_message`` MCP
-    tool does with ``receiver_id`` omitted. The caller id comes from
-    ``CAO_CALLBACK_TERMINAL_ID`` (recorded caller) — never guessed.
+    tool does with ``receiver_id`` omitted. The caller is resolved by
+    :func:`resolve_callback_target` — never guessed.
     """
     import requests
 
     endpoint = os.environ.get("CAO_ENDPOINT", "http://127.0.0.1:8990")
     token = os.environ.get("CAO_TERMINAL_TOKEN", "")
     sender = os.environ.get("CAO_TERMINAL_ID", "")
-    receiver = os.environ.get("CAO_CALLBACK_TERMINAL_ID") or os.environ.get("CAO_CALLER_ID", "")
+    headers = {"X-CAO-Terminal-Token": token} if token else {}
+    receiver = resolve_callback_target(endpoint, sender, headers)
     if not receiver:
         raise RunnerError(
             RunnerErrorCode.SUBMIT_UNKNOWN,
-            "no recorded caller (CAO_CALLBACK_TERMINAL_ID unset) — cannot call back",
+            f"no recorded caller for terminal {sender or '(CAO_TERMINAL_ID unset)'}: neither "
+            "CAO_CALLBACK_TERMINAL_ID nor the terminal's callback-target/caller_id row names "
+            "one — cannot call back",
             delivery_state=DeliveryState.DELIVERED,
         )
-    headers = {"X-CAO-Terminal-Token": token} if token else {}
     resp = requests.post(
         f"{endpoint.rstrip('/')}/terminals/{receiver}/inbox/messages",
         params={"sender_id": sender, "message": message},
@@ -379,20 +538,20 @@ async def _drive_composed_turn(
     from cli_agent_orchestrator.chatgpt_web_runner.stream_relay import get_relay_hub
     from cli_agent_orchestrator.chatgpt_web_runner.submit_ids import new_run_id
 
-    profile = resolve_profile_dir()
-    profile_epoch = pin_fingerprint_seed(profile)
-    context = await launch(build_launch_options(profile, profile_epoch))
-    page = context.pages[0] if context.pages else await context.new_page()
-    generations = LiveGenerations(page, context)
-    intent_log.transition(AttemptState.OWNED_BROWSER_READY)
-
-    # ── the pull plane ────────────────────────────────────────────────────
-    # One attempt, one loopback listener, separately killable. The connector —
-    # not the prompt — is the authority on what may be read (D5).
+    # ── the pull plane comes up BEFORE the browser ────────────────────────
+    # Reordered deliberately. The old order opened the logged-in profile first,
+    # so a turn whose model could not reach the connector still cost a profile
+    # launch and, later, a spent mint — before failing `source_correlation` with
+    # no report. Everything that can refuse now refuses first.
     connector_listener: Optional[ConnectorListener] = None
     connector_server: Any = None
     if manifest and frozen_worktree:
         from cli_agent_orchestrator.services.workspace_read import bind_attempt
+
+        # Resolve BOTH before binding anything: an unset public URL is a typed
+        # refusal, not a connector that comes up unreachable.
+        public_base_url = pull_public_base_url()
+        bind_port = pull_bind_port()
 
         connector_server = bind_attempt(
             attempt_id=attempt_id,
@@ -401,10 +560,41 @@ async def _drive_composed_turn(
             reviewed_commit=reviewed_commit,
             base_commit=base_commit,
             state_dir=_artifacts_dir() / "attempts" / attempt_id / "connector",
+            # D5/D7: this is what the OAuth metadata, the bearer challenge and
+            # the prompt advertise. Without it the connector announces a
+            # loopback issuer that ChatGPT can never reach.
+            public_base_url=public_base_url,
         )
-        connector_listener = ConnectorListener(connector_server)
+        connector_listener = ConnectorListener(connector_server, port=bind_port)
         await connector_listener.start()
-    intent_log.transition(AttemptState.CONNECTOR_READY)
+
+        # The single-use pairing gate. The operator types this into the ChatGPT
+        # UI once; it invalidates any previous session and expires on its own.
+        pairing = connector_server.pairing.create()
+        pairing_code = str(pairing["code"])
+        pairing_expires_at = float(pairing["expires_at"])
+
+        # Reachability is PROVED, not assumed, and proved to be THIS attempt.
+        await asyncio.to_thread(check_pull_plane_reachable, public_base_url, attempt_id)
+
+        intent_log.transition(
+            AttemptState.CONNECTOR_READY,
+            connector_public_base_url=public_base_url,
+            connector_pairing_code=pairing_code,
+            connector_pairing_expires_at=pairing_expires_at,
+        )
+        _marker(f"PULL-PLANE {public_base_url} attempt={attempt_id}")
+        _marker(f"PULL-PAIRING-CODE {pairing_code} (single use, expires in ~5 min)")
+        logger.info("chatgpt_web pull plane reachable at %s for %s", public_base_url, attempt_id)
+    else:
+        intent_log.transition(AttemptState.CONNECTOR_READY)
+
+    profile = resolve_profile_dir()
+    profile_epoch = pin_fingerprint_seed(profile)
+    context = await launch(build_launch_options(profile, profile_epoch))
+    page = context.pages[0] if context.pages else await context.new_page()
+    generations = LiveGenerations(page, context)
+    intent_log.transition(AttemptState.OWNED_BROWSER_READY)
 
     custody = _HeldRouteCustody(
         attempt_id=attempt_id, mint_id=attempt_id, profile_epoch=profile_epoch

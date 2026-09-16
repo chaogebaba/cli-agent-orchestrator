@@ -184,6 +184,14 @@ class SendIntentRecord:
     irreconcilable: bool = False
     supersedes_unresolved: Optional[str] = None
     relay_status: Optional[str] = None
+    #: D5/D7: how the MODEL reaches this attempt's pull plane. The public base
+    #: URL is the operator's tunnel front door; the pairing code is SINGLE-USE
+    #: and short-lived, and is recorded only because the operator needs it after
+    #: the pane has scrolled. The record file is created by mkstemp (0600) and
+    #: os.replace preserves that mode, so it is owner-only on disk.
+    connector_public_base_url: Optional[str] = None
+    connector_pairing_code: Optional[str] = None
+    connector_pairing_expires_at: Optional[float] = None
     verified_node_id: Optional[str] = None
     conversation_digest: Optional[str] = None
     fulfilled_at: Optional[float] = None
