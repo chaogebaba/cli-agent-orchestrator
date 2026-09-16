@@ -69,6 +69,12 @@ class PairingManager:
     ) -> None:
         self.workspace_id = workspace_id
         self._sessions: dict[str, PairingSession] = {}
+        # D9.2: consumption is a POSITIVE fact. verify() pops the session on
+        # success AND on expiry, so "no active session" cannot tell an
+        # authorised pairing from a dead one — which is how the operator gate
+        # came to treat a timeout as success. This set is the evidence that a
+        # code was actually redeemed.
+        self._consumed: set[str] = set()
         self._ip_hits: dict[str, tuple[int, float]] = {}
         self._ttl_s = ttl_s
         self._max_attempts = max_attempts
@@ -121,8 +127,10 @@ class PairingManager:
                 self._sessions.pop(session.id, None)
                 return {"ok": False, "reason": "too_many_attempts"}
             if secrets.compare_digest(input_hash, session.code_hash):
-                # one-time use: destroy immediately
+                # one-time use: destroy immediately, but RECORD that it was
+                # redeemed — the pop alone is indistinguishable from expiry.
                 self._sessions.pop(session.id, None)
+                self._consumed.add(session.id)
                 return {"ok": True, "session_id": session.id}
             session.attempts_left -= 1
             if session.attempts_left <= 0:
@@ -134,6 +142,15 @@ class PairingManager:
     def has_active_session(self) -> bool:
         now = time.time()
         return any(not s.used and now <= s.expires_at for s in self._sessions.values())
+
+    def was_consumed(self, session_id: str) -> bool:
+        """True only when this pairing session was actually redeemed.
+
+        Deliberately not the negation of :meth:`has_active_session`: a session
+        that expired, was invalidated, or was superseded is also absent, and
+        none of those is an authorization.
+        """
+        return session_id in self._consumed
 
     def invalidate_all(self) -> None:
         self._sessions.clear()

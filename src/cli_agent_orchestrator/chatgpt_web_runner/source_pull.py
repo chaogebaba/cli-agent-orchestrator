@@ -463,44 +463,57 @@ class PairingExpired(RuntimeError):
 async def await_pairing_consumed(
     pairing: Any,
     *,
+    session_id: str,
     expires_at: float,
     announce: Any,
+    store: Any = None,
     poll_interval: float = 1.0,
     countdown_interval: float = 30.0,
-    clock: Any = None,
 ) -> float:
-    """Block until the operator pairs, or raise :class:`PairingExpired`.
+    """Block until the operator PROVABLY paired, or raise :class:`PairingExpired`.
 
     This is the operator gate. Pairing needs a human in a second tab: open
-    Settings, find the connector, click Connect, type the code. The runner used
-    to print the code and then spend 5-15 seconds launching the browser,
-    navigating and minting — on the very page the human would have to navigate
-    away from. Nothing waited, so the pairing could not be completed and the
-    audit came back empty.
+    Settings, find the connector, click Connect, type the code.
 
-    Waiting HERE, before any profile touch, is what makes the gate cheap: a turn
-    the operator abandons costs no browser launch and no mint.
+    **It waits on a positive fact.** The first version asked
+    ``has_active_session()`` and treated its absence as success. That is the bug
+    pre-flight-2 caught on the deployed build: ``verify()`` pops the session on
+    redemption AND on expiry, so at the 300 s deadline the session was gone, the
+    liveness test said "not active", and the gate announced
+    ``PULL-PAIRING-OK authorized after 300s`` and walked on with no
+    authorization at all. Absence is not evidence. Redemption is, and so is a
+    refresh token appearing in the store — the OAuth exchange that follows it.
 
-    Returns the seconds waited. ``announce`` receives a countdown line roughly
-    every ``countdown_interval`` seconds so a blocked runner never looks hung.
+    Consumption is checked BEFORE the deadline, deliberately: a pairing redeemed
+    at 299 s but first observed at 301 s is an authorization, and refusing it
+    would throw away a turn the operator completed. Only an expired AND
+    unredeemed pairing raises.
+
+    Returns the seconds waited. ``announce`` receives a countdown roughly every
+    ``countdown_interval`` seconds so a blocked runner never looks hung.
     """
     import time as _time
 
-    now = clock or _time.monotonic
-    started = now()
-    deadline_in = max(0.0, expires_at - _time.time())
+    started = _time.monotonic()
+
+    def _authorized() -> bool:
+        if pairing.was_consumed(session_id):
+            return True
+        # The stronger corroboration: the code exchange completed and a
+        # refresh token exists, so a token really was issued.
+        return bool(store is not None and store.has_reusable_authorization())
+
     next_announce = 0.0
     while True:
-        if not pairing.has_active_session():
-            # Consumed (or invalidated). Either way the gate is open: the
-            # authorisation either exists now or never will for this code.
-            return now() - started
-        waited = now() - started
-        remaining = deadline_in - waited
+        if _authorized():
+            return _time.monotonic() - started
+        remaining = expires_at - _time.time()
         if remaining <= 0:
             raise PairingExpired(
-                f"the pairing code expired after {waited:.0f}s with no authorization"
+                f"the pairing code expired after {_time.monotonic() - started:.0f}s "
+                "with no authorization"
             )
+        waited = _time.monotonic() - started
         if waited >= next_announce:
             announce(f"PULL-PAIRING-WAIT {remaining:.0f}s left — pair in ChatGPT Settings")
             next_announce = waited + countdown_interval

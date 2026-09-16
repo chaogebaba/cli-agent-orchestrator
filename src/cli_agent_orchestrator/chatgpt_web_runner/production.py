@@ -101,6 +101,35 @@ _PULL_PUBLIC_BASE_URL_ENV = "CHATGPT_PULL_PUBLIC_BASE_URL"
 #: How long the reachability self-check waits for the public URL.
 _PULL_SELF_CHECK_TIMEOUT_S = 15.0
 
+#: D9.2: the pairing code's lifetime, and therefore the operator gate's deadline.
+#: Injectable so an arm can drive the REAL timing path — the previous expiry arm
+#: passed an already-past deadline while the session was still live, a
+#: combination production can never produce, which is why it passed against a
+#: gate that failed open at the true deadline.
+_PULL_PAIRING_TTL_ENV = "CHATGPT_PULL_PAIRING_TTL_S"
+_PULL_PAIRING_TTL_DEFAULT = 300.0
+
+
+def pull_pairing_ttl_s() -> float:
+    raw = os.environ.get(_PULL_PAIRING_TTL_ENV, "").strip()
+    if not raw:
+        return _PULL_PAIRING_TTL_DEFAULT
+    try:
+        ttl = float(raw)
+    except ValueError as exc:
+        raise RunnerError(
+            RunnerErrorCode.ACCESS_DENIED,
+            f"{_PULL_PAIRING_TTL_ENV}={raw!r} is not a number of seconds",
+            delivery_state=DeliveryState.NOTHING_SENT,
+        ) from exc
+    if ttl <= 0:
+        raise RunnerError(
+            RunnerErrorCode.ACCESS_DENIED,
+            f"{_PULL_PAIRING_TTL_ENV}={ttl} must be positive",
+            delivery_state=DeliveryState.NOTHING_SENT,
+        )
+    return ttl
+
 
 def _marker(text: str) -> None:
     """Print one operator-facing line to the pane, like __main__ does.
@@ -595,76 +624,16 @@ async def _drive_composed_turn(
             # code is minted, so a reused authorization costs the operator
             # nothing at all.
             auth_reused = bool(connector_server.store.has_reusable_authorization())
-            pairing_digest: Optional[str] = None
-            pairing_issued_at: Optional[float] = None
-            pairing_expires_at: Optional[float] = None
-
             if auth_reused:
                 _marker(f"PULL-AUTH-REUSED {public_base_url} (no pairing needed)")
                 logger.info("chatgpt_web reusing connector authorization for %s", public_base_url)
-            else:
-                pairing = connector_server.pairing.create()
-                pairing_code = str(pairing["code"])
-                pairing_expires_at = float(pairing["expires_at"])
-                pairing_issued_at = time.time()
-
-                # The raw code goes to the pane and to ONE ephemeral 0600 file;
-                # the durable ledger gets only its digest and its timestamps.
-                # Registered for teardown only AFTER the write succeeds. The
-                # O_EXCL refusal exists precisely so we never own a file someone
-                # else created; handing the unwritten handle to the finally would
-                # unlink that file on the way out, which is the opposite.
-                candidate = PairingCodeFile(
-                    _artifacts_dir() / "attempts" / attempt_id, connector_server.pairing
-                )
-                pairing_digest = candidate.write(pairing_code)
-                pairing_file = candidate
-                pairing_file.start_watch()
-                _marker(f"PULL-PAIRING-CODE {pairing_code} (single use, expires in ~5 min)")
-                _marker(
-                    f"PULL-PAIRING-FILE {pairing_file.path} " "(0600, removed once used or expired)"
-                )
 
             intent_log.transition(
                 AttemptState.CONNECTOR_READY,
                 connector_public_base_url=public_base_url,
-                connector_pairing_code_sha256=pairing_digest,
-                connector_pairing_issued_at=pairing_issued_at,
-                connector_pairing_expires_at=pairing_expires_at,
                 connector_auth_reused=auth_reused,
             )
             logger.info("chatgpt_web pull plane reachable at %s", public_base_url)
-
-            # ── THE OPERATOR GATE (D9.1) ──────────────────────────────────
-            # Block here, BEFORE any profile touch, until the human has paired.
-            # Pairing needs a second tab — Settings, the connector, Connect, the
-            # code — and the old order spent the next 5-15 seconds launching the
-            # browser and navigating the very page the operator would have to
-            # leave. Nothing waited, so the authorization could not land and the
-            # audit came back empty. A turn the operator abandons now costs no
-            # browser launch and no mint.
-            if not auth_reused:
-                assert pairing_expires_at is not None
-                try:
-                    waited = await await_pairing_consumed(
-                        connector_server.pairing,
-                        expires_at=pairing_expires_at,
-                        announce=_marker,
-                    )
-                except PairingExpired as exc:
-                    intent_log.transition(
-                        AttemptState.ERROR,
-                        route_disposition="pairing_expired",
-                        page_disposition="closed",
-                    )
-                    _marker("PULL-PAIRING-EXPIRED no authorization arrived; nothing was sent")
-                    raise RunnerError(
-                        RunnerErrorCode.PAIRING_EXPIRED,
-                        f"{exc} — no browser was launched and no mint was spent; "
-                        "re-dispatch once you are ready to pair",
-                        delivery_state=DeliveryState.NOTHING_SENT,
-                    ) from exc
-                _marker(f"PULL-PAIRING-OK authorized after {waited:.0f}s")
         else:
             intent_log.transition(AttemptState.CONNECTOR_READY)
 
@@ -674,6 +643,66 @@ async def _drive_composed_turn(
         page = context.pages[0] if context.pages else await context.new_page()
         generations = LiveGenerations(page, context)
         intent_log.transition(AttemptState.OWNED_BROWSER_READY)
+
+        # ── THE OPERATOR GATE (D9.2) ──────────────────────────────────────
+        # It sits AFTER the browser is up and BEFORE goto/composer. D9.1 put it
+        # before the launch, which was cheaper but made the operator open
+        # chatgpt.com in their own browser while the runner's profile was about
+        # to launch on the same burner account — the proc_exited collision the
+        # operator card flags. Pairing INSIDE this window means the second tab is
+        # a tab of the driven browser's own session: one profile instance, one
+        # account, no collision.
+        #
+        # The page is blank at this point. Nothing has navigated, no route
+        # handler is installed, no composer exists, and no mint has been
+        # reserved — so an expiry here still costs nothing but the browser that
+        # teardown closes.
+        if connector_server is not None and not auth_reused:
+            pairing = connector_server.pairing.create()
+            pairing_code = str(pairing["code"])
+            pairing_session_id = str(pairing["session_id"])
+            pairing_ttl = pull_pairing_ttl_s()
+            pairing_issued_at = time.time()
+            pairing_expires_at = pairing_issued_at + pairing_ttl
+
+            # Registered for teardown only AFTER the write succeeds (the O_EXCL
+            # refusal must not unlink a file it declined to own).
+            candidate = PairingCodeFile(
+                _artifacts_dir() / "attempts" / attempt_id, connector_server.pairing
+            )
+            pairing_digest = candidate.write(pairing_code)
+            pairing_file = candidate
+            pairing_file.start_watch()
+            _marker(f"PULL-PAIRING-CODE {pairing_code} (single use, ~{pairing_ttl:.0f}s)")
+            _marker(f"PULL-PAIRING-FILE {pairing_file.path} (0600, removed once used or expired)")
+            intent_log.transition(
+                AttemptState.OWNED_BROWSER_READY,
+                connector_pairing_code_sha256=pairing_digest,
+                connector_pairing_issued_at=pairing_issued_at,
+                connector_pairing_expires_at=pairing_expires_at,
+            )
+            try:
+                waited = await await_pairing_consumed(
+                    connector_server.pairing,
+                    session_id=pairing_session_id,
+                    expires_at=pairing_expires_at,
+                    announce=_marker,
+                    store=connector_server.store,
+                )
+            except PairingExpired as exc:
+                intent_log.transition(
+                    AttemptState.ERROR,
+                    route_disposition="pairing_expired",
+                    page_disposition="closed",
+                )
+                _marker("PULL-PAIRING-EXPIRED no authorization arrived; nothing was sent")
+                raise RunnerError(
+                    RunnerErrorCode.PAIRING_EXPIRED,
+                    f"{exc} — the page never navigated and no mint was spent; re-dispatch "
+                    "once you are ready to pair",
+                    delivery_state=DeliveryState.NOTHING_SENT,
+                ) from exc
+            _marker(f"PULL-PAIRING-OK authorized after {waited:.0f}s")
 
         custody = _HeldRouteCustody(
             attempt_id=attempt_id, mint_id=attempt_id, profile_epoch=profile_epoch
