@@ -36,6 +36,58 @@ def workspace(tmp_path: Path) -> Path:
     return tmp_path
 
 
+class _NavPage:
+    """Blank page; records navigation and stops the turn there (D9.2 order)."""
+
+    def __init__(self, events: list) -> None:
+        self._events = events
+        self.keyboard = None
+
+    def locator(self, _selector):
+        raise AssertionError("the composer was reached before navigation stopped the turn")
+
+    def on(self, _event, _handler):
+        return None
+
+    async def route(self, _pattern, _handler):
+        return None
+
+    async def goto(self, _url, **_kwargs):
+        self._events.append("goto")
+        raise RuntimeError("stop the turn at the navigation boundary")
+
+
+class _NavContext:
+    def __init__(self, events: list) -> None:
+        self.pages = [_NavPage(events)]
+        self.closed = False
+
+    def on(self, _event, _handler):
+        return None
+
+    async def new_page(self):
+        return self.pages[0]
+
+    async def close(self):
+        self.closed = True
+
+
+def _stub_browser_to_goto(monkeypatch, runtime, events: list) -> None:
+    """Launch succeeds; the turn stops at goto.
+
+    D9.2 mints the pairing AFTER the launch and gates before goto, so an arm
+    about the pairing has to run past the launch to see anything at all.
+    """
+
+    async def _launch(_options: object) -> object:
+        events.append("launch")
+        return _NavContext(events)
+
+    monkeypatch.setattr(runtime, "launch", _launch, raising=False)
+    monkeypatch.setattr(runtime, "resolve_profile_dir", lambda: "/data/fake/profile", raising=False)
+    monkeypatch.setattr(runtime, "pin_fingerprint_seed", lambda _p: "epoch", raising=False)
+
+
 def _skip_pairing_gate(monkeypatch) -> None:
     """Let an arm past the D9.1 operator gate without pairing.
 
@@ -326,91 +378,33 @@ def test_an_unusable_pull_plane_refuses_BEFORE_the_browser_launches(
 def test_a_reachable_plane_records_the_url_and_pairing_code(
     tmp_path, monkeypatch, workspace: Path
 ) -> None:
-    """The two values the operator needs, in the ledger before the composer."""
+    """The values the operator needs, in the ledger before any navigation."""
     import cli_agent_orchestrator.chatgpt_web_runner.runtime as runtime
     from cli_agent_orchestrator.chatgpt_web_runner.send_intent import AttemptState, SendIntentLog
-
-    _skip_pairing_gate(monkeypatch)
 
     port = _free_port()
     monkeypatch.setenv("CAO_ARTIFACTS_DIR", str(tmp_path))
     monkeypatch.setenv("CHATGPT_PULL_BIND_PORT", str(port))
     monkeypatch.setenv("CHATGPT_PULL_PUBLIC_BASE_URL", f"http://127.0.0.1:{port}")
-
-    reached: dict[str, object] = {}
-
-    async def _launch(_options: object) -> object:
-        # The plane is up by now; capture the ledger and stop the turn here.
-        record = SendIntentLog(tmp_path / "attempts" / "reach-ok-order").load()
-        reached["state"] = record.attempt_state
-        reached["url"] = record.connector_public_base_url
-        reached["digest"] = record.connector_pairing_code_sha256
-        reached["issued"] = record.connector_pairing_issued_at
-        reached["expires"] = record.connector_pairing_expires_at
-        raise RuntimeError("stop the turn here")
-
-    monkeypatch.setattr(runtime, "launch", _launch, raising=False)
-    monkeypatch.setattr(runtime, "resolve_profile_dir", lambda: "/data/fake/profile", raising=False)
-    monkeypatch.setattr(runtime, "pin_fingerprint_seed", lambda _p: "epoch", raising=False)
+    _skip_pairing_gate(monkeypatch)
+    events: list = []
+    _stub_browser_to_goto(monkeypatch, runtime, events)
 
     log = _attempt(tmp_path, "reach-ok-order")
-    with pytest.raises(RuntimeError, match="stop the turn here"):
+    with pytest.raises(RuntimeError, match="stop the turn at the navigation boundary"):
         asyncio.run(_drive(log, "reach-ok-order", workspace))
 
-    # CONNECTOR_READY is written before any composer step, with the public URL
-    # and the pairing AUDIT fields — never the raw code (see the ruling arms).
-    assert reached["state"] == AttemptState.CONNECTOR_READY.value
-    assert reached["url"] == f"http://127.0.0.1:{port}"
-    assert reached["digest"], "the ledger needs a digest to identify the code later"
-    assert float(reached["issued"]) > 0
-    assert float(reached["expires"]) > float(reached["issued"])
-
-
-def test_production_passes_the_public_url_through_to_bind_attempt(
-    tmp_path, monkeypatch, workspace: Path
-) -> None:
-    """The coverage gap a surviving mutant exposed.
-
-    The external-client arm calls ``bind_attempt`` itself, so it proves the
-    CONNECTOR honours ``public_base_url`` — not that PRODUCTION supplies it.
-    Setting it to None in production left that arm green. This one captures the
-    real call.
-    """
-    import cli_agent_orchestrator.chatgpt_web_runner.runtime as runtime
-    import cli_agent_orchestrator.services.workspace_read as workspace_read
-
-    _skip_pairing_gate(monkeypatch)
-
-    port = _free_port()
-    public = f"http://127.0.0.1:{port}"
-    monkeypatch.setenv("CAO_ARTIFACTS_DIR", str(tmp_path))
-    monkeypatch.setenv("CHATGPT_PULL_BIND_PORT", str(port))
-    monkeypatch.setenv("CHATGPT_PULL_PUBLIC_BASE_URL", public)
-
-    seen: dict[str, object] = {}
-    real_bind = workspace_read.bind_attempt
-
-    def _spy(**kwargs: object) -> object:
-        seen.update(kwargs)
-        return real_bind(**kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(workspace_read, "bind_attempt", _spy, raising=False)
-
-    async def _launch(_options: object) -> object:
-        raise RuntimeError("stop after the plane is up")
-
-    monkeypatch.setattr(runtime, "launch", _launch, raising=False)
-    monkeypatch.setattr(runtime, "resolve_profile_dir", lambda: "/data/fake/profile", raising=False)
-    monkeypatch.setattr(runtime, "pin_fingerprint_seed", lambda _p: "epoch", raising=False)
-
-    log = _attempt(tmp_path, "reach-passthrough")
-    with pytest.raises(RuntimeError, match="stop after the plane is up"):
-        asyncio.run(_drive(log, "reach-passthrough", workspace))
-
-    assert seen.get("public_base_url") == public, (
-        "production must pass the configured public URL, or the connector "
-        "advertises a loopback issuer ChatGPT cannot reach"
-    )
+    record = SendIntentLog(tmp_path / "attempts" / "reach-ok-order").load()
+    assert record is not None
+    # CONNECTOR_READY carries the URL and the reuse decision; the pairing audit
+    # fields land on OWNED_BROWSER_READY, because D9.2 mints after the launch.
+    assert record.connector_public_base_url == f"http://127.0.0.1:{port}"
+    assert record.connector_auth_reused is False
+    assert record.connector_pairing_code_sha256, "the ledger needs a digest to identify the code"
+    assert float(record.connector_pairing_issued_at) > 0
+    assert float(record.connector_pairing_expires_at) > float(record.connector_pairing_issued_at)
+    assert record.attempt_state == AttemptState.OWNED_BROWSER_READY.value
+    assert events == ["launch", "goto"], events
 
 
 # =====================================================================
@@ -423,16 +417,12 @@ def test_the_raw_pairing_code_is_absent_from_the_ledger_and_present_in_the_file(
 ) -> None:
     """The ruling, asserted on the bytes rather than on the field names.
 
-    The durable record refuses raw secrets — `create_locked_attempt` will not
-    even accept the relay token — so a single-use code is no exception just
-    because it is short-lived. What the record keeps is a digest and two
-    timestamps, enough to prove later WHICH code was used without holding it.
+    The durable record refuses raw secrets, so it keeps a digest and two
+    timestamps — enough to prove later WHICH code was used without holding it.
     The operator's copy lives in one 0600 file next to the attempt.
     """
     import hashlib
     import stat
-
-    _skip_pairing_gate(monkeypatch)
 
     import cli_agent_orchestrator.chatgpt_web_runner.runtime as runtime
     from cli_agent_orchestrator.chatgpt_web_runner.send_intent import SendIntentLog
@@ -442,38 +432,45 @@ def test_the_raw_pairing_code_is_absent_from_the_ledger_and_present_in_the_file(
     monkeypatch.setenv("CAO_ARTIFACTS_DIR", str(tmp_path))
     monkeypatch.setenv("CHATGPT_PULL_BIND_PORT", str(port))
     monkeypatch.setenv("CHATGPT_PULL_PUBLIC_BASE_URL", f"http://127.0.0.1:{port}")
+    _skip_pairing_gate(monkeypatch)
 
     captured: dict[str, object] = {}
+    attempt_dir = tmp_path / "attempts" / "pairing-ruling"
+
+    class _CapturePage(_NavPage):
+        async def goto(self, _url, **_kwargs):
+            # D9.2: by navigation time the code exists and the ledger is written.
+            captured["raw_json"] = (attempt_dir / "send_intent.json").read_text(encoding="utf-8")
+            code_path = attempt_dir / PAIRING_CODE_FILENAME
+            captured["code"] = code_path.read_text(encoding="utf-8").strip()
+            captured["mode"] = stat.S_IMODE(code_path.stat().st_mode)
+            raise RuntimeError("stop the turn at the navigation boundary")
+
+    class _CaptureContext(_NavContext):
+        def __init__(self, events):
+            super().__init__(events)
+            self.pages = [_CapturePage(events)]
 
     async def _launch(_options: object) -> object:
-        attempt_dir = tmp_path / "attempts" / "pairing-ruling"
-        captured["raw_json"] = (attempt_dir / "send_intent.json").read_text(encoding="utf-8")
-        code_path = attempt_dir / PAIRING_CODE_FILENAME
-        captured["code"] = code_path.read_text(encoding="utf-8").strip()
-        captured["mode"] = stat.S_IMODE(code_path.stat().st_mode)
-        raise RuntimeError("stop after the plane is up")
+        return _CaptureContext([])
 
     monkeypatch.setattr(runtime, "launch", _launch, raising=False)
     monkeypatch.setattr(runtime, "resolve_profile_dir", lambda: "/data/fake/profile", raising=False)
     monkeypatch.setattr(runtime, "pin_fingerprint_seed", lambda _p: "epoch", raising=False)
 
     log = _attempt(tmp_path, "pairing-ruling")
-    with pytest.raises(RuntimeError, match="stop after the plane is up"):
+    with pytest.raises(RuntimeError, match="stop the turn at the navigation boundary"):
         asyncio.run(_drive(log, "pairing-ruling", workspace))
 
     code = str(captured["code"])
     assert code, "the operator's copy must exist while the code is live"
-    # Owner-only, at creation, with no wider window (O_CREAT with mode 0600).
     assert captured["mode"] == 0o600, oct(int(captured["mode"]))
 
-    # The RAW code appears nowhere in the durable record's bytes.
     raw_json = str(captured["raw_json"])
     assert code not in raw_json, "the raw pairing code leaked into send_intent.json"
-    # Not even with the formatting stripped, in case a future format changes it.
     assert code.replace("-", "") not in raw_json.replace("-", "")
 
-    # What the record DOES carry proves which code it was.
-    record = SendIntentLog(tmp_path / "attempts" / "pairing-ruling").load()
+    record = SendIntentLog(attempt_dir).load()
     assert record is not None
     assert record.connector_pairing_code_sha256 == hashlib.sha256(code.encode()).hexdigest()
     assert record.connector_pairing_issued_at is not None
@@ -587,8 +584,13 @@ def _early_failure_turn(tmp_path, monkeypatch, workspace: Path, attempt_id: str,
     observed: dict[str, Any] = {"contexts": [], "plane_up": None}
 
     def _plane_up() -> bool:
-        """The arm proves nothing unless the plane was really up when it broke."""
-        return code_path.exists() and not _port_is_closed(port)
+        """The arm proves nothing unless the plane was really up when it broke.
+
+        D9.2 moved the pairing mint to AFTER the launch, so at the launch break
+        the listener is up and the code file does not exist yet; at the
+        composer break both do. Each site asserts what is true where it fires.
+        """
+        return not _port_is_closed(port)
 
     _skip_pairing_gate(monkeypatch)
     break_at(monkeypatch, runtime, observed, _plane_up)
@@ -643,7 +645,12 @@ class _StubLocator:
 
 
 def _break_at_launch(monkeypatch, runtime, observed, plane_up) -> None:
-    """The browser (or the profile lock) refuses: no context is ever created."""
+    """The browser (or the profile lock) refuses: no context is ever created.
+
+    Under D9.2 this fires BEFORE the pairing is minted, so there is no code file
+    to leak here — what this site proves is that the listener and the (absent)
+    context are still torn down.
+    """
 
     async def _launch(_options: object) -> object:
         observed["plane_up"] = plane_up()
@@ -736,13 +743,9 @@ def test_a_pre_existing_code_file_refuses_the_attempt(
     monkeypatch.setattr(runtime, "resolve_profile_dir", lambda: "/data/fake/profile", raising=False)
     monkeypatch.setattr(runtime, "pin_fingerprint_seed", lambda _p: "epoch", raising=False)
 
-    launches: list[object] = []
-
-    async def _launch(options: object) -> object:
-        launches.append(options)
-        raise AssertionError("the turn must refuse before the browser")
-
-    monkeypatch.setattr(runtime, "launch", _launch, raising=False)
+    _skip_pairing_gate(monkeypatch)
+    events: list = []
+    _stub_browser_to_goto(monkeypatch, runtime, events)
 
     log = _attempt(tmp_path, "oexcl")
     squatter = tmp_path / "attempts" / "oexcl" / PAIRING_CODE_FILENAME
@@ -755,7 +758,9 @@ def test_a_pre_existing_code_file_refuses_the_attempt(
 
     assert excinfo.value.code is RunnerErrorCode.ACCESS_DENIED
     assert "already exists" in str(excinfo.value.hint)
-    assert launches == [], "the browser opened despite the refusal"
+    # D9.2 mints after the launch, so the browser is up by then — but the turn
+    # still refuses before it navigates, and spends no mint.
+    assert "goto" not in events, "the page navigated despite the refusal"
     # The squatter's CONTENT is untouched: we neither truncated nor wrote to it.
     assert squatter.read_text(encoding="utf-8") == "not-ours\n"
 

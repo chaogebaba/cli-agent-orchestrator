@@ -369,19 +369,23 @@ class AuthStore:
             # match the live attempt. Without this, a durable store would hand
             # out tokens bound to a dead attempt and every read would 403 —
             # which is the same wall as re-pairing, reached more slowly.
-            return True, self.issue_tokens(
-                client_id=client_id,
-                scopes=record.scopes,
-                workspace_id=record.workspace_id,
-                attempt_id=(
-                    self.attempt_id if self.attempt_id is not None else record.attempt_id
+            return (
+                True,
+                self.issue_tokens(
+                    client_id=client_id,
+                    scopes=record.scopes,
+                    workspace_id=record.workspace_id,
+                    attempt_id=(
+                        self.attempt_id if self.attempt_id is not None else record.attempt_id
+                    ),
+                    manifest_digest=(
+                        self.manifest_digest
+                        if self.manifest_digest is not None
+                        else record.manifest_digest
+                    ),
                 ),
-                manifest_digest=(
-                    self.manifest_digest
-                    if self.manifest_digest is not None
-                    else record.manifest_digest
-                ),
-            ), ""
+                "",
+            )
 
     def revoke_token(self, token: str) -> bool:
         with self._lock:

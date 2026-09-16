@@ -81,19 +81,62 @@ def _drive(log: SendIntentLog, attempt_id: str, workspace: Path):
     )
 
 
-def _stub_browser(monkeypatch, launches: list, *, at_launch=None):
-    """A launch stub that records WHEN it ran, so ordering can be asserted."""
+class _GatePage:
+    """A blank page that records when it was navigated — never before the gate."""
+
+    def __init__(self, events: list) -> None:
+        self._events = events
+        self.keyboard = None
+
+    def locator(self, _selector):
+        raise AssertionError("the composer was reached before the gate opened")
+
+    def on(self, _event, _handler):
+        return None
+
+    async def route(self, _pattern, _handler):
+        self._events.append(("route", time.monotonic()))
+
+    async def goto(self, _url, **_kwargs):
+        self._events.append(("goto", time.monotonic()))
+        raise RuntimeError("stop the turn at the navigation boundary")
+
+
+class _GateContext:
+    def __init__(self, events: list) -> None:
+        self.pages = [_GatePage(events)]
+        self.closed = False
+
+    def on(self, _event, _handler):
+        return None
+
+    async def new_page(self):
+        return self.pages[0]
+
+    async def close(self):
+        self.closed = True
+
+
+def _stub_browser(monkeypatch, events: list):
+    """Launch succeeds and records when; navigation records and then stops.
+
+    D9.2 puts the gate between them, so this is the shape that can assert the
+    order: launch, then the wait, then goto — and never goto first.
+    """
     import cli_agent_orchestrator.chatgpt_web_runner.runtime as runtime
 
+    contexts: list = []
+
     async def _launch(_options: object) -> object:
-        launches.append(time.monotonic())
-        if at_launch is not None:
-            at_launch()
-        raise RuntimeError("stop the turn at the browser boundary")
+        events.append(("launch", time.monotonic()))
+        context = _GateContext(events)
+        contexts.append(context)
+        return context
 
     monkeypatch.setattr(runtime, "launch", _launch, raising=False)
     monkeypatch.setattr(runtime, "resolve_profile_dir", lambda: "/data/fake/profile", raising=False)
     monkeypatch.setattr(runtime, "pin_fingerprint_seed", lambda _p: "epoch", raising=False)
+    return contexts
 
 
 def _configure(monkeypatch, tmp_path: Path, port: int) -> str:
@@ -105,13 +148,53 @@ def _configure(monkeypatch, tmp_path: Path, port: int) -> str:
 
 
 # =====================================================================
-# The gate itself, driven directly
+# The gate itself, on the REAL timing path
+#
+# The arm this replaces passed an already-past deadline while the pairing
+# session was still live. Production can never produce that combination — the
+# deadline IS the session's TTL — so it exercised the deadline branch while
+# leaving the liveness branch, the one that actually ran at 300 s, untested. The
+# gate failed open there and the arm stayed green. Everything below drives a real
+# clock against a real, short TTL.
 # =====================================================================
 
 
-def test_the_gate_returns_as_soon_as_the_pairing_is_consumed() -> None:
-    pairing = PairingManager(workspace_id="w")
-    code = str(pairing.create()["code"])
+def _short_pairing(ttl: float):
+    """A real PairingManager whose code really expires, quickly."""
+    pairing = PairingManager(workspace_id="w", ttl_s=ttl)
+    created = pairing.create()
+    return pairing, str(created["code"]), str(created["session_id"]), float(created["expires_at"])
+
+
+def test_the_gate_raises_when_the_code_really_expires() -> None:
+    """The pre-flight-2 failure, reproduced on the real path.
+
+    At the true deadline the session is gone — `verify()` pops it on expiry just
+    as it does on redemption — so the old liveness test said "not active" and the
+    gate announced success. Here nobody pairs and the deadline genuinely passes.
+    """
+    pairing, _code, session_id, expires_at = _short_pairing(0.3)
+    lines: list[str] = []
+
+    async def _run() -> float:
+        return await await_pairing_consumed(
+            pairing,
+            session_id=session_id,
+            expires_at=expires_at,
+            announce=lines.append,
+            poll_interval=0.02,
+            countdown_interval=0.05,
+        )
+
+    with pytest.raises(PairingExpired):
+        asyncio.run(_run())
+    # And it really did wait, rather than failing instantly for another reason.
+    assert pairing.has_active_session() is False
+    assert pairing.was_consumed(session_id) is False
+
+
+def test_the_gate_returns_only_on_a_real_redemption() -> None:
+    pairing, code, session_id, expires_at = _short_pairing(5.0)
     lines: list[str] = []
 
     async def _run() -> float:
@@ -122,66 +205,105 @@ def test_the_gate_returns_as_soon_as_the_pairing_is_consumed() -> None:
         asyncio.ensure_future(_pair_soon())
         return await await_pairing_consumed(
             pairing,
-            expires_at=time.time() + 300,
+            session_id=session_id,
+            expires_at=expires_at,
             announce=lines.append,
-            poll_interval=0.01,
-            countdown_interval=0.02,
+            poll_interval=0.02,
+            countdown_interval=0.03,
         )
 
     waited = asyncio.run(_run())
     assert waited >= 0
-    # It announced while blocked, so a waiting runner never looks hung.
+    assert pairing.was_consumed(session_id) is True
     assert any(line.startswith("PULL-PAIRING-WAIT") for line in lines), lines
 
 
-def test_the_gate_raises_when_the_code_expires() -> None:
-    pairing = PairingManager(workspace_id="w", ttl_s=300)
-    pairing.create()
-    lines: list[str] = []
+def test_an_invalidated_pairing_is_not_an_authorization() -> None:
+    """`has_active_session()` is false here too — and that is not consent."""
+    pairing, _code, session_id, expires_at = _short_pairing(0.3)
+    pairing.invalidate_all()
+    assert pairing.has_active_session() is False
 
-    async def _run() -> None:
-        # An already-past deadline: the code's life is over, nobody paired.
-        await await_pairing_consumed(
+    async def _run() -> float:
+        return await await_pairing_consumed(
             pairing,
-            expires_at=time.time() - 1,
-            announce=lines.append,
-            poll_interval=0.01,
-            countdown_interval=0.02,
+            session_id=session_id,
+            expires_at=expires_at,
+            announce=lambda _l: None,
+            poll_interval=0.02,
         )
 
     with pytest.raises(PairingExpired):
         asyncio.run(_run())
 
 
-def test_the_gate_does_not_wait_when_there_is_no_active_session() -> None:
-    """An invalidated pairing opens the gate too: it will never be authorised."""
-    pairing = PairingManager(workspace_id="w")
-    pairing.create()
-    pairing.invalidate_all()
+def test_a_redemption_observed_after_the_deadline_still_counts() -> None:
+    """Consumption is checked before expiry, on purpose.
+
+    A code redeemed at 299 s but first observed at 301 s is an authorization the
+    operator completed; refusing it would throw the turn away. Only an expired
+    AND unredeemed pairing raises.
+    """
+    pairing, code, session_id, _expires = _short_pairing(5.0)
+    assert pairing.verify(code)["ok"] is True
 
     async def _run() -> float:
         return await await_pairing_consumed(
-            pairing, expires_at=time.time() + 300, announce=lambda _line: None
+            pairing,
+            session_id=session_id,
+            expires_at=time.time() - 1,  # already past
+            announce=lambda _l: None,
+            poll_interval=0.02,
         )
 
     assert asyncio.run(_run()) >= 0
 
 
+def test_a_refresh_token_in_the_store_also_opens_the_gate(tmp_path, workspace: Path) -> None:
+    """The stronger corroboration: the exchange completed and a token exists."""
+    pairing, _code, session_id, expires_at = _short_pairing(5.0)
+    server = bind_attempt(
+        attempt_id="store-evidence",
+        frozen_worktree=workspace,
+        manifest=["alpha.py"],
+        state_dir=connector_auth_dir(tmp_path, "https://front.example"),
+        public_base_url="https://front.example",
+    )
+    server.store.issue_tokens(client_id="chatgpt", scopes=["workspace.read", "offline_access"])
+
+    async def _run() -> float:
+        return await await_pairing_consumed(
+            pairing,
+            session_id=session_id,
+            expires_at=expires_at,
+            announce=lambda _l: None,
+            store=server.store,
+            poll_interval=0.02,
+        )
+
+    assert asyncio.run(_run()) >= 0
+    assert pairing.was_consumed(session_id) is False, "it opened on the STORE, not the session"
+
+
 # =====================================================================
-# Through the composed turn
+# Through the composed turn — D9.2 ordering
 # =====================================================================
 
 
-def test_pairing_consumed_then_the_browser_launches_in_that_order(
-    tmp_path, monkeypatch, workspace: Path
-) -> None:
-    """The ordering the pre-flight found inverted."""
+def test_launch_then_wait_then_goto_in_that_order(tmp_path, monkeypatch, workspace: Path) -> None:
+    """D9.2: the browser is up BEFORE the code is printed, and goto waits.
+
+    Pairing happens inside this window, in a second tab of the driven browser's
+    own session — one profile instance on the burner account, which is what
+    removes the proc_exited collision the operator card flagged.
+    """
     import cli_agent_orchestrator.chatgpt_web_runner.source_pull as source_pull
 
     port = _free_port()
     _configure(monkeypatch, tmp_path, port)
-    launches: list[float] = []
-    _stub_browser(monkeypatch, launches)
+    monkeypatch.setenv("CHATGPT_PULL_PAIRING_TTL_S", "5")
+    events: list = []
+    _stub_browser(monkeypatch, events)
 
     consumed_at: list[float] = []
     real_gate = source_pull.await_pairing_consumed
@@ -189,60 +311,62 @@ def test_pairing_consumed_then_the_browser_launches_in_that_order(
     async def _gate(pairing, **kwargs):
         async def _pair_soon() -> None:
             await asyncio.sleep(0.05)
-            pairing.invalidate_all()  # stands in for the operator authorising
+            # A REAL redemption, not invalidate_all: absence is not consent.
+            code = (tmp_path / "attempts" / "gate-order" / "pairing.code").read_text().strip()
+            assert pairing.verify(code)["ok"] is True
             consumed_at.append(time.monotonic())
 
         asyncio.ensure_future(_pair_soon())
-        return await real_gate(pairing, **{**kwargs, "poll_interval": 0.01})
+        return await real_gate(pairing, **{**kwargs, "poll_interval": 0.02})
 
     monkeypatch.setattr(source_pull, "await_pairing_consumed", _gate, raising=False)
 
     log = _attempt(tmp_path, "gate-order")
-    with pytest.raises(RuntimeError, match="stop the turn at the browser boundary"):
+    with pytest.raises(RuntimeError, match="stop the turn at the navigation boundary"):
         asyncio.run(_drive(log, "gate-order", workspace))
 
-    assert consumed_at, "the pairing was never consumed"
-    assert launches, "the browser never launched after consumption"
-    # ORDER, not just occurrence: the browser opened AFTER the operator paired.
-    assert launches[0] > consumed_at[0]
+    kinds = [kind for kind, _at in events]
+    assert kinds[0] == "launch", f"the browser must be up before the gate: {kinds}"
+    assert "goto" in kinds, "the turn never navigated"
+    assert consumed_at, "the pairing was never redeemed"
+    launch_at = next(at for kind, at in events if kind == "launch")
+    goto_at = next(at for kind, at in events if kind == "goto")
+    # ORDER, not occurrence.
+    assert launch_at < consumed_at[0] < goto_at
 
 
-def test_an_expired_pairing_aborts_with_no_browser_and_no_mint(
+def test_an_expired_pairing_after_launch_closes_the_browser_and_spends_nothing(
     tmp_path, monkeypatch, workspace: Path
 ) -> None:
-    import cli_agent_orchestrator.chatgpt_web_runner.source_pull as source_pull
+    """Expiry on the REAL clock: a short TTL and nobody pairs."""
     from cli_agent_orchestrator.chatgpt_web_runner.source_pull import PAIRING_CODE_FILENAME
 
     port = _free_port()
     _configure(monkeypatch, tmp_path, port)
-    launches: list[float] = []
-    _stub_browser(monkeypatch, launches)
-
-    real_gate = source_pull.await_pairing_consumed
-
-    async def _gate(pairing, **kwargs):
-        # The code's life is already over when the gate opens.
-        return await real_gate(
-            pairing, **{**kwargs, "expires_at": time.time() - 1, "poll_interval": 0.01}
-        )
-
-    monkeypatch.setattr(source_pull, "await_pairing_consumed", _gate, raising=False)
+    # The real gate, the real clock, a deadline an arm can afford to wait out.
+    monkeypatch.setenv("CHATGPT_PULL_PAIRING_TTL_S", "0.4")
+    events: list = []
+    contexts = _stub_browser(monkeypatch, events)
 
     log = _attempt(tmp_path, "gate-expired")
     with pytest.raises(RunnerError) as excinfo:
         asyncio.run(_drive(log, "gate-expired", workspace))
 
     assert excinfo.value.code is RunnerErrorCode.PAIRING_EXPIRED
-    # NOTHING_SENT is the honest classification: the gate sits before the profile.
     assert excinfo.value.delivery_state.value == "nothing-sent"
-    assert launches == [], "the browser launched despite an expired pairing"
+
+    kinds = [kind for kind, _at in events]
+    assert "launch" in kinds, "the gate must sit after the launch (D9.2)"
+    assert "goto" not in kinds, "the page navigated despite an expired pairing"
+
+    # The browser the turn opened is closed by the teardown.
+    assert contexts and contexts[0].closed is True
 
     record = SendIntentLog(tmp_path / "attempts" / "gate-expired").load()
     assert record is not None
     assert record.attempt_state == AttemptState.ERROR.value
     assert record.route_disposition == "pairing_expired"
     assert record.reserved_at is None and record.submits_dispatched == 0
-    # The raw code did not outlive the attempt.
     assert not (tmp_path / "attempts" / "gate-expired" / PAIRING_CODE_FILENAME).exists()
 
 
@@ -292,11 +416,11 @@ def test_a_stored_refresh_token_means_no_pairing_is_issued(
         return 0.0
 
     monkeypatch.setattr(source_pull, "await_pairing_consumed", _gate, raising=False)
-    launches: list[float] = []
-    _stub_browser(monkeypatch, launches)
+    events: list = []
+    _stub_browser(monkeypatch, events)
 
     log = _attempt(tmp_path, "reuse")
-    with pytest.raises(RuntimeError, match="stop the turn at the browser boundary"):
+    with pytest.raises(RuntimeError, match="stop the turn at the navigation boundary"):
         asyncio.run(_drive(log, "reuse", workspace))
 
     record = SendIntentLog(tmp_path / "attempts" / "reuse").load()
@@ -305,7 +429,7 @@ def test_a_stored_refresh_token_means_no_pairing_is_issued(
     assert record.connector_pairing_code_sha256 is None, "a code was minted despite reuse"
     assert not (tmp_path / "attempts" / "reuse" / PAIRING_CODE_FILENAME).exists()
     assert gate_calls == [], "the operator was made to wait despite a reusable authorization"
-    assert launches, "the turn did not proceed to the browser"
+    assert any(k == "launch" for k, _ in events), "the turn did not proceed to the browser"
 
 
 def test_an_unusable_stored_token_issues_a_fresh_pairing(
@@ -341,7 +465,7 @@ def test_an_unusable_stored_token_issues_a_fresh_pairing(
     _stub_browser(monkeypatch, [])
 
     log = _attempt(tmp_path, "stale")
-    with pytest.raises(RuntimeError, match="stop the turn at the browser boundary"):
+    with pytest.raises(RuntimeError, match="stop the turn at the navigation boundary"):
         asyncio.run(_drive(log, "stale", workspace))
 
     record = SendIntentLog(tmp_path / "attempts" / "stale").load()
