@@ -92,8 +92,13 @@ class FakeHerdrServer:
         self.requests: list[dict[str, Any]] = []
         #: One entry per accepted CONNECTION, holding the methods that arrived on
         #: it in order.  ``requests`` alone cannot answer "were these two calls on
-        #: the same socket", which is the property the Seam B race narrowing is.
+        #: the same socket", and that question is what the review r1 §3 race
+        #: turns on.
         self.connections: list[list[str]] = []
+        #: Reproduce herdr's one-request-per-connection rule.  A test that needs
+        #: the older, laxer fake sets this False and says why.
+        self.one_request_per_connection = True
+        self._subscribed_writers: list[asyncio.StreamWriter] = []
         self.on_request: Handler = FakeHerdrServer._default_handler
 
     async def __aenter__(self) -> "FakeHerdrServer":
@@ -149,7 +154,13 @@ class FakeHerdrServer:
             self._writer = writer
             await self.on_request(self, request)
 
+    def _subscribed_on(self, writer: asyncio.StreamWriter) -> bool:
+        return writer in self._subscribed_writers
+
     async def reply(self, request_id: str, result: dict[str, Any]) -> None:
+        if result.get("type") == "subscription_started" and self._writer is not None:
+            # A subscribed connection STREAMS; it is not dropped after its ack.
+            self._subscribed_writers.append(self._writer)
         await self._write({"id": request_id, "result": result})
 
     async def error(self, request_id: str, code: str, message: str) -> None:
@@ -186,6 +197,14 @@ class FakeHerdrServer:
         assert self._writer is not None
         self._writer.write(json.dumps(obj).encode() + b"\n")
         await self._writer.drain()
+        if self.one_request_per_connection and "id" in obj:
+            # herdr 0.9.0 serves ONE request per API connection and drops it
+            # (measured live, grok-box-005 2026-09-16).  A fake that kept
+            # answering would let the suite bless a client herdr refuses, which
+            # is exactly what happened to r2's single-connection narrowing.
+            # Subscriptions are exempt: that connection STREAMS after its ack.
+            if not self._subscribed_on(self._writer):
+                self._writer.close()
 
     async def _default_handler(self, request: dict[str, Any]) -> None:
         method = request.get("method")
@@ -1298,16 +1317,23 @@ async def test_agent_not_found_is_a_pane_absent(socket_path: str) -> None:
         assert result.detail == "herdr:agent_not_found"
 
 
-async def test_the_state_read_and_the_submission_share_one_connection(
+async def test_the_state_read_and_the_submission_use_separate_connections(
     socket_path: str,
 ) -> None:
-    """The race narrowing of review r1 §3, as a countable property.
+    """herdr serves ONE request per API connection, so two calls need two.
 
-    r1 read the state on its own short-lived connection and then opened a second
-    one to submit, so a full connect/teardown sat between the observation and
-    the act it qualifies. herdr offers no submission identity, so the race cannot
-    be CLOSED — but the window can be a message gap on an already-open socket
-    instead of two connection lifetimes, and that is what this pins.
+    r2 tried the opposite and the live round refuted it.  On grok-box-005
+    (2026-09-16) a second request on the same connection failed on the write,
+    for every method::
+
+        get,get     req 1 ok / EXC ... Connection lost   submitted=False
+        ping,ping   req 1 ok / EXC ... Connection lost   submitted=False
+
+    This is pinned as a test because it is the reason the review r1 §3 race
+    cannot be narrowed from here: the window between the observation and the act
+    it qualifies is a whole connection lifetime, and herdr leaves no way to make
+    it smaller.  The fake server below enforces the same rule, so a later change
+    that assumes otherwise fails here rather than on a box.
     """
 
     async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
@@ -1330,8 +1356,9 @@ async def test_the_state_read_and_the_submission_share_one_connection(
         result = await client.prompt_agent(target="%3", text="hello")
         assert result.outcome is AttemptOutcome.DELIVERED
         assert server.connections == [
-            ["agent.get", "agent.prompt"]
-        ], "the read and the submission must ride ONE connection, in this order"
+            ["agent.get"],
+            ["agent.prompt"],
+        ], "one request per connection, in this order"
 
 
 async def test_a_failed_state_read_still_submits_and_reports_no_pre_state(
@@ -1367,3 +1394,35 @@ async def test_a_failed_state_read_still_submits_and_reports_no_pre_state(
         assert result.outcome is AttemptOutcome.SUBMISSION_UNCERTAIN
         assert result.detail == "herdr:no_pre_state"
         assert len(_prompts(server)) == 1, "the submission is made regardless"
+
+
+async def test_agent_not_running_is_also_a_pane_absent(socket_path: str) -> None:
+    """A pane that outlived its agent, in herdr's own words.
+
+    Observed in the r2 live round on grok-box-005: a provider exited on a failed
+    login, the PANE stayed, and the next prompt answered
+    ``agent_not_running`` — "agent is no longer running in the target pane".
+    The review's crash probe reached the same condition by killing the process
+    and got ``agent_not_found``; r1 mapped only that one, so this route fell to
+    the unmapped ``VETO_UNVERIFIED`` default and said something less true about
+    a pane that is demonstrably empty.
+    """
+
+    async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
+        if request.get("method") == "agent.get":
+            await _pre_state()(server, request)
+        elif request.get("method") == "agent.prompt":
+            await server.error(
+                request["id"],
+                "agent_not_running",
+                "agent is no longer running in the target pane",
+            )
+        else:
+            await FakeHerdrServer._default_handler(server, request)
+
+    async with FakeHerdrServer(socket_path) as server:
+        server.on_request = handler
+        client = HerdrClient(socket_path)
+        result = await client.prompt_agent(target="%3", text="hello")
+        assert result.outcome is AttemptOutcome.PANE_ABSENT
+        assert result.detail == "herdr:agent_not_running"
