@@ -13,6 +13,7 @@ import click
 
 from cli_agent_orchestrator.cli.orchestrator_commands.fold_corpus import fold_corpus
 from cli_agent_orchestrator.cli.orchestrator_commands.ledger import ledger
+from cli_agent_orchestrator.cli.orchestrator_commands.lint_doctrine import lint_doctrine
 from cli_agent_orchestrator.cli.orchestrator_commands.sync_routing import sync_routing
 
 try:
@@ -30,6 +31,7 @@ def cli() -> None:
 cli.add_command(ledger)
 cli.add_command(fold_corpus)
 cli.add_command(sync_routing)
+cli.add_command(lint_doctrine)
 
 
 if __name__ == "__main__":
