@@ -90,6 +90,10 @@ class FakeHerdrServer:
         self._writers: list[asyncio.StreamWriter] = []
         self._serve_tasks: list[asyncio.Task[None]] = []
         self.requests: list[dict[str, Any]] = []
+        #: One entry per accepted CONNECTION, holding the methods that arrived on
+        #: it in order.  ``requests`` alone cannot answer "were these two calls on
+        #: the same socket", which is the property the Seam B race narrowing is.
+        self.connections: list[list[str]] = []
         self.on_request: Handler = FakeHerdrServer._default_handler
 
     async def __aenter__(self) -> "FakeHerdrServer":
@@ -123,6 +127,8 @@ class FakeHerdrServer:
 
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self._writers.append(writer)
+        methods: list[str] = []
+        self.connections.append(methods)
         if self._stream_writer is None:
             self._stream_writer = writer
         task = asyncio.current_task()
@@ -137,6 +143,7 @@ class FakeHerdrServer:
                 continue
             request = json.loads(text)
             self.requests.append(request)
+            methods.append(str(request.get("method")))
             # Per REQUEST, not per connection: a handler's ``reply`` must reach
             # the client that asked, even while another connection is open.
             self._writer = writer
@@ -1289,3 +1296,74 @@ async def test_agent_not_found_is_a_pane_absent(socket_path: str) -> None:
         result = await client.prompt_agent(target="nope", text="hello")
         assert result.outcome is AttemptOutcome.PANE_ABSENT
         assert result.detail == "herdr:agent_not_found"
+
+
+async def test_the_state_read_and_the_submission_share_one_connection(
+    socket_path: str,
+) -> None:
+    """The race narrowing of review r1 §3, as a countable property.
+
+    r1 read the state on its own short-lived connection and then opened a second
+    one to submit, so a full connect/teardown sat between the observation and
+    the act it qualifies. herdr offers no submission identity, so the race cannot
+    be CLOSED — but the window can be a message gap on an already-open socket
+    instead of two connection lifetimes, and that is what this pins.
+    """
+
+    async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
+        if request.get("method") == "agent.get":
+            await _pre_state("idle", 4)(server, request)
+        elif request.get("method") == "agent.prompt":
+            await server.reply(
+                request["id"],
+                {
+                    "type": "agent_prompted",
+                    "agent": {"agent_status": "working", "state_change_seq": 5},
+                },
+            )
+        else:
+            await FakeHerdrServer._default_handler(server, request)
+
+    async with FakeHerdrServer(socket_path) as server:
+        server.on_request = handler
+        client = HerdrClient(socket_path)
+        result = await client.prompt_agent(target="%3", text="hello")
+        assert result.outcome is AttemptOutcome.DELIVERED
+        assert server.connections == [
+            ["agent.get", "agent.prompt"]
+        ], "the read and the submission must ride ONE connection, in this order"
+
+
+async def test_a_failed_state_read_still_submits_and_reports_no_pre_state(
+    socket_path: str,
+) -> None:
+    """A read that cannot be answered is a missing INPUT, not a failed delivery.
+
+    Review r1 §10.5: r1 conflated the two, so a read timeout was journalled
+    ``SUBMISSION_UNCERTAIN`` even though nothing had been written to the agent.
+    The read now has its own bound and its own swallowed failure; the submission
+    goes ahead, and ``no_pre_state`` is honest precisely because by then the text
+    HAS gone.
+    """
+
+    async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
+        if request.get("method") == "agent.get":
+            await server.error(request["id"], "unavailable", "cannot read")
+        elif request.get("method") == "agent.prompt":
+            await server.reply(
+                request["id"],
+                {
+                    "type": "agent_prompted",
+                    "agent": {"agent_status": "working", "state_change_seq": 5},
+                },
+            )
+        else:
+            await FakeHerdrServer._default_handler(server, request)
+
+    async with FakeHerdrServer(socket_path) as server:
+        server.on_request = handler
+        client = HerdrClient(socket_path)
+        result = await client.prompt_agent(target="%3", text="hello")
+        assert result.outcome is AttemptOutcome.SUBMISSION_UNCERTAIN
+        assert result.detail == "herdr:no_pre_state"
+        assert len(_prompts(server)) == 1, "the submission is made regardless"
