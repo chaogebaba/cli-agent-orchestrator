@@ -566,24 +566,42 @@ def test_ac35_send_once_is_the_only_origin_post_in_the_runner() -> None:
 def test_d11_production_wires_the_disposition_oracle() -> None:
     """``observe()`` must be reachable from the composed path.
 
-    ``HeldRoute`` decides `released_to_origin` from PUBLIC Playwright request
-    events. A composition that never fed them could not detect the one outcome
-    Amendment D exists to prevent, and every arm proving the oracle works would
-    be proving a property production does not have.
+    Structural, not textual. The two source-text scans this replaces asserted
+    the build-stop branch was *written* — which it was, while the control flow
+    could not reach it on either ordering (B3 review finding 4). The arms that
+    now prove reachability by EXECUTION live in
+    ``test_f862_d11_composed_arms.py``; what is left here is the one static
+    fact those arms cannot state: the wiring call exists in the dispatcher.
     """
-    text = Path(production.__file__).read_text(encoding="utf-8")
-    assert "_wire_request_events(page, custody" in text
-    assert 'for name in ("requestfailed", "requestfinished", "response")' in text
-    assert "holder.observe(event_name)" in text
+    import ast
 
-
-def test_d11_released_to_origin_is_a_hard_stop_in_production() -> None:
-    """The build-stop branch refuses; it does not warn and continue."""
     text = Path(production.__file__).read_text(encoding="utf-8")
-    assert "D11 build stop" in text
-    stop = text.index("D11 BUILD STOP")
-    # Between the detection and the next state transition there is a raise.
-    assert "raise RunnerError(" in text[stop : stop + 1500]
+    tree = ast.parse(text)
+    dispatcher = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_dispatcher"
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_wire_request_events"
+        for node in ast.walk(dispatcher)
+    ), "the dispatcher does not feed the D1 disposition oracle"
+
+    wire = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_wire_request_events"
+    )
+    events = {
+        element.value
+        for node in ast.walk(wire)
+        if isinstance(node, ast.Tuple)
+        for element in node.elts
+        if isinstance(element, ast.Constant) and isinstance(element.value, str)
+    }
+    assert {"requestfailed", "requestfinished", "response"} <= events
 
 
 def test_d11_the_oracle_distinguishes_a_release_from_a_local_fulfil() -> None:

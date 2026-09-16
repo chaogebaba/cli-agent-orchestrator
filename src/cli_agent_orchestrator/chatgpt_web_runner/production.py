@@ -75,6 +75,16 @@ _HOLD_TIMEOUT_S = 60.0
 #: The detached authoritative GET's bound (inherited cadence, D6).
 _GET_TIMEOUT_S = 420.0
 
+#: D6/N3: an unresolved attempt must close or quarantine its page BEFORE the
+#: profile lease is released, and the ledger accepts only
+#: ``quarantined`` / ``closed`` / ``live``. Every failure path here ends in the
+#: teardown's unconditional ``context.close()``, so ``closed`` is the honest
+#: value — and it is the one the record must carry, because the previous
+#: ``"open"`` was not a legal disposition at all: ``record_ack_unknown`` raised
+#: ``SendIntentViolation`` on every ACK_UNKNOWN write, which turned each of them
+#: into a second, unclassified failure on top of the first.
+_PAGE_DISPOSITION_ON_FAILURE = "closed"
+
 
 def _artifacts_dir() -> Path:
     return Path(
@@ -413,7 +423,13 @@ async def _drive_composed_turn(
             method = str(getattr(request, "method", "GET"))
             url = str(getattr(request, "url", ""))
         except Exception:  # pragma: no cover - defensive
-            await route.continue_()
+            # ABORT, never continue. This branch runs when the request will not
+            # tell us its own method or url, so it is exactly the case where we
+            # cannot rule out that it IS the conversation POST. Continuing would
+            # be the one `continue_()` in this dispatcher that could release the
+            # send to the origin; aborting costs a page asset at worst
+            # (B3 review §8 item 4).
+            await route.abort()
             return
         if not is_conversation_post(method, url):
             try:
@@ -552,39 +568,62 @@ async def _drive_composed_turn(
             deadline=time.monotonic() + _GET_TIMEOUT_S,
             get_conversation=_detached_get(captured),
         )
+        # The GET chose the node and the branch; record both. Before this they
+        # were declared on the record and never assigned, so the two fields the
+        # live-turn ledger tells the supervisor to read came back null
+        # (B3 review §7(b)).
+        intent_log.transition(
+            AttemptState.GET_VERIFY,
+            verified_node_id=answer.assistant_node_id,
+            conversation_digest=branch_digest,
+        )
 
         # ── the LOCAL synthetic fulfil ────────────────────────────────────
         # Built from the exact object Python posted, so the page renders the
         # answer it would have rendered — without a second origin request.
-        disposition = await holder.fulfil(
-            body=synthetic_v1_stream(
-                posted_user_message=posted_user_message,
-                conversation_id=conversation_id,
-                assistant_id=answer.assistant_node_id,
-                final_text=answer.text,
-            )
-        )
+        #
+        # D11 BUILD STOP, ORDERING A. The release may ALREADY be recorded by the
+        # time we get here: a `response` observed while the route was still HELD
+        # terminates `released_to_origin` (D1). ``fulfil()`` refuses from any
+        # non-HELD disposition, so calling it first would raise
+        # RouteCustodyError — a RuntimeError, which ``run_review`` does not
+        # catch — and the whole detector below would be skipped, taking the
+        # callback and the ledger row with it. So the disposition is read BEFORE
+        # the fulfil, not after it. (B3 review finding 4.)
         await custody.settle()
-        # D11 BUILD STOP. `released_to_origin` means the BROWSER's copy of the
-        # conversation POST also reached the origin after Python had already
-        # invoked it: two sends for one mint, which is the outcome Amendment D
-        # exists to prevent. It is never recoverable and never publishable.
+        if holder.disposition is RouteDisposition.RELEASED_TO_ORIGIN:
+            raise _d11_build_stop(intent_log, "before the local fulfil was attempted")
+
+        try:
+            disposition = await holder.fulfil(
+                body=synthetic_v1_stream(
+                    posted_user_message=posted_user_message,
+                    conversation_id=conversation_id,
+                    assistant_id=answer.assistant_node_id,
+                    final_text=answer.text,
+                )
+            )
+        except RouteCustodyError as exc:
+            raise classify_refused_fulfil(intent_log, holder, exc) from exc
+
+        await custody.settle()
+        # D11 BUILD STOP, ORDERING B. An event landing at or after the
+        # HELD -> FULFILLING CAS is, by D1(iii), indistinguishable from the local
+        # fulfil's own completion and terminates `fulfilled`. That classification
+        # is correct and is NOT reinterpreted here. What the detector owes is to
+        # RECORD what it saw, so `route_disposition` separates the outcomes
+        # instead of being absent on the happy path and absent on a stop alike.
         if RouteDisposition.RELEASED_TO_ORIGIN in (disposition, holder.disposition):
-            intent_log.record_ack_unknown(
-                route_disposition=RouteDisposition.RELEASED_TO_ORIGIN.value,
-                page_disposition="open",
-            )
-            raise RunnerError(
-                RunnerErrorCode.SUBMIT_UNKNOWN,
-                "D11 build stop: the held browser copy was released to the origin after "
-                "the Python invocation — two sends for one mint",
-                delivery_state=DeliveryState.ACK_UNKNOWN,
-            )
+            raise _d11_build_stop(intent_log, "after the local fulfil completed")
         if disposition is RouteDisposition.FULFILLED:
-            intent_log.transition(AttemptState.BROWSER_FULFIL)
+            intent_log.transition(
+                AttemptState.BROWSER_FULFIL,
+                route_disposition=RouteDisposition.FULFILLED.value,
+                fulfilled_at=time.time(),
+            )
         else:
             intent_log.record_ack_unknown(
-                route_disposition=disposition.value, page_disposition="open"
+                route_disposition=disposition.value, page_disposition=_PAGE_DISPOSITION_ON_FAILURE
             )
 
         # ── AC-33 source correlation, BEFORE publication ──────────────────
@@ -594,10 +633,16 @@ async def _drive_composed_turn(
             )
 
             evidence = collect_pull_evidence(connector_audit_projection(connector_server))
+            # The two digests must come from DIFFERENT observations or the check
+            # is vacuous (B3 review §8 item 4). `branch_digest` is what
+            # poll_authoritative_get accepted; `recorded` is what the ledger
+            # stored on the GET_VERIFY row. They agree only if nothing rewrote
+            # the branch between acceptance and this point.
+            recorded = str(intent_log.record.conversation_digest or "")
             correlated = verify_source_correlation(
                 evidence,
                 answer_text=answer.text,
-                observed_branch_digest=branch_digest,
+                observed_branch_digest=recorded,
                 accepted_branch_digest=branch_digest,
             )
             pull_evidence["sources"] = [
@@ -612,6 +657,26 @@ async def _drive_composed_turn(
                 RunnerErrorCode.SUBMIT_UNKNOWN, failure, delivery_state=DeliveryState.ACK_UNKNOWN
             )
         return answer
+    except RouteCustodyError as exc:
+        # BACKSTOP. Custody errors are RuntimeErrors, and ``run_review`` catches
+        # only RunnerError — so any RouteCustodyError that escapes this function
+        # escapes the whole runner, and the worker sends NO callback: neither
+        # FINDINGS-READY nor FINDINGS-FAILED. That is exactly how the D11 stop
+        # became unobservable (B3 review finding 4). The sites above classify
+        # the ones they can name; this converts anything else (``send_once``'s
+        # ``guard_for_python`` and ``mark_python_invoked`` both raise it) so the
+        # failure is always typed, always recorded, and always called back.
+        held = custody.holder
+        observed = held.disposition.value if held is not None else "unknown"
+        with contextlib.suppress(Exception):
+            intent_log.record_ack_unknown(
+                route_disposition=observed, page_disposition=_PAGE_DISPOSITION_ON_FAILURE
+            )
+        raise RunnerError(
+            RunnerErrorCode.SUBMIT_UNKNOWN,
+            f"route custody was lost during the composed turn ({observed}): {exc}",
+            delivery_state=DeliveryState.ACK_UNKNOWN,
+        ) from exc
     finally:
         # Release the parked holder FIRST so the owner task can end without
         # racing the teardown, then take the pull plane and the browser down.
@@ -625,6 +690,66 @@ async def _drive_composed_turn(
             await connector_listener.stop()
         with contextlib.suppress(Exception):
             await context.close()
+
+
+def classify_refused_fulfil(intent_log: Any, holder: Any, exc: Exception) -> RunnerError:
+    """Type the outcome when ``fulfil()`` refuses, and record it.
+
+    ``fulfil()`` refuses from any non-HELD disposition, so this runs when the
+    route stopped being HELD between the pre-fulfil check and the
+    HELD -> FULFILLING CAS. That window is genuinely narrow — narrow enough that
+    the offline harness cannot drive it deterministically, because the observe
+    that would close it is a task and there is no await between the check and
+    the CAS — which is exactly why the classification lives in a named function
+    with its own arms rather than inline where only a race could reach it.
+
+    Whatever the route became, it is TYPED here. ``RouteCustodyError`` is a
+    RuntimeError and ``run_review`` catches only ``RunnerError``, so letting one
+    escape means the worker sends no callback of either kind (B3 review
+    finding 4).
+    """
+    from cli_agent_orchestrator.chatgpt_web_runner.in_page_transport import RouteDisposition
+
+    observed = holder.disposition
+    if observed is RouteDisposition.RELEASED_TO_ORIGIN:
+        return _d11_build_stop(intent_log, "the local fulfil was refused")
+    intent_log.record_ack_unknown(
+        route_disposition=observed.value, page_disposition=_PAGE_DISPOSITION_ON_FAILURE
+    )
+    return RunnerError(
+        RunnerErrorCode.SUBMIT_UNKNOWN,
+        f"the held browser copy could not be fulfilled locally: {exc}",
+        delivery_state=DeliveryState.ACK_UNKNOWN,
+    )
+
+
+def _d11_build_stop(intent_log: Any, when: str) -> RunnerError:
+    """Record the D11 terminal and return the typed error to raise.
+
+    `released_to_origin` means the BROWSER's copy of the conversation POST also
+    reached the origin after Python had already invoked it: two sends for one
+    mint, which is the outcome Amendment D exists to prevent. It is never
+    recoverable and never publishable.
+
+    This is a helper rather than three inline copies because the stop is
+    reachable from three points in the fulfil sequence, and the B3 review's
+    finding was precisely that a stop written once, in the one place the control
+    flow could not reach, looks exactly like a stop that never needed to fire.
+    Returning the error (instead of raising) keeps `raise _d11_build_stop(...)`
+    readable at each site and keeps the ledger write next to the raise.
+    """
+    from cli_agent_orchestrator.chatgpt_web_runner.in_page_transport import RouteDisposition
+
+    intent_log.record_ack_unknown(
+        route_disposition=RouteDisposition.RELEASED_TO_ORIGIN.value,
+        page_disposition=_PAGE_DISPOSITION_ON_FAILURE,
+    )
+    return RunnerError(
+        RunnerErrorCode.SUBMIT_UNKNOWN,
+        "D11 build stop: the held browser copy was released to the origin after the "
+        f"Python invocation ({when}) — two sends for one mint",
+        delivery_state=DeliveryState.ACK_UNKNOWN,
+    )
 
 
 def _wire_request_events(page: Any, custody: _HeldRouteCustody, request: Any) -> None:
