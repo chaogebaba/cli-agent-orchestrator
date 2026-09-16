@@ -133,6 +133,31 @@ class HeldRoute:
         self._disposition = RouteDisposition.HELD
         self._python_invoked = False
         self._terminal_written_at: Optional[float] = None
+        self._owner_death_settled = False
+        # D1: "any holder-task exit for another reason ... before invocation it
+        # is ABANDONED_PRE_INVOKE with route disposition `lost`". A cancelled
+        # worker never gets to call on_teardown(), so without this callback the
+        # disposition stays HELD forever: the send guard still refuses (it
+        # checks the live task), but the attempt can never record a terminal
+        # and forbid_while_held() locks out its own cleanup. The holder writing
+        # its own terminal as it dies keeps the one-writer rule intact, and
+        # _set_terminal is idempotent, so a real terminal already written by
+        # fulfil/abort/observe always wins.
+        if self._owner_task is not None:
+            self._owner_task.add_done_callback(self._on_owner_done)
+
+    def _on_owner_done(self, _task: "asyncio.Task[Any]") -> None:
+        """Write the fail-closed terminal when the holder task stops existing."""
+        self._owner_death_settled = True
+        if self._disposition not in _TERMINAL_ROUTE_DISPOSITIONS:
+            # Conservative by construction: a hold whose owner died mid-flight
+            # is never provably un-sent, so it is `lost`, never `aborted`.
+            self._set_terminal(RouteDisposition.LOST)
+
+    @property
+    def owner_death_settled(self) -> bool:
+        """True once the holder task has ended and its terminal is written."""
+        return self._owner_death_settled
 
     @property
     def disposition(self) -> RouteDisposition:

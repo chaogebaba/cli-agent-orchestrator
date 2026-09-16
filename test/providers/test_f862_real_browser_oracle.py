@@ -20,6 +20,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import os
+from pathlib import Path
 from test.fixtures.chatgpt_web_fake_origin import FakeOrigin
 from test.fixtures.chatgpt_web_real_browser import (
     HeldRouteSession,
@@ -53,6 +56,21 @@ pytestmark = [
         reason=f"real-browser oracle needs Chromium: {chromium_unavailable_reason()}",
     ),
 ]
+
+#: When set, every arm appends its evidence row here as JSON lines, so the
+#: readiness report cites what the run actually observed instead of a
+#: transcription of it.
+EVIDENCE_PATH = os.environ.get("CAO_F862_EVIDENCE")
+
+
+def _record_evidence(row: dict) -> None:
+    if not EVIDENCE_PATH:
+        return
+    path = Path(EVIDENCE_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, sort_keys=True) + "\n")
+
 
 POSTED_USER_MESSAGE = {
     "id": "user-real-1",
@@ -303,11 +321,23 @@ async def _teardown_action(session: HeldRouteSession) -> None:
         session.notes["guard_error"] = str(exc)
 
 
+#: Every way D1 lets the send guard refuse. The arm asserts the guard refused
+#: with one of these, not with a particular one: which cut a given teardown
+#: trips (dead holder task vs bumped generation) is a Playwright-ordering
+#: detail, and pinning one of them would make the arm assert the accident
+#: rather than the property. All three are fail-closed and pre-network.
+CUSTODY_REFUSALS = (
+    "route holder task is not live",
+    "page/context/CDP generation changed",
+    "not held; Python POST refused",
+)
+
+
 async def _run_teardown_arm(
     tmp_path: Any,
     inject: Any,
     *,
-    expect_guard_error: str = "not held",
+    arm: str,
     cancel_holder: bool = False,
 ) -> dict:
     """One AC-25 pre-invocation arm; returns the evidence row it produced."""
@@ -327,11 +357,22 @@ async def _run_teardown_arm(
                 await asyncio.wait_for(session.finished.wait(), 20)
             await session.settle()
 
+            # The holder task is gone in every arm; D1 makes its death write a
+            # terminal, so read the disposition after it has been reaped.
+            guard_error = session.notes.get("guard_error")
+            if cancel_holder:
+                # A cancelled worker never reached the in-handler guard call.
+                assert session.holder is not None
+                with pytest.raises(RouteCustodyError) as excinfo:
+                    await session.holder.guard_for_python(session.generations.current)
+                guard_error = str(excinfo.value)
+
             receipts = origin.ledger.snapshot()
             row = {
-                "disposition": session.disposition,
-                "guard_error": session.notes.get("guard_error"),
-                "events": list(session.events),
+                "arm": arm,
+                "disposition": session.disposition.value,
+                "guard_refusal": guard_error,
+                "playwright_events": list(session.events),
                 "origin_receipts": len(receipts),
                 "restart_action": log.restart_action(),
             }
@@ -342,26 +383,25 @@ async def _run_teardown_arm(
             assert log.record.reserved_at is None
             assert log.record.invoked_at is None
 
-            if cancel_holder:
-                # A cancelled worker cannot be the live holder any more.
-                assert session.holder is not None
-                with pytest.raises(RouteCustodyError, match="not live"):
-                    await session.holder.guard_for_python(session.generations.current)
-            else:
-                assert row["guard_error"] is not None
-                assert expect_guard_error in row["guard_error"]
+            # The send guard refused, by one of D1's three fail-closed cuts.
+            assert guard_error is not None, "the guard admitted a torn-down hold"
+            assert any(reason in guard_error for reason in CUSTODY_REFUSALS), guard_error
 
+            # A torn-down hold is never resend-safe: `aborted` is reserved for a
+            # holder-owned abort that succeeded from HELD, and nothing upgrades
+            # `lost` to it.
+            assert session.disposition is not RouteDisposition.ABORTED
             assert session.disposition in {
                 RouteDisposition.LOST,
                 RouteDisposition.RELEASED_TO_ORIGIN,
             }, session.disposition
-            # `lost` is never resend-safe: the terminal is ACK_UNKNOWN.
             log.record_ack_unknown(
-                route_disposition=str(row["disposition"].value),
+                route_disposition=row["disposition"],
                 page_disposition="closed",
             )
             assert log.record.attempt_state == AttemptState.ACK_UNKNOWN.value
             assert log.can_fresh_same_turn_mint() is False
+            _record_evidence(row)
             return row
 
 
@@ -403,7 +443,7 @@ async def test_arm_navigation_before_invocation(tmp_path):
     async def inject(harness, _session):
         await harness.inject_navigation()
 
-    row = await _run_teardown_arm(tmp_path, inject)
+    row = await _run_teardown_arm(tmp_path, inject, arm="navigate")
     assert row["origin_receipts"] == 0
 
 
@@ -412,7 +452,7 @@ async def test_arm_page_close_before_invocation(tmp_path):
     async def inject(harness, _session):
         await harness.inject_page_close()
 
-    row = await _run_teardown_arm(tmp_path, inject)
+    row = await _run_teardown_arm(tmp_path, inject, arm="page_close")
     assert row["origin_receipts"] == 0
 
 
@@ -421,7 +461,7 @@ async def test_arm_context_close_before_invocation(tmp_path):
     async def inject(harness, _session):
         await harness.inject_context_close()
 
-    row = await _run_teardown_arm(tmp_path, inject)
+    row = await _run_teardown_arm(tmp_path, inject, arm="context_close")
     assert row["origin_receipts"] == 0
 
 
@@ -430,7 +470,7 @@ async def test_arm_playwright_disconnect_before_invocation(tmp_path):
     async def inject(harness, _session):
         await harness.inject_browser_disconnect()
 
-    row = await _run_teardown_arm(tmp_path, inject)
+    row = await _run_teardown_arm(tmp_path, inject, arm="playwright_disconnect")
     assert row["origin_receipts"] == 0
 
 
@@ -440,7 +480,7 @@ async def test_arm_chromium_kill_before_invocation(tmp_path):
         await harness.inject_chromium_kill()
         assert not harness.chromium_alive()
 
-    row = await _run_teardown_arm(tmp_path, inject)
+    row = await _run_teardown_arm(tmp_path, inject, arm="chromium_kill")
     assert row["origin_receipts"] == 0
 
 
@@ -453,12 +493,14 @@ async def test_arm_driver_death_chromium_surviving(tmp_path):
         await harness.inject_driver_death()
         observed["chromium_alive"] = harness.chromium_alive()
 
-    row = await _run_teardown_arm(tmp_path, inject)
+    row = await _run_teardown_arm(tmp_path, inject, arm="driver_death")
     # Whether Chromium releases the paused request when its client vanishes is
     # a browser-owned behaviour; the design only requires that the runner never
     # treats it as proved non-delivery and never issues a second POST.
     assert row["origin_receipts"] in {0, 1}, row
-    assert row["disposition"] is not RouteDisposition.ABORTED
+    assert row["disposition"] != RouteDisposition.ABORTED.value
+    # The arm is only meaningful if Chromium really outlived its driver.
+    assert observed["chromium_alive"] is True, observed
 
 
 @pytest.mark.timeout(180)
@@ -466,5 +508,5 @@ async def test_arm_worker_cancellation_before_invocation(tmp_path):
     async def inject(_harness, _session):
         return None
 
-    row = await _run_teardown_arm(tmp_path, inject, cancel_holder=True)
+    row = await _run_teardown_arm(tmp_path, inject, arm="worker_cancellation", cancel_holder=True)
     assert row["origin_receipts"] == 0

@@ -111,6 +111,30 @@ def _pids_with(token: str) -> list[int]:
     return found
 
 
+def _descendant_driver_pid() -> Optional[int]:
+    """The Playwright node driver running beneath THIS python process, if any.
+
+    Walks our own descendants rather than scanning the whole machine, so a
+    second harness (or another lane on the same box) is never killed.
+    """
+    try:
+        import psutil
+    except Exception:  # pragma: no cover - psutil is a runtime dependency
+        return None
+    try:
+        me = psutil.Process()
+        for child in me.children(recursive=True):
+            try:
+                cmdline = " ".join(child.cmdline())
+            except Exception:
+                continue
+            if "playwright" in cmdline and ("driver" in cmdline or "run-driver" in cmdline):
+                return int(child.pid)
+    except Exception:
+        return None
+    return None
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -227,11 +251,21 @@ class RealBrowserHarness:
                 os.kill(pid, signal.SIGKILL)
 
     def _discover_driver_pid(self) -> Optional[int]:
+        """PID of the node driver process this Playwright instance just spawned.
+
+        Playwright's private transport attribute has moved between releases
+        (``_connection._transport._proc`` is absent on 1.5x), and an absent
+        driver PID silently disables the driver-death arm. So the private path
+        is only a hint: the authoritative answer is our own process tree, where
+        the driver is the descendant running ``.../playwright/driver/node``.
+        """
         connection = getattr(self.playwright, "_connection", None)
         transport = getattr(connection, "_transport", None)
         proc = getattr(transport, "_proc", None)
         pid = getattr(proc, "pid", None)
-        return int(pid) if isinstance(pid, int) else None
+        if isinstance(pid, int) and _pid_alive(pid):
+            return int(pid)
+        return _descendant_driver_pid()
 
     # --- interception -----------------------------------------------------
     async def arm_route(
