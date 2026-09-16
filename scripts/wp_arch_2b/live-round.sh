@@ -96,6 +96,9 @@ ROUND=$REMOTE_SCRATCH/\$ARM
 rm -rf "\$ROUND"; mkdir -p "\$ROUND"
 export CAO_HOME_DIR="\$ROUND/home"
 export CAO_WORKER_TRUTH_INGEST=1
+# The analyser must distinguish a herdr-backed cohort from an ordinary tmux
+# arm; record the seam precondition explicitly rather than infer it later.
+export CAO_HERDR_RUNTIME=1
 export CAO_WORKER_TRUTH_STATUS=$status_env
 export CAO_WORKER_TRUTH_STATUS_PROVIDERS=$providers_env
 mkdir -p "\$CAO_HOME_DIR"
@@ -117,7 +120,19 @@ export HOME=$BOXHOME
 # launch is accepted, and the provider pane sits at ``command not found`` until
 # the 180 s init timeout — which is what "the round produced no lanes" looks
 # like.  Lifted from scripts/box-e2e-launch.sh, where five gate rounds put it.
-export PATH="\$HOME/.bun/bin:\$HOME/.local/bin:\$HOME/.grok/bin:\$PATH"
+# herdr is installed in the box login prefix, while CAO and provider CLIs
+# are installed under the workload home.  Keep both prefixes: the round sets
+# HOME to the workload home for credentials, but herdr itself remains at
+# /home/box/.local/bin on provisioned images.
+export PATH="\$HOME/.bun/bin:\$HOME/.local/bin:\$HOME/.grok/bin:/home/box/.local/bin:/home/box/.bun/bin:\$PATH"
+# The built-in CAO ``developer`` profile is enough for most providers, but
+# Kiro also requires a matching base agent manifest.  Provisioned boxes carry
+# the repo's kiro_dev manifest; seed the generic name used by this harness.
+if [ ! -f "\$HOME/.kiro/agents/developer.json" ] &&
+   [ -f "\$HOME/.kiro/agents/kiro_dev.json" ]; then
+  mkdir -p "\$HOME/.kiro/agents"
+  cp "\$HOME/.kiro/agents/kiro_dev.json" "\$HOME/.kiro/agents/developer.json"
+fi
 
 cd $BOXHOME/cli-subagents/cli-agent-orchestrator || exit 2
 git fetch origin >/dev/null 2>&1
@@ -141,6 +156,35 @@ if tmux has-session -t "\$ARM_SESSION" 2>/dev/null; then
   exit 2
 fi
 
+# Herdr has persistent workspaces rather than tmux sessions.  Killing
+# cao-server does not remove one, so an aborted arm otherwise makes the next
+# `cao launch` answer "Session already exists" even though its port is clean.
+# Close only this harness arm's exact label; never sweep another workspace.
+python3 - "\$ARM_SESSION" <<'CLEAN_HERDR'
+import json
+import subprocess
+import sys
+
+target = sys.argv[1]
+try:
+    raw = subprocess.check_output(
+        ["herdr", "--session", "cao", "workspace", "list"],
+        text=True,
+        stderr=subprocess.DEVNULL,
+    )
+    body = json.loads(raw)
+except Exception:
+    raise SystemExit(0)
+for workspace in body.get("result", {}).get("workspaces", []):
+    if workspace.get("label") == target:
+        subprocess.run(
+            ["herdr", "--session", "cao", "workspace", "close", workspace["workspace_id"]],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+CLEAN_HERDR
+
 # Seed providers.toml the way install.sh does — copy the default only when the
 # arm's fresh home has none — so the provider model defaults are the repo's
 # rather than whatever a bare home implies.
@@ -154,13 +198,26 @@ fi
 # Started WITHOUT a subshell so ``\$!`` is this arm's server pid.  The teardown
 # below needs to stop exactly this process: the box is shared, and a pattern
 # kill there has already taken out another lane's server by accident.
-cao-server >"\$ROUND/server.log" 2>&1 &
+SERVER_PID=""
+SERIES_PID=""
+cleanup_arm() {
+  [ -n "\$SERIES_PID" ] && kill "\$SERIES_PID" 2>/dev/null || true
+  [ -n "\$SERVER_PID" ] && kill "\$SERVER_PID" 2>/dev/null || true
+}
+# A lane/auth failure is a harness failure, but it must not leave a server
+# bound to the shared port for the next arm or another box user.
+trap cleanup_arm EXIT
+cao-server --terminal herdr >"\$ROUND/server.log" 2>&1 &
 SERVER_PID=\$!
 for _ in \$(seq 1 60); do
   curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
   sleep 1
 done
-curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 || { echo "HARNESS: server never came up"; exit 2; }
+health_json=\$(curl -sf "http://127.0.0.1:$PORT/health" 2>/dev/null || true)
+[ -n "\$health_json" ] || { echo "HARNESS: server never came up"; exit 2; }
+python3 -c 'import json,sys; data=json.loads(sys.argv[1]); expected="herdr"; actual=data.get("terminal_backend"); sys.exit(0 if actual == expected else 1)' "\$health_json" \
+  || { echo "HARNESS: server backend is not herdr: \$health_json"; exit 2; }
+echo "backend: herdr" >> "\$ROUND/server.log"
 
 # Three lanes: a codex (the allowlisted provider and the only one with a
 # rollout source), a claude_code (the second source), and a kiro — the
@@ -242,17 +299,12 @@ SERIES_PID=\$!
 # ``/fleet`` answers an OBJECT with a ``terminals`` key, not a bare list — the
 # first run of this round drove nothing at all because the parser assumed a list
 # and silently produced no lanes.
-# ONE fleet read feeds both the lane list and the provider map.  Two reads a
-# second apart disagreed on a live box: the first saw a transient id that was
-# gone by the second, and the turns loop then spent one send per turn on a
-# terminal that answered 404 for the whole arm.
-curl -sf "http://127.0.0.1:$PORT/sessions/\$ARM_SESSION/fleet" > "\$ROUND/fleet-lanes.json" 2>/dev/null
-LANES=\$(python3 -c '
+LANES=\$(curl -sf "http://127.0.0.1:$PORT/sessions/\$ARM_SESSION/fleet" | python3 -c '
 import json, sys
-body = json.load(open(sys.argv[1]))
+body = json.load(sys.stdin)
 rows = body["terminals"] if isinstance(body, dict) else body
 print(" ".join(r["id"] for r in rows))
-' "\$ROUND/fleet-lanes.json" 2>/dev/null)
+' 2>/dev/null)
 if [ -z "\$LANES" ]; then echo "HARNESS: the session has no lanes; see launch.log"; exit 2; fi
 echo "lanes: \$LANES"
 
@@ -260,13 +312,13 @@ echo "lanes: \$LANES"
 # classifier is banner-only and each provider has its OWN banner regex
 # (providers/condition.py:760-772).  Driving the wrong one produces nothing and
 # the check SKIPs on a round that looked like it ran.
-python3 -c '
+curl -sf "http://127.0.0.1:$PORT/sessions/\$ARM_SESSION/fleet" | python3 -c '
 import json, sys
-body = json.load(open(sys.argv[1]))
+body = json.load(sys.stdin)
 rows = body["terminals"] if isinstance(body, dict) else body
 for row in rows:
     print(row["id"], row.get("provider") or "")
-' "\$ROUND/fleet-lanes.json" > "\$ROUND/lane-providers.txt" 2>/dev/null || true
+' > "\$ROUND/lane-providers.txt" 2>/dev/null || true
 cat "\$ROUND/lane-providers.txt"
 ARM_STARTED=\$(date +%s)
 
@@ -341,12 +393,107 @@ cap_banner_for() {
     *)         return 1 ;;
   esac
 }
+cappable_lanes=""
 while read -r lane_id lane_provider; do
-  cap_banner_for "\$lane_provider" > "\$ROUND/cap-banner-\$lane_provider.txt" 2>/dev/null || continue
+  # Redirect AFTER the lookup succeeds.  Writing straight to the file created an
+  # empty ``cap-banner-claude_code.txt`` for every provider with no banner,
+  # because the shell opens the redirect before the function runs and
+  # ``continue`` cannot unmake it — an empty banner file in the artefacts reads
+  # like a drive that was attempted and produced nothing.
+  lane_banner=\$(cap_banner_for "\$lane_provider" 2>/dev/null) || continue
+  printf '%s\n' "\$lane_banner" > "\$ROUND/cap-banner-\$lane_provider.txt"
+  cappable_lanes="\$cappable_lanes \$lane_id"
   send "\$lane_id" "Run this exact shell command and nothing else, then stop: cat \$ROUND/cap-banner-\$lane_provider.txt"
   echo "cap drive -> \$lane_id (\$lane_provider)" >> "\$ROUND/send.log"
 done < "\$ROUND/lane-providers.txt"
 sleep 60
+
+# THE PRECONDITIONS (N11).  Every ``N/A`` scope used to be INFERRED from an
+# empty result, which made a harness regression indistinguishable from a
+# criterion the box cannot reach: a workload that silently stopped driving
+# produced the same empty table as a fleet with nothing cappable on it, and the
+# verdict stayed YES.  Three of this harness's defects have now had that exact
+# shape.  So the arm RECORDS what it actually set up, and the analyser reads the
+# record instead of guessing from absence.  An empty result whose precondition
+# says the workload SHOULD have produced something is a FAIL.
+python3 - "\$ROUND" "\$cappable_lanes" <<'PRECONDITIONS'
+import json, os, sys
+
+round_dir, cappable = sys.argv[1], sys.argv[2].split()
+providers = {}
+for line in open(os.path.join(round_dir, "lane-providers.txt")):
+    parts = line.split()
+    if len(parts) == 2:
+        providers[parts[0]] = parts[1]
+
+# Dialog capability is read from the PROCESS TABLE, not from the terminal row.
+# The row's ``shell_command`` comes back EMPTY for every lane on a live box —
+# measured — and an empty string is not evidence that a lane lacks a
+# permissions-skip flag; it is evidence that we could not tell.  Treating it as
+# "not capable" would be the same silent-inapplicable defect this record exists
+# to remove, so the flags are read from the spawned processes themselves.
+# Matched on a TOKEN's basename, exactly.  A substring match is not good
+# enough and was measured wrong: "/pi" matches ``box-picom`` and
+# ``/tmp/picom:1.log``, which put six unrelated desktop processes into the
+# dialog-capable list and would have failed ``prompt-awaiting`` on a round that
+# was fine.
+PROVIDER_BASENAMES = {"claude", "cline", "codex", "kiro", "pi"}
+SKIP_FLAGS = (
+    "--dangerously-skip-permissions",
+    "--yolo",
+    "--skip-permissions",
+    "--auto-approve",          # cline
+    "--full-auto",             # codex
+    "--trust-all-tools",       # kiro
+)
+processes = []
+for pid in os.listdir("/proc"):
+    if not pid.isdigit():
+        continue
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            command = handle.read().replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+    except OSError:
+        continue
+    if not command:
+        continue
+    if not any(
+        os.path.basename(token) in PROVIDER_BASENAMES for token in command.split()
+    ):
+        continue
+    processes.append(command[:200])
+
+unguarded = [c for c in processes if not any(flag in c for flag in SKIP_FLAGS)]
+unreadable = []
+if not processes:
+    # No provider process visible at all: capability is UNKNOWN, not absent.
+    unreadable.append("no provider process found in /proc")
+
+json.dump(
+    {
+        "lane_providers": providers,
+        "provider_processes": processes,
+        "spawn_unreadable": unreadable,
+        # Lanes the cap drive actually targeted, i.e. whose provider has a
+        # banner the CAPPED classifier knows.
+        "cappable_lanes": cappable,
+        # Provider processes running WITHOUT any permissions-skip flag.  A
+        # non-empty list means a real card was reachable in this arm, so an
+        # absent ``prompt.awaiting`` is a failure rather than an unreachable
+        # criterion.
+        "dialog_capable_lanes": unguarded,
+        # A terminal can only be certified when the H1 seam is armed, so an
+        # unarmed seam is proof no cohort could exist.  Certification itself
+        # lives in server memory and is not readable from a post-mortem.
+        "herdr_seam_armed": os.environ.get("CAO_HERDR_RUNTIME", "").strip().lower()
+        in {"1", "true", "yes", "on"},
+    },
+    open(os.path.join(round_dir, "preconditions.json"), "w"),
+    indent=2,
+)
+print("preconditions recorded")
+PRECONDITIONS
+cat "\$ROUND/preconditions.json" 2>/dev/null | head -40
 
 # Hold the arm open to its floor.  Not padding: the sweep runs every
 # PANE_HEARTBEAT_S and the condition label's lifetime is measured in sweeps, so
@@ -463,7 +610,7 @@ for arm in off on; do
   if ! grokfleet ssh --lease "$LEASE_ID" "echo $payload_b64 | base64 -d > $REMOTE_SCRATCH-payload.sh && bash $REMOTE_SCRATCH-payload.sh" >>"$OUT/round.log" 2>&1; then
     die "arm $arm did not complete; see $OUT/round.log"
   fi
-  for artefact in db fleet.json fleet-series.jsonl read-path.jsonl server.log cao.log launch.log; do
+  for artefact in db fleet.json fleet-series.jsonl read-path.jsonl server.log cao.log launch.log preconditions.json lane-providers.txt send.log; do
     grokfleet ssh --lease "$LEASE_ID" "cat $REMOTE_SCRATCH/$arm/$artefact 2>/dev/null | base64 -w0" \
       2>/dev/null | base64 -d > "$OUT/$arm/$artefact" 2>/dev/null || true
   done
@@ -483,7 +630,8 @@ grokfleet ssh --lease "$LEASE_ID" "
     --on-fleet $REMOTE_SCRATCH/on/fleet.json \
     --on-fleet-series $REMOTE_SCRATCH/on/fleet-series.jsonl \
     --on-read-path $REMOTE_SCRATCH/on/read-path.jsonl \
-    --on-server-log $REMOTE_SCRATCH/on/cao.log
+    --on-server-log $REMOTE_SCRATCH/on/cao.log \
+    --on-preconditions $REMOTE_SCRATCH/on/preconditions.json
 " | tee "$OUT/report.txt"
 verdict_status=${PIPESTATUS[0]}
 

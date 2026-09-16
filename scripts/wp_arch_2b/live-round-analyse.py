@@ -130,6 +130,47 @@ def _latched(row: sqlite3.Row) -> str:
         return ""
 
 
+def load_preconditions(path: Path, report: Report) -> dict | None:
+    """The arm's recorded setup, or ``None`` with the reason already reported.
+
+    N11.  Every ``N/A`` scope was previously inferred from an EMPTY RESULT, and
+    an empty result is also what a broken workload produces — so a harness
+    regression landed in the not-applicable bucket and the verdict stayed YES.
+    That is the third defect of this exact shape in this harness (a check whose
+    failure mode is indistinguishable from its inapplicable mode), so the
+    preconditions are now a recorded FACT and absence of the record is itself a
+    failure rather than a licence to skip.
+    """
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        report.bad(
+            "preconditions",
+            f"the arm recorded no usable preconditions ({exc}) — every scoped "
+            f"criterion below is unverifiable, so none of them may report N/A",
+        )
+        return None
+    if not isinstance(loaded, dict) or "lane_providers" not in loaded:
+        report.bad("preconditions", f"preconditions file is malformed: {str(loaded)[:120]}")
+        return None
+    unreadable = loaded.get("spawn_unreadable") or []
+    if unreadable:
+        report.bad(
+            "preconditions",
+            f"{len(unreadable)} lane(s) had an unreadable spawn command "
+            f"({unreadable[:3]}), so dialog capability could not be established",
+        )
+        return None
+    report.ok(
+        "preconditions",
+        f"{len(loaded['lane_providers'])} lane(s); "
+        f"cappable={len(loaded.get('cappable_lanes') or [])}, "
+        f"dialog-capable={len(loaded.get('dialog_capable_lanes') or [])}, "
+        f"herdr-seam={'armed' if loaded.get('herdr_seam_armed') else 'not armed'}",
+    )
+    return loaded
+
+
 def check_unmapped(db: Path, report: Report) -> None:
     """Every non-empty pane reading must be a status the vocabulary knows.
 
@@ -235,7 +276,9 @@ def check_evidence_chain(db: Path, report: Report) -> None:
         report.ok("evidence-chain", f"{len(transitions)} transition(s) resolve")
 
 
-def check_capped_parity(on: Path, off: Path, report: Report) -> None:
+def check_capped_parity(
+    on: Path, off: Path, report: Report, preconditions: dict | None = None
+) -> None:
     """AC-2b case 12: the one case whose arms are EXPECTED to agree."""
 
     def count(db: Path) -> int:
@@ -243,6 +286,22 @@ def check_capped_parity(on: Path, off: Path, report: Report) -> None:
 
     on_count, off_count = count(on), count(off)
     if on_count == 0 and off_count == 0:
+        # N11: scope is decided by what the arm RECORDED, not by the emptiness
+        # of this table.  If the round DID have a cappable lane and drove it,
+        # zero rows is the check failing — the cap drive ran and produced
+        # nothing — and calling that "not applicable" is how a real regression
+        # would have read as a pass.
+        if preconditions is None:
+            report.bad("capped-parity", "no preconditions recorded; cannot establish scope")
+            return
+        cappable = preconditions.get("cappable_lanes") or []
+        if cappable:
+            report.bad(
+                "capped-parity",
+                f"{len(cappable)} cappable lane(s) were driven ({cappable}) and NEITHER arm "
+                f"recorded a usage.capped — the cap drive produced nothing",
+            )
+            return
         # LAPTOP-ONLY by ruling.  A cap cannot be driven on a projected lane
         # from a box: ``claude_code`` has no entry in the cap-pattern table at
         # all (providers/condition.py), and codex — the one provider that is
@@ -262,10 +321,23 @@ def check_capped_parity(on: Path, off: Path, report: Report) -> None:
         report.bad("capped-parity", f"on={on_count} off={off_count}")
 
 
-def check_prompt_awaiting(db: Path, report: Report) -> None:
+def check_prompt_awaiting(db: Path, report: Report, preconditions: dict | None = None) -> None:
     """AC-2b case 13: a sourced codex lane still reaches ``awaiting_input``."""
     rows = _rows(db, "SELECT terminal_id FROM worker_event WHERE kind = ?", (PROMPT_AWAITING,))
     if not rows:
+        # N11, as above: a lane that COULD have raised a card and did not is a
+        # failure of this criterion, not an environment that cannot reach it.
+        if preconditions is None:
+            report.bad("prompt-awaiting", "no preconditions recorded; cannot establish scope")
+            return
+        capable = preconditions.get("dialog_capable_lanes") or []
+        if capable:
+            report.bad(
+                "prompt-awaiting",
+                f"{len(capable)} lane(s) spawned WITHOUT a permissions-skip flag ({capable}) "
+                f"so a card was reachable, and none was recorded",
+            )
+            return
         # LAPTOP-ONLY by ruling.  No automated workload can raise a dialog on a
         # box: every lane spawns ``--dangerously-skip-permissions`` and the
         # add-terminal endpoint has no parameter to disable it, so no real card
@@ -531,7 +603,9 @@ def check_condition_ledger(on: Path, off: Path, report: Report) -> None:
         report.ok("condition-ledger", f"{on_rows} cleared rows (off arm {off_rows})")
 
 
-def check_certified_pane_silence(db: Path, report: Report) -> None:
+def check_certified_pane_silence(
+    db: Path, report: Report, preconditions: dict | None = None
+) -> None:
     """WP-HERDR §6(ii): no pane publish for a certified terminal after it degraded.
 
     §6(ii) keeps a certified terminal PROJECTED through ``degraded(no_signal)``
@@ -557,15 +631,31 @@ def check_certified_pane_silence(db: Path, report: Report) -> None:
         ("DIAG-CERTIFIED-SOURCE-STALE",),
     )
     if not stale:
-        # Not a SKIP either: there is no certified herdr cohort anywhere yet, so
-        # no round of any kind can reach this until WP-HERDR ships one.  Held
-        # open under its own scope rather than silently passing or permanently
-        # failing the verdict.
-        report.not_applicable(
+        # N11: this used to arm on the presence of a stale FINDING, which is the
+        # check's own output — so it could never fail, only vanish.  It now arms
+        # on the recorded precondition for a cohort EXISTING at all: the H1 seam
+        # being armed.  Certification itself lives in server memory and is not
+        # readable from a post-mortem, but an unarmed seam is proof that no
+        # terminal could have been certified.
+        if preconditions is None:
+            report.bad(
+                "certified-pane-silence", "no preconditions recorded; cannot establish scope"
+            )
+            return
+        if not preconditions.get("herdr_seam_armed"):
+            report.not_applicable(
+                "certified-pane-silence",
+                "PENDING-COHORT",
+                "the H1 herdr seam was not armed in this arm, so no terminal could be "
+                "certified; this check arms itself when a cohort exists",
+            )
+            return
+        # Seam armed and nothing went stale: the cohort may exist, but the round
+        # did not exercise the criterion.  That is a SKIP — never a pass.
+        report.skip(
             "certified-pane-silence",
-            "PENDING-COHORT",
-            "no certified herdr terminal exists yet; this check arms itself when "
-            "WP-HERDR certifies a cohort",
+            "the herdr seam was armed but no certified source went stale; the "
+            "criterion was not exercised",
         )
         return
     offending: list[str] = []
@@ -646,6 +736,9 @@ def main() -> int:
     parser.add_argument("--on-fleet-series", type=Path, required=True)
     parser.add_argument("--on-read-path", type=Path, required=True)
     parser.add_argument("--on-server-log", type=Path, required=True)
+    # N11: the preconditions this arm RECORDED.  Required, because its absence
+    # is exactly the condition that used to read as "nothing to check".
+    parser.add_argument("--on-preconditions", type=Path, required=True)
     args = parser.parse_args()
 
     report = Report()
@@ -655,18 +748,21 @@ def main() -> int:
             print("FLIP-READY: NO")
             return 1
 
+    # Loaded FIRST: it decides whether the scoped checks below are allowed to
+    # report N/A at all, and its own PASS/FAIL line records what the arm set up.
+    preconditions = load_preconditions(args.on_preconditions, report)
     check_unmapped(args.on_db, report)
     check_disagreements(args.on_db, report)
     check_unsourced_identical(args.on_db, args.off_db, report)
     check_evidence_chain(args.on_db, report)
-    check_capped_parity(args.on_db, args.off_db, report)
-    check_prompt_awaiting(args.on_db, report)
+    check_capped_parity(args.on_db, args.off_db, report, preconditions)
+    check_prompt_awaiting(args.on_db, report, preconditions)
     check_status_since(args.on_fleet, args.on_db, report)
     check_condition_lifetime(args.on_fleet_series, report)
     check_read_path(args.on_read_path, args.on_db, report)
     check_announcement_count(args.on_server_log, args.on_db, report)
     check_condition_ledger(args.on_db, args.off_db, report)
-    check_certified_pane_silence(args.on_db, report)
+    check_certified_pane_silence(args.on_db, report, preconditions)
     check_off_arm_inert(args.off_db, args.on_db, report)
 
     for line in report.lines:

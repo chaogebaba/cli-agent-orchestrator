@@ -39,7 +39,23 @@ Current scopes:
 
 Adding to this table is a **ruling**, not a convenience. A criterion moves out of
 the box round only when the box genuinely cannot reach it and something else
-genuinely does.
+genuinely does — and the "something else" has to be an artefact that can refuse,
+not a sentence. The two `LAPTOP-ONLY` rows are carried by
+[`laptop-acceptance.md`](laptop-acceptance.md), a checklist the flip operator
+fills with named evidence (event ids, the verbatim banner, the answered card).
+An empty field there is a NO, so neither criterion can be silently skipped.
+
+**Scope is decided by a RECORDED precondition, never by an empty result.** Each
+arm writes `preconditions.json` — the lane providers, each lane's spawn command,
+which lanes the cap drive could target, which lanes could raise a real card, and
+whether the H1 herdr seam was armed — and the analyser reads it to decide
+whether a criterion was reachable. This matters more than it sounds: inferring
+"not applicable" from an empty table makes a harness regression indistinguishable
+from an unreachable criterion, and this harness has already produced three
+defects of exactly that shape. So an empty result whose recorded precondition
+says the workload *should* have produced something is a **FAIL**, and a missing
+or unreadable `preconditions.json` fails every scoped criterion rather than
+licensing them all to report N/A.
 
 ## Six things that are easy to get wrong, each of which cost a round
 
