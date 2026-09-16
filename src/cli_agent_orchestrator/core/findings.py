@@ -187,6 +187,19 @@ class FindingCode(StrEnum):
     #: lanes is indistinguishable from working native status.
     DIAG_HERDR_STATUS_UNKNOWN = "DIAG-HERDR-STATUS-UNKNOWN"
 
+    #: WP-ACP-PLANE D22/AC-S1.12: the terminal's CAO-issued token and whatever a
+    #: pane-shaped marker says about the same terminal disagreed.  Counted over a
+    #: cycle rather than acted on, which is the whole of D22's change in posture:
+    #: identity is a token CAO issued and bound to an ACP ``sessionId``, not a
+    #: third party's detection of what kind of agent occupies a pane, so a marker
+    #: that disagrees is EVIDENCE ABOUT THE MARKER.
+    DIAG_ACP_IDENTITY_DISAGREE = "DIAG-ACP-IDENTITY-DISAGREE"
+
+    #: WP-ACP-PLANE AC-S1.19's negative arm.  ACP defines no busy class, so a
+    #: busy-shaped error frame means an adapter invented one and the plane's
+    #: model of that adapter is wrong.  Never expected to fire.
+    DIAG_ACP_BUSY_LEAK = "DIAG-ACP-BUSY-LEAK"
+
 
 #: Codes that remain readable but which no code path raises any more (D9b).
 #: ``cao diag findings`` prints them, retention keeps their samples, and a check
