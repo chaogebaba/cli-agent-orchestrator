@@ -430,3 +430,108 @@ def test_every_provider_that_has_an_effort_knob_reads_the_request() -> None:
     for module in (claude_code, cline_cli, codex, grok_cli, kiro_cli, pi_cli):
         source = inspect.getsource(module)
         assert "requested_effort_for_terminal" in source, module.__name__
+
+
+# ------------------------------------------------------------ S4: the schema
+
+
+@pytest.mark.slow
+def test_bare_assign_exposes_only_d21s_shape() -> None:
+    """S4: pruning the tool LIST while leaving the schema is half the mode.
+
+    D21 specifies ``assign(task, position? | provider?, model?, effort?, cwd?)``.
+    The SKILL-era function carries twenty parameters, so a BARE seat was reading
+    a surface full of fork bases, barriers, worktrees and authority pins —
+    vocabulary the mode exists to keep away from it. AC-S1.11 pins the count
+    only, which is why it could not see this.
+
+    Read off a SPAWNED server's ``tools/list``, because the schema a client
+    actually receives is the thing under test.
+    """
+    schema = _spawned_assign_schema("bare")
+    assert set(schema["properties"]) == {
+        "agent_profile",
+        "message",
+        "provider",
+        "model",
+        "effort",
+        "working_directory",
+    }
+    assert set(schema.get("required", [])) == {"agent_profile", "message"}
+
+
+@pytest.mark.slow
+def test_skill_assign_keeps_its_full_shape() -> None:
+    """The control. Narrowing BARE must not narrow the doctrine surface, where
+    fork bases and barriers are the vocabulary."""
+    schema = _spawned_assign_schema("skill")
+    assert "fork_from" in schema["properties"]
+    assert "barrier" in schema["properties"]
+    assert len(schema["properties"]) >= 20
+
+
+def test_the_narrowing_drops_no_parameter_the_function_requires() -> None:
+    """A schema that hid a REQUIRED parameter would make every BARE assign fail.
+
+    So the kept set is checked against the function's own signature: everything
+    without a default must survive the prune.
+    """
+    import inspect
+
+    from cli_agent_orchestrator.mcp_server.server import BARE_ASSIGN_PARAMETERS, assign
+
+    for name, parameter in inspect.signature(assign).parameters.items():
+        if parameter.default is inspect.Parameter.empty:
+            assert name in BARE_ASSIGN_PARAMETERS, f"{name} is required and was pruned"
+
+
+def _spawned_assign_schema(mode: str) -> dict:
+    """``assign``'s inputSchema from a real ``tools/list``."""
+    env = dict(os.environ)
+    env["CAO_MCP_MODE"] = mode
+    process = subprocess.Popen(
+        [_server_binary()],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=env,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdin is not None and process.stdout is not None
+
+    def send(frame: dict) -> None:
+        process.stdin.write(json.dumps(frame) + "\n")
+        process.stdin.flush()
+
+    try:
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "s4", "version": "1"},
+                },
+            }
+        )
+        deadline = time.monotonic() + _HANDSHAKE_TIMEOUT_S
+        while time.monotonic() < deadline:
+            line = process.stdout.readline()
+            if not line:
+                break
+            frame = json.loads(line)
+            if frame.get("id") == 1:
+                send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+                send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+            elif frame.get("id") == 2:
+                for tool in frame["result"]["tools"]:
+                    if tool["name"] == "assign":
+                        return tool["inputSchema"]
+                raise AssertionError(f"no assign tool in {mode} mode")
+        raise AssertionError(f"no tools/list reply from a {mode!r} server")
+    finally:
+        process.kill()
+        process.wait(timeout=10)

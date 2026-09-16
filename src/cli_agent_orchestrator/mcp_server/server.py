@@ -6740,6 +6740,20 @@ BARE_MODE_TOOLS: frozenset[str] = frozenset(
     {"assign", "send_message", "handoff", "list", "load_skill"}
 )
 
+#: D21 specifies BARE's ``assign`` as ``assign(task, position? | provider?,
+#: model?, effort?, cwd?)``. The SKILL-era function carries twenty parameters,
+#: and pruning the tool LIST while leaving the schema untouched left a BARE seat
+#: reading a surface full of fork bases, barriers, worktrees and authority pins —
+#: vocabulary the mode exists to keep away from it. AC-S1.11 pins the count only,
+#: so it could not see this.
+#:
+#: Narrowing the SCHEMA and not the function is deliberate: every dropped
+#: parameter keeps its default, so nothing behaves differently for a caller that
+#: never passed one. What changes is what a bare seat is TOLD it can ask for.
+BARE_ASSIGN_PARAMETERS: frozenset[str] = frozenset(
+    {"agent_profile", "message", "provider", "model", "effort", "working_directory"}
+)
+
 _MODE_ENV_VAR = "CAO_MCP_MODE"
 
 
@@ -6818,7 +6832,38 @@ def _apply_surface_mode(server: FastMCP, mode: str) -> tuple[str, ...]:
         if name not in BARE_MODE_TOOLS:
             provider.remove_tool(name)
             removed.append(name)
+    _narrow_bare_assign(provider)
     return tuple(removed)
+
+
+def _narrow_bare_assign(provider: object) -> None:
+    """Prune ``assign``'s schema to D21's five-plus-task shape.
+
+    In place, on the surviving tool, because the alternative is a second
+    ``assign`` function whose body would have to be kept in step with the first —
+    and two dispatch paths is exactly what D21's one-surface rule is against.
+
+    Silent on anything unexpected: this runs at import in a server whose boot
+    must not be failed by a schema shape that moved. A surface that is too WIDE
+    is the condition this narrows, and it is visible; a server that will not
+    start is not.
+    """
+    from fastmcp.tools import Tool as _Tool
+
+    for component in getattr(provider, "_components", {}).values():
+        if not isinstance(component, _Tool) or component.name != "assign":
+            continue
+        parameters = getattr(component, "parameters", None)
+        if not isinstance(parameters, dict):
+            return
+        properties = parameters.get("properties")
+        if isinstance(properties, dict):
+            for key in [k for k in properties if k not in BARE_ASSIGN_PARAMETERS]:
+                properties.pop(key, None)
+        required = parameters.get("required")
+        if isinstance(required, list):
+            parameters["required"] = [k for k in required if k in BARE_ASSIGN_PARAMETERS]
+        return
 
 
 _REMOVED_IN_BARE = _apply_surface_mode(mcp, SURFACE_MODE)

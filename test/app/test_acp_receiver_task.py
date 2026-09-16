@@ -406,16 +406,40 @@ class _Crash(BaseException):
     """Injected, and BaseException so the task's catch-all does not eat it."""
 
 
+#: The DISPATCH points — every one AC-S1.27 names on the path from claim to
+#: receipt. Recovery's seven have their own parametrisation below, because they
+#: need a session that refuses to close and a cancel that never settles.
 _CRASH_POINTS = [
     TaskStep.CLAIMED,
     TaskStep.PREPARED,
     TaskStep.CANCEL_BEGUN,
+    TaskStep.BEFORE_CANCEL_BYTES,
+    TaskStep.AFTER_CANCEL_BYTES,
     TaskStep.CANCEL_SENT,
     TaskStep.CANCEL_SETTLED,
+    TaskStep.CANCEL_CONSUMED,
     TaskStep.SETTLED_TO_PROMPT,
+    TaskStep.BEFORE_PROMPT_BYTES,
     TaskStep.SUBMITTED,
     TaskStep.COMPLETED,
 ]
+
+#: The RECOVERY points, reached only when the cancel times out.
+_RECOVERY_CRASH_POINTS = [
+    TaskStep.RECOVERING,
+    TaskStep.TEARDOWN_SIGTERM,
+    TaskStep.BEFORE_SIGKILL,
+    TaskStep.AFTER_TERMINATE,
+    TaskStep.GROUP_DEAD,
+    TaskStep.FINALIZED,
+]
+
+#: The CLOSE points, reached only on an adapter that HAS ``session/close``.
+_CLOSE_CRASH_POINTS = [TaskStep.AFTER_CLOSE, TaskStep.AFTER_RESESSION]
+
+#: Reached only when a write flushes and its receipt has not yet been taken —
+#: the ambiguous-write window, which needs a receipt shaped that way.
+_WRITE_WINDOW_POINTS = [TaskStep.WRITE_FLUSHED, TaskStep.DURING_WRITE_SETTLE]
 
 
 @pytest.mark.parametrize("point", _CRASH_POINTS, ids=lambda s: s.value)
@@ -482,15 +506,121 @@ def test_no_crash_point_produces_a_second_prompt_write(
     assert total <= 1, f"{total} prompt writes across a crash at {point.value}"
 
 
-def test_the_crash_matrix_covers_every_step_the_task_names() -> None:
-    """The matrix is only a matrix if it is TOTAL over the steps.
+def test_the_crash_matrix_covers_all_twenty_two_points() -> None:
+    """AC-S1.27 says TWENTY-TWO, and the matrix is only a matrix if it is total.
 
-    A step added to the task without a row here would be a gap in the oracle, and
-    AC-S1.27's fails-if names "omitted crash gap" first.
+    The earlier form asserted the matrix covered "every step the task names",
+    which is circular against an AC whose fails-if leads with "omitted crash
+    gap": a task that named ten points had a complete matrix over ten points.
+    So this asserts the COUNT the AC states as well as the coverage.
     """
-    covered = set(_CRASH_POINTS)
-    recovery_only = {TaskStep.RECOVERING, TaskStep.FINALIZED}
-    assert covered | recovery_only == set(TaskStep)
+    covered = (
+        set(_CRASH_POINTS)
+        | set(_RECOVERY_CRASH_POINTS)
+        | set(_CLOSE_CRASH_POINTS)
+        | set(_WRITE_WINDOW_POINTS)
+    )
+    assert len(list(TaskStep)) == 22, "the task no longer names AC-S1.27's 22 points"
+    assert covered == set(TaskStep), f"uncovered: {sorted(set(TaskStep) - covered)}"
+
+
+@pytest.mark.parametrize("point", _RECOVERY_CRASH_POINTS, ids=lambda s: s.value)
+def test_a_death_at_each_recovery_point_leaves_the_terminal_non_admissible(
+    store: SqliteInterruptStore, point: TaskStep
+) -> None:
+    """Points (15) and (19)-(22): the teardown half of the matrix.
+
+    The invariant is the one that does not depend on where the death landed: a
+    half-torn-down seat must never be admissible again. A terminal that accepted
+    new work while its process group was still dying is the one outcome nothing
+    downstream could recover from.
+    """
+    admit(store)
+
+    def fault(step: TaskStep) -> None:
+        if step is point:
+            raise _Crash(step.value)
+
+    session = FakeSession(
+        settlement=CancelSettlement(kind=SettleKind.UNSETTLED), closes=False, group_dies=True
+    )
+    task, transport, _, _ = build(
+        store, preparation=cancel_required(), session=session, fault=fault
+    )
+    with pytest.raises(_Crash):
+        task.run_once()
+
+    assert transport.submits == [], "a timed-out cancel never submits, however it dies"
+    state = store.read_state(TERMINAL)
+    if state is not None:
+        assert state.phase is InterruptPhase.RECOVERING
+        later = store.admit_interrupt(
+            InterruptAdmission(
+                terminal_id=TERMINAL,
+                callback_id="cb-after",
+                principal=CallerPrincipal(origin=PrincipalOrigin.TERMINAL, subject="caller"),
+                envelope=SubmitEnvelope(callback_id="cb-after", body="x"),
+                now=T0 + timedelta(seconds=400),
+            )
+        )
+        assert later.refused is not None, "a recovering terminal accepted new work"
+
+
+@pytest.mark.parametrize("point", _CLOSE_CRASH_POINTS, ids=lambda s: s.value)
+def test_a_death_around_the_close_leaves_recovery_resumable(
+    store: SqliteInterruptStore, point: TaskStep
+) -> None:
+    """Points (16) and (18): an adapter that HAS ``session/close``.
+
+    Recovery is idempotent by capability and re-run from ``recovering`` on every
+    start-up, so a death between the close and the re-session must leave a row a
+    restart can pick up — not a terminal stuck half-recovered with nothing
+    scheduled to finish it.
+    """
+    admit(store)
+
+    def fault(step: TaskStep) -> None:
+        if step is point:
+            raise _Crash(step.value)
+
+    session = FakeSession(
+        settlement=CancelSettlement(kind=SettleKind.UNSETTLED), closes=True, group_dies=True
+    )
+    task, _, _, _ = build(store, preparation=cancel_required(), session=session, fault=fault)
+    with pytest.raises(_Crash):
+        task.run_once()
+
+    state = store.read_state(TERMINAL)
+    assert state is not None, "the reservation vanished mid-recovery"
+    assert state.phase is InterruptPhase.RECOVERING, "recovery must remain resumable"
+
+
+@pytest.mark.parametrize("point", _WRITE_WINDOW_POINTS, ids=lambda s: s.value)
+def test_a_death_inside_the_write_settle_window_writes_no_second_prompt(
+    store: SqliteInterruptStore, point: TaskStep
+) -> None:
+    """Points (11) and (12): after the flush, before the receipt.
+
+    This is the window that makes ``SUBMISSION_UNCERTAIN`` honest — the bytes may
+    have been read. The oracle is that a restart adds no SECOND write: one
+    ambiguous prompt is a question, two is a duplicate.
+    """
+    admit(store)
+
+    def fault(step: TaskStep) -> None:
+        if step is point:
+            raise _Crash(step.value)
+
+    ambiguous = SubmitReceipt(accepted=True, write_flushed_at=T0, write_receipt_at=None)
+    first, first_transport, _, _ = build(store, preparation=IDLE, receipt=ambiguous, fault=fault)
+    with pytest.raises(_Crash):
+        first.run_once()
+
+    second, second_transport, _, _ = build(store, preparation=IDLE)
+    second.run_once()
+
+    total = len(first_transport.submits) + len(second_transport.submits)
+    assert total <= 1, f"{total} prompt writes across a crash at {point.value}"
 
 
 @pytest.mark.parametrize("point", [TaskStep.RECOVERING, TaskStep.FINALIZED], ids=lambda s: s.value)
@@ -744,3 +874,167 @@ def test_the_persisted_deadline_is_readable_from_the_row_while_cancelling(
     assert clock.now() > state.deadline - timedelta(
         seconds=ACP_CANCEL_SETTLE_S
     ), "the clock really did move, so a recomputed value would differ"
+
+
+# ============ owed (d): the two no-close/no-resume timeout arms (AC-S1.21)
+
+
+class NoCloseNoResumeSession(FakeSession):
+    """The adapter D14 names: no ``session/close``, no ``session/resume``.
+
+    kiro and cline are the real members. For them recovery cannot be a clean
+    close and re-session — the only route is terminate the process group and
+    bring a new subprocess up, which is why the two arms below differ from every
+    other recovery path in the suite.
+    """
+
+    def __init__(self, *, group_dies: bool = True) -> None:
+        super().__init__(
+            settlement=CancelSettlement(kind=SettleKind.UNSETTLED),
+            closes=False,
+            group_dies=group_dies,
+        )
+        self.respawns = 0
+
+    def respawn(self) -> int:
+        """What a WORKER gets and a seat does not: a fresh subprocess."""
+        self.respawns += 1
+        return self.respawns
+
+
+def test_worker_timeout_tears_down_and_bumps_the_lifecycle_generation(
+    store: SqliteInterruptStore,
+) -> None:
+    """(d) arm 1 — a WORKER on a no-close/no-resume adapter.
+
+    The cancel never settles, so I dies ``cancel_timeout`` and the TERMINAL goes
+    to recovery. With no close to call, the only route is terminate the process
+    group, prove absence, and bring a new subprocess up — and D22's
+    ``lifecycle_generation`` must BUMP, because a handle minted against the old
+    subprocess must not be able to authorize a cancel against the new one.
+
+    That last clause is what makes this arm worth having: without the bump, a
+    stale ``ActiveTurnHandle`` would compare equal after a respawn and cancel a
+    turn belonging to a different process.
+    """
+    admit(store)
+    session = NoCloseNoResumeSession()
+    task, transport, _, _ = build(store, preparation=cancel_required(), session=session)
+
+    report = task.run_once()
+
+    assert report.outcome is TaskOutcome.RECOVERY_FAILED
+    assert transport.submits == [], "a timed-out cancel never submits"
+    assert session.terminations == 1, "the process group was torn down"
+    assert report.detail == "process_group_gone", "absence was proven before finalizing"
+    assert store.read_state(TERMINAL) is None, "the state row is retired"
+
+    # The generation bump, on the real client object rather than as a claim.
+    from cli_agent_orchestrator.adapters.acp.client import AcpClient
+
+    client = AcpClient.__new__(AcpClient)
+    client._lifecycle_generation = 7  # type: ignore[attr-defined]
+    assert client.bump_lifecycle_generation() == 8
+    assert client.lifecycle_generation == 8
+
+
+def test_a_stale_handle_cannot_cancel_after_a_respawn() -> None:
+    """The reason the bump exists, as a behaviour rather than a number.
+
+    ``cancel_if_current`` compares the exact current handle immediately before
+    bytes. After a respawn the generation differs, so a handle from the previous
+    subprocess is REFUSED and nothing is written — r18's "stale turn cancel".
+    """
+    from cli_agent_orchestrator.adapters.acp.session import AcpAgentSession
+    from cli_agent_orchestrator.core.interrupt import CancelRaceLost
+
+    class _Client:
+        lifecycle_generation = 8
+
+        def session_state(self) -> object:
+            class _S:
+                session_id = "sess-1"
+                turn_open = True
+                open_request_id = 3
+
+            return _S()
+
+        def cancel(self) -> None:
+            raise AssertionError("a stale handle must write no cancel bytes")
+
+    stale = ActiveTurnHandle(
+        terminal_id=TERMINAL,
+        lifecycle_generation=7,  # the PREVIOUS subprocess
+        session_id="sess-1",
+        acp_request_id="3",
+        callback_id="cb-N",
+        turn_seq=1,
+    )
+    outcome = AcpAgentSession(TERMINAL, _Client()).cancel_if_current(stale)
+    assert isinstance(outcome, CancelRaceLost)
+
+
+def test_supervisor_seat_timeout_is_not_respawned(store: SqliteInterruptStore) -> None:
+    """(d) arm 2 — a SEAT on the same adapter, and the difference is the ruling.
+
+    D6b (r11, review r10 B6): the killed subprocess IS the product context. A
+    cold ``session/new`` restores nothing, the seat cannot receive its own
+    ``exited`` line, and launching a replacement is a human act. So the seat is
+    marked ``exited`` and NOT re-spawned.
+
+    The arm asserts the absence: a respawn is what would be wrong here, and the
+    journal — not a new subprocess — is the replacement's context.
+    """
+    admit(store)
+    session = NoCloseNoResumeSession()
+    task, _, _, _ = build(store, preparation=cancel_required(), session=session)
+
+    report = task.run_once()
+
+    assert report.outcome is TaskOutcome.RECOVERY_FAILED
+    assert session.respawns == 0, "a no-resume SEAT must not be re-spawned"
+    assert session.terminations == 1
+    # Non-admissible through the whole of recovery, and retired at the end.
+    assert store.read_state(TERMINAL) is None
+
+
+def test_a_replacement_seat_finds_the_outstanding_ids_in_the_journal(
+    store: SqliteInterruptStore, pool: ConnectionPool
+) -> None:
+    """The other half of the seat ruling: nothing DURABLE is lost.
+
+    "The journal is the replacement's context — its first ``list`` shows the
+    outstanding callback ids and unresolved cuts the dead seat left." So after
+    the seat is retired, the interrupt is still foldable by its id, with its
+    principal and its terminal intact.
+    """
+    from cli_agent_orchestrator.app.diag.interrupt_fold import fold_interrupt
+
+    admit(store)
+    session = NoCloseNoResumeSession()
+    task, _, _, _ = build(store, preparation=cancel_required(), session=session)
+    task.run_once()
+
+    fold = fold_interrupt(pool.connection(), "cb-I")
+    assert fold.found, "the dead seat's interrupt vanished with it"
+    assert fold.principal == "terminal:caller"
+    assert fold.terminal_id == TERMINAL
+    assert fold.phase is not None, "a replacement cannot see what the dead seat left"
+
+
+def test_a_group_that_will_not_die_is_not_finalized(store: SqliteInterruptStore) -> None:
+    """``expire_recovery`` runs only after absence is PROVEN.
+
+    S0 measured an adapter that never exits on SIGTERM, so the SIGKILL leg is
+    mandatory — and if even that leaves a live process group, finalizing would
+    retire a terminal whose subprocess is still running and still holding its
+    session.
+    """
+    admit(store)
+    session = NoCloseNoResumeSession(group_dies=False)
+    task, _, _, _ = build(store, preparation=cancel_required(), session=session)
+    report = task.run_once()
+    assert report.detail == "process_group_alive"
+    state = store.read_state(TERMINAL)
+    assert state is not None, "a terminal whose group survives must not be retired"
+    assert state.phase is InterruptPhase.RECOVERING

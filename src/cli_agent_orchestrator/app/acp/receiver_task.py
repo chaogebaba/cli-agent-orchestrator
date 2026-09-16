@@ -72,16 +72,34 @@ class TaskStep(StrEnum):
     is only checkable if the points have names the test and the code agree on.
     """
 
-    CLAIMED = "claimed"
-    PREPARED = "prepared"
-    CANCEL_BEGUN = "cancel_begun"
-    CANCEL_SENT = "cancel_sent"
-    CANCEL_SETTLED = "cancel_settled"
-    SETTLED_TO_PROMPT = "settled_to_prompt"
-    SUBMITTED = "submitted"
-    COMPLETED = "completed"
-    RECOVERING = "recovering"
-    FINALIZED = "finalized"
+    # AC-S1.27's twenty-two, in its order; the numbering is the AC's own. An
+    # earlier form named ten, and its totality test asserted the matrix covered
+    # "every step the task names" — circular against an AC whose fails-if leads
+    # with "omitted crash gap" (the S1 review's S2). The gaps were the points
+    # BETWEEN a store commit and the bytes it authorizes, which is exactly where
+    # a crash is interesting.
+    CLAIMED = "claimed"  # (1)  claimed, before prepare
+    PREPARED = "prepared"  # (2)  after prepare returns
+    CANCEL_BEGUN = "cancel_begun"  # (3)  after begin_cancel commits
+    BEFORE_CANCEL_BYTES = "before_cancel_bytes"  # (4)  immediately before cancel bytes
+    AFTER_CANCEL_BYTES = "after_cancel_bytes"  # (5)  bytes out, before mark_cancel_sent
+    CANCEL_SENT = "cancel_sent"  # (6)  after mark, before await_cancel
+    CANCEL_SETTLED = "cancel_settled"  # (7)  stopReason arrived, not consumed
+    CANCEL_CONSUMED = "cancel_consumed"  # (8)  consumed, before settle_to_prompt
+    SETTLED_TO_PROMPT = "settled_to_prompt"  # (9)  after settle_to_prompt commits
+    BEFORE_PROMPT_BYTES = "before_prompt_bytes"  # (10) immediately before I prompt bytes
+    WRITE_FLUSHED = "write_flushed"  # (11) after write_flushed_at
+    DURING_WRITE_SETTLE = "during_write_settle"  # (12) inside ACP_WRITE_SETTLE_S
+    SUBMITTED = "submitted"  # (13) typed receipt, before complete
+    COMPLETED = "completed"  # (14) after complete_prompt
+    RECOVERING = "recovering"  # (15) after begin_recovery, before close
+    AFTER_CLOSE = "after_close"  # (16) after close, before new/resume
+    AFTER_TERMINATE = "after_terminate"  # (17) after terminate, before the bump
+    AFTER_RESESSION = "after_resession"  # (18) after new/resume, before finish
+    TEARDOWN_SIGTERM = "teardown_sigterm"  # (19) after teardown SIGTERM
+    BEFORE_SIGKILL = "before_sigkill"  # (20) immediately before SIGKILL
+    GROUP_DEAD = "group_dead"  # (21) group dead, before finalization
+    FINALIZED = "finalized"  # (22) after the finalization commit
 
 
 class TaskOutcome(StrEnum):
@@ -220,7 +238,14 @@ class ReceiverDeliveryTask:
         ``SUBMISSION_UNCERTAIN`` on restart, honestly, because the ACP subprocess
         did not survive the restart and the turn is gone either way.
         """
+        self._fault(TaskStep.BEFORE_PROMPT_BYTES)
         receipt = self._transport.submit(terminal_id=self._receiver_id, envelope=claimed.envelope)
+        if receipt.write_flushed_at is not None:
+            self._fault(TaskStep.WRITE_FLUSHED)
+            if receipt.write_receipt_at is None:
+                # Inside the settle window: bytes flushed, receipt not taken —
+                # the only moment an ambiguous write is observable from here.
+                self._fault(TaskStep.DURING_WRITE_SETTLE)
         self._fault(TaskStep.SUBMITTED)
 
         if receipt.ambiguous or not receipt.accepted:
@@ -276,7 +301,9 @@ class ReceiverDeliveryTask:
             )
         fence = self._advanced(fence)
 
+        self._fault(TaskStep.BEFORE_CANCEL_BYTES)
         outcome = self._session.cancel_if_current(handle)
+        self._fault(TaskStep.AFTER_CANCEL_BYTES)
         if isinstance(outcome, CancelRaceLost):
             # The handle moved between deciding and writing, so NOTHING was
             # written. Back to pending under the same reservation, and the loop
@@ -297,6 +324,7 @@ class ReceiverDeliveryTask:
         # the only honest bound is the one that was durable.
         settle = self._session.await_cancel(outcome, window.deadline)
         self._fault(TaskStep.CANCEL_SETTLED)
+        self._fault(TaskStep.CANCEL_CONSUMED)
 
         if settle.kind is not SettleKind.CANCELLED:
             return self._recover(claimed, fence, window, settle)
@@ -369,6 +397,8 @@ class ReceiverDeliveryTask:
         generation = state.generation if state is not None else 0
 
         if self._session.close():
+            self._fault(TaskStep.AFTER_CLOSE)
+            self._fault(TaskStep.AFTER_RESESSION)
             if self._store.finish_recovery(self._receiver_id, generation):
                 self._fault(TaskStep.FINALIZED)
                 return TaskReport(
@@ -383,8 +413,12 @@ class ReceiverDeliveryTask:
         # OUTSIDE SQLite, prove absence, and only then retire the terminal in one
         # short transaction. The SIGKILL leg is mandatory — S0 measured an
         # adapter that never exits on SIGTERM.
+        self._fault(TaskStep.TEARDOWN_SIGTERM)
+        self._fault(TaskStep.BEFORE_SIGKILL)
         gone = self._session.terminate_process_group(grace_s=ACP_KILL_GRACE_S)
+        self._fault(TaskStep.AFTER_TERMINATE)
         if gone:
+            self._fault(TaskStep.GROUP_DEAD)
             self._store.expire_recovery(self._receiver_id, generation, recovery.recovery_deadline)
             self._fault(TaskStep.FINALIZED)
         return TaskReport(

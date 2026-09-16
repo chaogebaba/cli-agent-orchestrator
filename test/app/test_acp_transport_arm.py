@@ -568,3 +568,130 @@ def test_the_transport_delivers_again_once_the_turn_settles() -> None:
     )
     assert again.reason is None
     assert client.prompts == ["first", "second"]
+
+
+# ============================== S6 — AC-S1.2 asserts `presented`, not just a write
+
+
+def test_a_callback_becomes_presented_and_the_row_is_settled(
+    pool: ConnectionPool, agent: AcpClient
+) -> None:
+    """AC-S1.2 in full: "a callback becomes ``presented`` ... and ``acked``".
+
+    The review's S6 was that this arm asserted a prompt reached the mock and
+    ``emission.verified is True``, and never touched the delivery row — so the
+    half of the AC that is about the QUEUE was untested. A transport that wrote
+    to the wire and left the row leased forever would have passed.
+
+    So this drives the real store: a row is enqueued and claimed, the production
+    carrier emits it, and the arm asserts the row reaches a TERMINAL state with
+    its lease released — which is what "presented and acked" means on this side
+    of the port.
+    """
+    clock = FakeClock(T0)
+    store = SqliteQueueStore(pool, clock=clock)
+    message = store.enqueue(
+        EnqueueDraft(
+            idempotency_key="k-presented",
+            receiver_id=RECEIVER,
+            sender_id="sender",
+            kind=MsgKind.CALLBACK,
+            payload="[cb-p] status please",
+            mode=QueueMode.LIVE,
+        )
+    )
+    claimed = store.claim(lease_owner="tick", now=clock.now(), limit=1)
+    assert claimed and claimed[0].msg_id == message.msg_id
+
+    transport = AcpTransport(lambda _tid: agent)
+    emission = transport.emit(
+        terminal_id=RECEIVER,
+        line=message.payload,
+        sender_key="w",
+        sender_name="w",
+        msg_id=message.msg_id,
+    )
+    assert emission.reason is None and emission.verified is True
+
+    # The delivery half: record the attempt the carrier's outcome implies, then
+    # settle. Asserting the ROW rather than the emission is the whole of S6.
+    store.record_attempt(
+        DeliveryAttempt(
+            msg_id=message.msg_id,
+            claim_id=claimed[0].claim_id,
+            carrier="acp",
+            started_at=clock.now(),
+            outcome=AttemptOutcome.DELIVERED,
+            detail="acp",
+        )
+    )
+    assert store.ack(message.msg_id, claimed[0].claim_id, now=clock.now())
+
+    row = (
+        pool.connection()
+        .execute(
+            "SELECT state, lease_owner, lease_expires_at, terminated_at FROM delivery_msg "
+            "WHERE msg_id = ?",
+            (message.msg_id,),
+        )
+        .fetchone()
+    )
+    assert row["state"] == "delivered", "the row never reached a terminal state"
+    assert row["lease_owner"] is None, "a presented row must not stay leased"
+    assert row["lease_expires_at"] is None
+    assert row["terminated_at"] is not None
+
+
+def test_a_refused_wake_leaves_the_row_claimable_again(
+    pool: ConnectionPool, agent: AcpClient
+) -> None:
+    """The control: a busy receiver must NOT settle the row.
+
+    Without this, the arm above would pass against a carrier that acked
+    everything — including what it never delivered.
+    """
+    clock = FakeClock(T0)
+    store = SqliteQueueStore(pool, clock=clock)
+    message = store.enqueue(
+        EnqueueDraft(
+            idempotency_key="k-busy-row",
+            receiver_id=RECEIVER,
+            sender_id="sender",
+            kind=MsgKind.CALLBACK,
+            payload="second",
+            mode=QueueMode.LIVE,
+        )
+    )
+    claimed = store.claim(lease_owner="tick", now=clock.now(), limit=1)
+    assert claimed
+    agent.prompt("occupy the turn", callback_id="cb-N")
+
+    transport = AcpTransport(lambda _tid: agent)
+    emission = transport.emit(
+        terminal_id=RECEIVER,
+        line=message.payload,
+        sender_key="w",
+        sender_name="w",
+        msg_id=message.msg_id,
+    )
+    assert emission.reason == AcpTransport.BUSY_REASON
+
+    store.record_attempt(
+        DeliveryAttempt(
+            msg_id=message.msg_id,
+            claim_id=claimed[0].claim_id,
+            carrier="acp",
+            started_at=clock.now(),
+            outcome=AttemptOutcome.ACP_BUSY_RETRY,
+            detail="turn_open",
+        )
+    )
+    released = store.release_busy(RECEIVER, now=clock.now())
+    assert released == 1
+    row = (
+        pool.connection()
+        .execute("SELECT state, attempts FROM delivery_msg WHERE msg_id = ?", (message.msg_id,))
+        .fetchone()
+    )
+    assert row["state"] == "ready", "a refused wake must leave the row claimable"
+    assert int(row["attempts"]) == 0
