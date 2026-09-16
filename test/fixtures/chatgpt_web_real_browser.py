@@ -45,12 +45,13 @@ _UNAVAILABLE_REASON: Optional[str] = None
 def chromium_available() -> bool:
     """True when a launchable Playwright Chromium build exists for this interpreter.
 
-    Asks Playwright's own registry for ``chromium.executable_path`` rather than
-    guessing at the browsers directory layout. A layout guess is a silent
-    false-negative machine: it turns "the browser moved" into "13 tests
-    skipped", which is exactly how a load-bearing oracle stops being run
-    without anyone noticing. ``chromium_unavailable_reason()`` carries the
-    diagnosis into the skip message so a skipped run is still legible.
+    A pure directory-layout guess is a silent false-negative machine: it turns
+    "the browser moved" into "13 tests skipped", which is exactly how a
+    load-bearing oracle stops being run without anyone noticing. (It did:
+    Playwright 151 ships the binary under ``chrome-linux64/``.) So the probe
+    falls back to Playwright's own registry, ``chromium.executable_path``, and
+    ``chromium_unavailable_reason()`` carries the diagnosis into the skip
+    message so a skipped run is still legible.
     """
     global _UNAVAILABLE_REASON
     try:
@@ -58,6 +59,21 @@ def chromium_available() -> bool:
     except Exception as exc:  # pragma: no cover - import guard
         _UNAVAILABLE_REASON = f"playwright python package not importable: {exc!r}"
         return False
+    # Fast path: a plain directory probe, so the common (installed) case never
+    # spawns the node driver at collection time. Playwright has shipped the
+    # binary under chrome-linux/, chrome-linux64/ and chrome-headless-shell-*/
+    # across versions, so probe by FILE NAME and let the registry arbitrate
+    # when the probe comes up empty.
+    root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or str(
+        Path.home() / ".cache" / "ms-playwright"
+    )
+    base = Path(root)
+    if base.is_dir():
+        for binary in ("chrome", "chrome-headless-shell", "headless_shell"):
+            for found in base.glob(f"chromium*/*/{binary}"):
+                if found.is_file():
+                    return True
+    # Slow path: ask the registry, and keep its diagnosis for the skip reason.
     try:
         with sync_playwright() as p:
             executable = Path(p.chromium.executable_path)
@@ -69,8 +85,7 @@ def chromium_available() -> bool:
         return False
     if not executable.exists():
         _UNAVAILABLE_REASON = (
-            f"chromium build missing at {executable} "
-            f"(run `uv run playwright install chromium`)"
+            f"chromium build missing at {executable} " f"(run `uv run playwright install chromium`)"
         )
         return False
     return True
@@ -144,9 +159,7 @@ class HeldRouteSession:
         if self.pending:
             done_soon = list(self.pending)
             with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(
-                    asyncio.gather(*done_soon, return_exceptions=True), timeout
-                )
+                await asyncio.wait_for(asyncio.gather(*done_soon, return_exceptions=True), timeout)
         await asyncio.sleep(0)
 
     async def wait_terminal(self, timeout: float = 10.0) -> RouteDisposition:
@@ -279,9 +292,7 @@ class RealBrowserHarness:
                 ):
                     return
                 session.events.append(event_name)
-                session.pending.append(
-                    asyncio.ensure_future(self._observe(session, event_name))
-                )
+                session.pending.append(asyncio.ensure_future(self._observe(session, event_name)))
 
             return _on
 

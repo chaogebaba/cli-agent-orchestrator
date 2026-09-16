@@ -233,9 +233,7 @@ async def test_response_while_held_is_released_to_origin_and_refuses_python(tmp_
         # The guard must be taken while this holder task is still live, which
         # is the only situation in which production would ever reach it.
         try:
-            await session.captured.route_holder.guard_for_python(
-                session.generations.current
-            )
+            await session.captured.route_holder.guard_for_python(session.generations.current)
         except RouteCustodyError as exc:
             session.notes["guard_error"] = str(exc)
 
@@ -273,9 +271,7 @@ async def test_local_abort_is_the_only_resend_safe_terminal(tmp_path):
 
             log = _ledger(tmp_path)
             _record_held(log, session)
-            log.record_abandoned_pre_invoke(
-                route_disposition="aborted", page_disposition="closed"
-            )
+            log.record_abandoned_pre_invoke(route_disposition="aborted", page_disposition="closed")
             assert log.record.attempt_state == AttemptState.ABANDONED_PRE_INVOKE.value
             assert log.can_fresh_same_turn_mint() is True
 
