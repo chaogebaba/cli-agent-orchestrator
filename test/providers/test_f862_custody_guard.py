@@ -240,6 +240,21 @@ async def test_only_a_proved_abort_authorises_a_fresh_same_turn_mint(tmp_path):
     assert aborted.can_fresh_same_turn_mint() is True
 
 
+async def test_abandoned_pre_invoke_refuses_an_unproved_lost_hold(tmp_path):
+    """Only a holder-owned abort may write the resend-safe terminal.
+
+    Taken from REQUEST_HELD, which is a LEGAL predecessor of both terminals, so
+    the refusal can only come from the disposition check itself and not from a
+    state-machine transition guard standing in front of it.
+    """
+    log = _held_log(tmp_path)
+    assert log.record.attempt_state == AttemptState.REQUEST_HELD.value
+    with pytest.raises(SendIntentViolation, match="resend-safe only after holder-owned abort"):
+        log.record_abandoned_pre_invoke(route_disposition="lost", page_disposition="closed")
+    # Still held: the refusal did not half-apply.
+    assert log.record.attempt_state == AttemptState.REQUEST_HELD.value
+
+
 async def test_restart_loaded_lost_row_still_refuses_a_fresh_mint(tmp_path):
     """The predicate must re-check the disposition of a row it did not write.
 
