@@ -87,6 +87,7 @@ class Observables:
     callback_kind: str
     callback_states: tuple[str, ...]
     ack_status: int
+    install_returncode: int
     diag_returncode: int
     diag_has_timeline: bool
     recover_status: int
@@ -154,6 +155,27 @@ def _run_round_trip(project: Path, home: Path) -> Observables:
     # the directory probe is gone. chdir is the only way to set it through this helper.
     with contextlib.chdir(project):
         try:
+            # --- install ----------------------------------------------------------------
+            # A.5 names install as the first step of the round trip. Run BEFORE the server
+            # so it cannot be mistaken for something the server did, and against the same
+            # private HOME, so the developer's real store is never touched.
+            installed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "cli_agent_orchestrator.cli.main",
+                    "install",
+                    "developer",
+                    "--provider",
+                    "mock_cli",
+                ],
+                capture_output=True,
+                text=True,
+                cwd=project,
+                env={**os.environ, "HOME": str(home)},
+                timeout=180,
+            )
+
             server = _start_cao_server(home, _pick_free_port())
 
             # From here to the ack the deny guard is armed over THIS process. It cannot
@@ -270,6 +292,7 @@ def _run_round_trip(project: Path, home: Path) -> Observables:
                 callback_kind=callback_kind,
                 callback_states=tuple(seen_states),
                 ack_status=acked.status_code,
+                install_returncode=installed.returncode,
                 diag_returncode=diag.returncode,
                 diag_has_timeline=_diag_has_timeline(diag.stdout),
                 recover_status=recovered.status_code,
@@ -436,6 +459,10 @@ def test_one_callback_is_admitted_and_claimed_by_the_delivery_tick(
     assert bare_arm.ack_status in (200, 400)
 
 
+def test_install_is_green_in_a_bare_project(bare_arm: Observables) -> None:
+    assert bare_arm.install_returncode == 0
+
+
 def test_diag_and_recover_are_green(bare_arm: Observables) -> None:
     assert bare_arm.diag_returncode == 0
     assert bare_arm.diag_has_timeline
@@ -484,6 +511,7 @@ def test_empty_orchestrator_directory_changes_no_observable(
     assert mutant_arm.callback_kind == bare_arm.callback_kind
     assert mutant_arm.callback_states == bare_arm.callback_states
     assert mutant_arm.ack_status == bare_arm.ack_status
+    assert mutant_arm.install_returncode == bare_arm.install_returncode
     assert mutant_arm.diag_returncode == bare_arm.diag_returncode
     assert mutant_arm.diag_has_timeline == bare_arm.diag_has_timeline
     assert mutant_arm.recover_status == bare_arm.recover_status
