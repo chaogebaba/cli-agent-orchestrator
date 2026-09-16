@@ -229,6 +229,23 @@ def manifest_variants(manifest: Path, table: str = "orchestrator") -> tuple[str,
     return variants
 
 
+def normalize_composed(data: bytes, workspace: Path, manifest: Path) -> bytes:
+    """Make the composed bytes independent of where the repo is checked out.
+
+    ``compose.py`` writes the ABSOLUTE manifest path into its ``GENERATED`` header,
+    so the same doctrine measures differently in ``/home/me/repo`` and in a deep
+    worktree — measured 2026-09-16: 44,610 vs 44,617 bytes for one identical tree.
+    A budget that moves when you clone elsewhere is not a budget, so the path is
+    normalized to its repo-relative form before measuring. This changes only what
+    the linter measures; the composed prompt the seat reads is untouched.
+    """
+    try:
+        relative = manifest.relative_to(workspace).as_posix()
+    except ValueError:
+        return data
+    return data.replace(str(manifest).encode("utf-8"), relative.encode("utf-8"))
+
+
 def compose_variant(
     workspace: Path, manifest: Path, composer: Path, variant: str, out: Path
 ) -> int:
@@ -252,8 +269,9 @@ def compose_variant(
     if proc.returncode != 0:
         detail = proc.stderr.decode("utf-8", "replace").strip()
         raise LintError(f"compose failed for variant {variant!r}: {detail}")
-    out.write_bytes(proc.stdout)
-    return len(proc.stdout)
+    data = normalize_composed(proc.stdout, workspace, manifest)
+    out.write_bytes(data)
+    return len(data)
 
 
 # --------------------------------------------------------------------------
