@@ -56,19 +56,28 @@ import json
 import logging
 import os
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator
+
+from cli_agent_orchestrator.core.delivery import AttemptOutcome
+from cli_agent_orchestrator.core.timing import HERDR_PROMPT_WAIT_MS
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "HERDR_AGENT_BLOCKED",
+    "HERDR_AGENT_PROMPT_STALLED",
+    "HERDR_PROMPT_ACK_STATES",
     "HERDR_PROTOCOL",
     "HERDR_SCHEMA_VERSION",
+    "HERDR_TIMEOUT",
     "HerdrClient",
     "HerdrError",
     "HerdrProtocolMismatch",
     "HerdrRequestError",
     "HerdrTransportError",
+    "PromptSubmission",
     "default_socket_path",
 ]
 
@@ -78,6 +87,39 @@ __all__ = [
 #: compares against these and refuses anything else.
 HERDR_PROTOCOL = 22
 HERDR_SCHEMA_VERSION = 1
+
+#: The three ``agent.prompt`` failure codes herdr 0.9.0 documents, verbatim from
+#: its own ``herdr agent prompt --help``:
+#:
+#:   "If the agent is already blocked, submission is rejected with agent_blocked
+#:   before any input is sent.  When an accepted submission starts from another
+#:   non-working state, --wait requires an observed working or blocked state
+#:   within 5000ms; otherwise it returns agent_prompt_stalled.  A caller timeout
+#:   that expires first returns timeout."
+#:
+#: Quoted rather than paraphrased because the WHOLE mapping below turns on the
+#: phrase "before any input is sent": that is what makes ``agent_blocked`` a
+#: refusal we may retry, and the other two submissions we may not.
+HERDR_AGENT_BLOCKED = "agent_blocked"
+HERDR_AGENT_PROMPT_STALLED = "agent_prompt_stalled"
+HERDR_TIMEOUT = "timeout"
+
+#: The pane states that ACKNOWLEDGE a submission.
+#:
+#: Seam B asks for ``wait`` and asks for exactly these two, which is the whole
+#: reason it is not a bare ``agent.prompt``.  A bare prompt returns
+#: ``agent_prompted`` the instant herdr has WRITTEN the text, which is evidence
+#: that bytes left CAO and no evidence at all that an agent took them — i.e.
+#: every delivery would be ``SUBMISSION_UNCERTAIN`` and nothing would ever be
+#: ``DELIVERED``.  With ``wait``, herdr's own observation of ``working`` or
+#: ``blocked`` is D4's "acknowledged acceptance for the bound occupant", and its
+#: absence inside herdr's five-second gate is ``agent_prompt_stalled``.
+#:
+#: They are NOT herdr's default ``--until`` set (``idle``, ``done``, ``blocked``).
+#: That set waits for a TURN TO END, which for a delivery seam means blocking the
+#: tick on the agent's work; these two are the earliest states that can only be
+#: reached by the submission having landed.
+HERDR_PROMPT_ACK_STATES = ("working", "blocked")
 
 
 class HerdrError(Exception):
@@ -91,7 +133,23 @@ class HerdrError(Exception):
 
 
 class HerdrTransportError(HerdrError):
-    """The socket could not be reached, or the connection dropped mid-call."""
+    """The socket could not be reached, or the connection dropped mid-call.
+
+    ``submitted`` is the ONE fact the delivery seam cannot reconstruct
+    afterwards: whether this request's bytes had already been flushed to herdr
+    when the transport failed.  A failure BEFORE the flush is a delivery that
+    never started and may be retried; a failure AFTER it is a submission whose
+    outcome is unknown, which is a different thing and is what
+    ``AttemptOutcome.SUBMISSION_UNCERTAIN`` exists to carry.  Collapsing the two
+    into one error is how a retry double-submits into an agent's composer.
+
+    It defaults ``False`` because every raise site outside :meth:`request_once`
+    is a connect-time failure, where nothing was written by construction.
+    """
+
+    def __init__(self, message: str, *, submitted: bool = False) -> None:
+        super().__init__(message)
+        self.submitted = submitted
 
 
 class HerdrRequestError(HerdrError):
@@ -118,6 +176,34 @@ class HerdrProtocolMismatch(HerdrError):
         )
         self.got_protocol = got_protocol
         self.got_schema = got_schema
+
+
+@dataclass(frozen=True)
+class PromptSubmission:
+    """What ONE ``agent.prompt`` did, in the delivery vocabulary (H2-S2).
+
+    The mapping from herdr's reply to :class:`~core.delivery.AttemptOutcome`
+    lives HERE, in the transport, and not in the injector that calls it.  That is
+    deliberate: the codes are wire facts of herdr 0.9.0, they change when herdr
+    changes, and the pin that says which herdr this build talks to is three
+    constants up.  An injector that re-derived them would be a second place the
+    protocol is known, and the blueprint allows exactly one.
+
+    Importing ``core.delivery`` is the only import this leaf has beyond stdlib.
+    It is contract-legal (``adapters`` may import ``core``; the reverse and every
+    legacy package are what the contracts forbid) and it is what keeps the
+    mapping typed instead of stringly.
+
+    ``agent_status`` and ``state_change_seq`` are herdr's own reading of the pane
+    AT THE MOMENT the submission resolved, passed through untouched.  The
+    injector uses the sequence number to decide later whether an earlier
+    UNCERTAIN submission has since resolved; nothing here interprets them.
+    """
+
+    outcome: AttemptOutcome
+    detail: str
+    agent_status: str | None = None
+    state_change_seq: int | None = None
 
 
 def default_socket_path(session: str, *, config_home: str | None = None) -> str:
@@ -165,6 +251,60 @@ def _envelope_result(reply: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise HerdrTransportError(f"herdr reply carries neither result nor error: {reply!r}")
     return result
+
+
+def _as_status(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _as_seq(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _submission_from_result(result: dict[str, Any]) -> PromptSubmission:
+    """Map a successful ``agent.prompt`` reply.
+
+    A reply reached us only because the wait was satisfied — herdr answers an
+    unsatisfied wait with ``agent_prompt_stalled`` or ``timeout``, not with a
+    success — so the outcome is ``DELIVERED`` and the pane's state rides along as
+    detail.  The ``type`` is checked anyway: a herdr that answered
+    ``agent.prompt`` with some other result body is one this build does not know,
+    and guessing that it meant success is exactly the failure this seam must not
+    have.
+    """
+    if result.get("type") != "agent_prompted":
+        return PromptSubmission(
+            outcome=AttemptOutcome.VETO_UNVERIFIED,
+            detail=f"herdr_unexpected_result:{result.get('type')!r}",
+        )
+    agent = result.get("agent")
+    agent_dict: dict[str, Any] = agent if isinstance(agent, dict) else {}
+    status = _as_status(agent_dict.get("agent_status"))
+    return PromptSubmission(
+        outcome=AttemptOutcome.DELIVERED,
+        detail=f"herdr:{status or 'unknown'}",
+        agent_status=status,
+        state_change_seq=_as_seq(agent_dict.get("state_change_seq")),
+    )
+
+
+def _submission_from_error_code(code: str, message: str) -> PromptSubmission:
+    """Map one herdr ``agent.prompt`` error code.  The table is in the docstring
+    of :meth:`HerdrClient.prompt_agent`; this is only its transcription."""
+    if code == HERDR_AGENT_PROMPT_STALLED:
+        return PromptSubmission(
+            outcome=AttemptOutcome.SUBMISSION_UNCERTAIN,
+            detail=HERDR_AGENT_PROMPT_STALLED,
+        )
+    if code == HERDR_TIMEOUT:
+        return PromptSubmission(
+            outcome=AttemptOutcome.SUBMISSION_UNCERTAIN,
+            detail=HERDR_TIMEOUT,
+        )
+    if code == HERDR_AGENT_BLOCKED:
+        return PromptSubmission(outcome=AttemptOutcome.VETO_DIALOG, detail=HERDR_AGENT_BLOCKED)
+    logger.debug("unmapped herdr agent.prompt error code %s: %s", code, message)
+    return PromptSubmission(outcome=AttemptOutcome.VETO_UNVERIFIED, detail=f"herdr_error:{code}")
 
 
 class HerdrClient:
@@ -358,10 +498,25 @@ class HerdrClient:
         "Connection lost" on every attempt and the source never received an
         event.
         """
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_unix_connection(self._socket_path),
-            timeout=self._connect_timeout_s,
-        )
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_unix_connection(self._socket_path),
+                timeout=self._connect_timeout_s,
+            )
+        except (OSError, asyncio.TimeoutError) as exc:
+            # H2: the connect was OUTSIDE the try below, so an absent or dead
+            # socket escaped as a raw ``OSError`` — past every caller that
+            # catches this leaf's own hierarchy.  It is wrapped here, with
+            # ``submitted=False``: nothing can have been written on a connection
+            # that was never opened.
+            raise HerdrTransportError(
+                f"could not connect to herdr socket {self._socket_path}: {exc}",
+                submitted=False,
+            ) from exc
+        # H2: whether the request bytes reached herdr is the difference between
+        # "retry this" and "we do not know what happened", so it is TRACKED
+        # rather than inferred from the exception type.
+        flushed = False
         try:
             request_id = self._next_id()
             payload = (
@@ -370,6 +525,7 @@ class HerdrClient:
             )
             writer.write(payload)
             await writer.drain()
+            flushed = True
             while True:
                 line = await asyncio.wait_for(reader.readline(), timeout=self._request_timeout_s)
                 if not line:
@@ -384,14 +540,130 @@ class HerdrClient:
                     return _envelope_result(obj)
                 # A one-shot connection carries no subscription, so anything else
                 # on it is noise; keep reading for our reply.
+        except HerdrTransportError as exc:
+            # Raised inside the loop (a closed socket, a non-object line, a reply
+            # carrying neither result nor error) — all of them AFTER the flush.
+            # Re-raised carrying that fact rather than swallowed into the generic
+            # arm, which would lose it.
+            raise HerdrTransportError(str(exc), submitted=flushed) from exc
         except (OSError, asyncio.TimeoutError, json.JSONDecodeError, ValueError) as exc:
-            raise HerdrTransportError(f"herdr one-shot request {method} failed: {exc}") from exc
+            raise HerdrTransportError(
+                f"herdr one-shot request {method} failed: {exc}", submitted=flushed
+            ) from exc
         finally:
             try:
                 writer.close()
                 await writer.wait_closed()
             except (OSError, RuntimeError):
                 logger.debug("herdr one-shot close raced a broken transport", exc_info=True)
+
+    async def prompt_agent(
+        self,
+        *,
+        target: str,
+        text: str,
+        wait_timeout_ms: int = HERDR_PROMPT_WAIT_MS,
+    ) -> PromptSubmission:
+        """Submit ONE prompt to a herdr agent and say what happened (Seam B).
+
+        ``target`` is a herdr-namespace key (a pane id, or a name herdr resolves
+        to one) — never a CAO terminal uuid.  Resolving the CAO id to it is the
+        caller's job, because this leaf holds no registry and must not acquire
+        one.
+
+        On its OWN short-lived connection, via :meth:`request_once`, for the
+        reason that method documents: a streaming connection may carry no plain
+        request before its ``events.subscribe``, and Seam A owns the streaming
+        connection.  So Seam B never shares a socket with Seam A and cannot
+        poison it.
+
+        **Exactly one submission per call, in every arm.**  There is no internal
+        retry and no second ``agent.prompt`` on any path, including the arms
+        below that return a retryable outcome — retrying is the delivery tick's
+        decision, made with the lease and the attempt budget in view, neither of
+        which a transport can see.  ``agent_blocked`` in particular is herdr
+        refusing *before any input is sent*, so the re-offer that follows it is
+        the first submission and not a second.
+
+        The mapping, and what each arm costs if it is wrong:
+
+        =============================== ========================= ==============
+        herdr says                      outcome                   bound
+        =============================== ========================= ==============
+        ``agent_prompted`` + ack state   ``DELIVERED``             none
+        ``agent_blocked``                ``VETO_DIALOG``           veto ceiling
+        ``agent_prompt_stalled``         ``SUBMISSION_UNCERTAIN``  ``dead_by``
+        ``timeout``                      ``SUBMISSION_UNCERTAIN``  ``dead_by``
+        transport failed AFTER flush     ``SUBMISSION_UNCERTAIN``  ``dead_by``
+        transport failed BEFORE flush    ``VETO_UNVERIFIED``       attempt budget
+        any other error code             ``VETO_UNVERIFIED``       attempt budget
+        =============================== ========================= ==============
+
+        ``agent_blocked`` is ``VETO_DIALOG`` and not an attempt-budget outcome
+        because it is the same condition the pane injector's dialog gate already
+        names: a worker parked on a permission card is WAITING, not failing, and
+        D12 bounds a wait by the veto ceiling.  Spending the attempt budget on it
+        would kill a message at 325 s because a human had not answered a prompt.
+
+        The unmapped default is ``VETO_UNVERIFIED`` for the reason
+        ``PaneWorkerInjector._send`` gives for the same default: a submission
+        whose result cannot be verified is a FAILING delivery, not a deferral.
+        It is deliberately not ``SUBMISSION_UNCERTAIN`` — an unrecognised code is
+        a herdr this build has not been certified against, which is a
+        configuration fault that should die on the budget rather than sit open
+        until ``dead_by``.
+        """
+        params: dict[str, Any] = {
+            "target": target,
+            "text": text,
+            "wait": {
+                "until": list(HERDR_PROMPT_ACK_STATES),
+                "timeout_ms": wait_timeout_ms,
+            },
+        }
+        try:
+            result = await self.request_once("agent.prompt", params)
+        except HerdrRequestError as exc:
+            return _submission_from_error_code(exc.code, exc.message)
+        except HerdrTransportError as exc:
+            if exc.submitted:
+                return PromptSubmission(
+                    outcome=AttemptOutcome.SUBMISSION_UNCERTAIN,
+                    detail="herdr_transport_after_submit",
+                )
+            return PromptSubmission(
+                outcome=AttemptOutcome.VETO_UNVERIFIED,
+                detail="herdr_transport_before_submit",
+            )
+        return _submission_from_result(result)
+
+    async def agent_state(self, *, target: str) -> PromptSubmission | None:
+        """Read one agent's current status and state sequence, or ``None``.
+
+        Not a submission — it reuses :class:`PromptSubmission` only as the
+        carrier for the two fields the injector needs, with the outcome fixed at
+        ``DELIVERED`` and meaningless.  It exists because the injector's
+        no-second-submission rule needs to know whether an earlier UNCERTAIN
+        submission has since resolved, and herdr's own ``state_change_seq`` is
+        the only monotone evidence for that.
+
+        Returns ``None`` when the agent cannot be read at all, which the caller
+        reads as "no evidence either way" rather than as an answer.
+        """
+        try:
+            result = await self.request_once("agent.get", {"target": target})
+        except HerdrError:
+            logger.debug("herdr agent.get failed for %s", target, exc_info=True)
+            return None
+        agent = result.get("agent")
+        if not isinstance(agent, dict):
+            return None
+        return PromptSubmission(
+            outcome=AttemptOutcome.DELIVERED,
+            detail="agent_state",
+            agent_status=_as_status(agent.get("agent_status")),
+            state_change_seq=_as_seq(agent.get("state_change_seq")),
+        )
 
     async def check_protocol(self) -> dict[str, Any]:
         """Read the live protocol number and refuse one this build does not pin.
