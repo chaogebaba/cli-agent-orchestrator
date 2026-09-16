@@ -729,6 +729,7 @@ fn route(id: CommandId) -> Option<Route> {
         CommandId::BarrierStatus => None,
         CommandId::BaseRegister => None,
         CommandId::ConfigReconcile => None,
+        CommandId::DiagInterrupt => None,
         CommandId::DiagMsg => None,
         CommandId::Fold => None,
         CommandId::IdentityBackfillOwners => None,

@@ -86,7 +86,7 @@ use std::vec::Vec;
 /// must not offer itself — giving **33 IN-APP / 5 HANDOFF / 23 HIDE = 61**. Recorded here
 /// because a reader comparing the design's 60 against this 61 would otherwise suspect drift.
 /// (#321)
-const COMMAND_COUNT: usize = 122;
+const COMMAND_COUNT: usize = 123;
 
 /// What the TUI does with a command.
 ///
@@ -280,6 +280,7 @@ pub(crate) const DISPLAY_ORDER: [CommandId; COMMAND_COUNT] = [
     CommandId::GateQuestions,
     CommandId::GateShow,
     CommandId::DiagFindings,
+    CommandId::DiagInterrupt,
     CommandId::DiagMsg,
     CommandId::DiagTerminal,
     CommandId::DiagWhy,
@@ -543,6 +544,8 @@ pub enum CommandId {
     // published status, and neither comparison has a side any more.
     /// `cao diag findings`
     DiagFindings,
+    /// `cao diag interrupt`
+    DiagInterrupt,
     /// `cao diag msg`
     DiagMsg,
     /// `cao diag terminal`
@@ -1652,6 +1655,16 @@ fn entry(id: CommandId) -> Command {
             handoff_reason: None,
             // HIDE: fork-only / ops command; unclassified default (project.md)
         },
+        CommandId::DiagInterrupt => Command {
+            id: CommandId::DiagInterrupt,
+            parent: Some("diag"),
+            leaf_name: "interrupt",
+            summary: "Fold one interrupt end to end: principal, terminal, cut, cancelled turn.",
+            policy: Policy::Hidden,
+            params: &[],
+            handoff_reason: None,
+            // HIDE: fork-only / ops command; unclassified default (project.md)
+        },
         CommandId::DiagMsg => Command {
             id: CommandId::DiagMsg,
             parent: Some("diag"),
@@ -2055,17 +2068,21 @@ mod tests {
     /// (`gate ask`, `answer`, `escalate`, `questions`, `question`) — all HIDE by
     /// the mandated default, since none has been reviewed for in-pane use →
     /// **24/19/79 = 122**.
+    ///
+    /// WP-ACP-PLANE slice S1 then added `cao diag interrupt`, which folds one interrupt end to
+    /// end across the plane's stores — HIDE by the mandated default, and a wide diagnostic table
+    /// is a poor fit for the pane besides → **24/19/80 = 123**.
     #[test]
     fn the_policy_distribution_is_twentyfour_eighteen_seventyfour() {
         let (in_app, handoff, hidden) = distribution();
 
         assert_eq!(in_app, 24, "expected 24 IN-APP commands, found {in_app}");
         assert_eq!(handoff, 19, "expected 19 HANDOFF commands, found {handoff}");
-        assert_eq!(hidden, 79, "expected 79 HIDE commands, found {hidden}");
+        assert_eq!(hidden, 80, "expected 80 HIDE commands, found {hidden}");
         assert_eq!(
             in_app + handoff + hidden,
-            122,
-            "the three policy counts must account for all 122 leaf commands of the Click tree"
+            123,
+            "the three policy counts must account for all 123 leaf commands of the Click tree"
         );
 
         // The three counts summing to 99 does not prove 99 *distinct* commands were counted: a
@@ -2075,8 +2092,8 @@ mod tests {
         let distinct: BTreeSet<CommandId> = DISPLAY_ORDER.iter().copied().collect();
         assert_eq!(
             distinct.len(),
-            122,
-            "DISPLAY_ORDER must list 122 DISTINCT commands; a duplicate would let one command go \
+            123,
+            "DISPLAY_ORDER must list 123 DISTINCT commands; a duplicate would let one command go \
              uncounted while the totals still summed correctly"
         );
     }
