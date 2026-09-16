@@ -220,6 +220,8 @@ CREATE TABLE IF NOT EXISTS delivery_msg (
   cancel_on_complete INTEGER NOT NULL DEFAULT 0,
   is_notice          INTEGER NOT NULL DEFAULT 0,
   legacy_message_id  INTEGER,
+  urgency            TEXT NOT NULL DEFAULT 'normal',
+  urgency_rank       INTEGER NOT NULL DEFAULT 1,
   created_at         TEXT NOT NULL,
   terminated_at      TEXT)
 """
@@ -528,6 +530,14 @@ CREATE TABLE IF NOT EXISTS ownership_transfer (
 # fills existing rows with it, and a NOT NULL column without one is refused.
 # ---------------------------------------------------------------------------
 ADDITIVE_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    # WP-ACP-PLANE A2.9(i)/(iv): the canonical envelope's ``urgency``, closed at
+    # admission and part of A2.1's conflicting-reuse identity.  ``urgency_rank``
+    # is STORED rather than derived in the ORDER BY: the claim statement runs
+    # under the write lock on every tick, and a CASE expression there could not
+    # be indexed.  The default is ``normal``/1, so every pre-ACP row keeps
+    # exactly the order it had.
+    ("delivery_msg", "urgency", "TEXT NOT NULL DEFAULT 'normal'"),
+    ("delivery_msg", "urgency_rank", "INTEGER NOT NULL DEFAULT 1"),
     # A1: the wake ordinal.  Lease periods in which this epoch was woken — the
     # durable half of I3's enforcement, the transport's content window being the
     # half a server bounce clears.
@@ -582,6 +592,76 @@ def _retire_shadow_delivery_rows(conn: sqlite3.Connection) -> None:
         (new_ulid(), FindingCode.DIAG_SHADOW_ROWS_RETIRED.value, now, detail, now, now),
     )
     logger.warning("delivery: retired shadow-mode rows (#738): %s", detail)
+
+
+# ---------------------------------------------------------------------------
+# WP-ACP-PLANE D6b(3) / A2.9(vii) — the interrupt plane's two tables.
+#
+# In THIS migrator, beside the queue, for the reason the gate record gave: a
+# second migrator is how one schema comes to have two authorities.  D6b(3) goes
+# further and makes it a build-stop condition — "if queue/state/journal do not
+# share one DB, the build stops" — because every interrupt transition is one
+# ``BEGIN IMMEDIATE`` spanning the state row, I's queue row and the journal, and
+# a transaction cannot span two SQLite files.
+#
+# ``interrupt_state`` is ONE ROW PER TERMINAL, not per interrupt.  That is the
+# mutual exclusion: the row's existence with a mid-interrupt phase is what makes
+# a second admission fail with ``INTERRUPT_IN_PROGRESS``, and a per-interrupt
+# table would need a separate lock to say the same thing.
+#
+# Three column groups, with different rules:
+#
+#   phase/generation   CASed together.  ``generation`` bumps on every transition,
+#                      so a receiver task resumed after a restart cannot CAS a
+#                      phase it read before the crash.
+#   deadline/*_deadline  PERSISTED instants, never recomputed.  ``deadline`` is
+#                      ALWAYS the cancel-settle deadline and never I's lease
+#                      expiry — the two differ by CANCEL_HOLD_MARGIN_S, and
+#                      conflating them is a named r18 mutant.  Nullable, because
+#                      they are nullable BY PHASE: a pending row has no cancel
+#                      deadline and saying so with NULL beats saying so with a
+#                      sentinel nobody can distinguish from a real instant.
+#   active_turn_*      AUDIT ONLY.  They record which turn was cut.  Nothing
+#                      reads them back as authority, and in particular no queue
+#                      identifier appears among them (A2.9(iii)).
+#
+# ``interrupt_ledger`` is the limiter's durable window.  One row per ADMITTED
+# interrupt, and nothing else: a refusal writes nothing at all, so the table is
+# also the answer to "how many interrupts were actually charged".  It survives a
+# ``cao-server`` restart, which is the point — a window that reset on restart
+# would let a caller rotate the server to refresh its budget (AC-S1.22(e)).
+# ---------------------------------------------------------------------------
+
+_INTERRUPT_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS interrupt_state (
+  terminal_id             TEXT PRIMARY KEY,
+  phase                   TEXT NOT NULL,
+  generation              INTEGER NOT NULL DEFAULT 0,
+  interrupt_msg_id        TEXT,
+  interrupt_claim_id      INTEGER,
+  cut_callback_id         TEXT,
+  active_turn_session_id  TEXT,
+  active_turn_request_id  TEXT,
+  active_turn_generation  INTEGER,
+  active_turn_seq         INTEGER,
+  deadline                TEXT,
+  pending_deadline        TEXT,
+  recovery_deadline       TEXT,
+  cancel_sent             INTEGER NOT NULL DEFAULT 0,
+  CHECK (phase IN ('none','pending','cancelling','prompting','recovering')),
+  CHECK (phase != 'cancelling' OR deadline IS NOT NULL),
+  CHECK (phase NOT IN ('none','prompting') OR deadline IS NULL))
+"""
+
+_INTERRUPT_LEDGER_DDL = """
+CREATE TABLE IF NOT EXISTS interrupt_ledger (
+  interrupt_id TEXT PRIMARY KEY,
+  principal    TEXT NOT NULL,
+  terminal_id  TEXT NOT NULL,
+  admitted_at  TEXT NOT NULL,
+  forced       INTEGER NOT NULL DEFAULT 0,
+  proxied_optin INTEGER NOT NULL DEFAULT 0)
+"""
 
 
 MIGRATION_STEPS: tuple[tuple[str, tuple[MigrationStatement, ...]], ...] = (
@@ -644,6 +724,21 @@ MIGRATION_STEPS: tuple[tuple[str, tuple[MigrationStatement, ...]], ...] = (
     ),
     ("delivery_attempt", (_DELIVERY_ATTEMPT_DDL,)),
     ("delivery_dead", (_DELIVERY_DEAD_DDL,)),
+    ("interrupt_state", (_INTERRUPT_STATE_DDL,)),
+    ("interrupt_ledger", (_INTERRUPT_LEDGER_DDL,)),
+    (
+        "interrupt_ledger_indexes",
+        (
+            # Both bounds are range scans over one window, and both run on the
+            # admission path inside the write lock, so neither may be a table
+            # scan: the per-principal budget scans (principal, admitted_at) and
+            # the per-terminal gap scans (terminal_id, admitted_at).
+            "CREATE INDEX IF NOT EXISTS ix_interrupt_ledger_principal "
+            "ON interrupt_ledger(principal, admitted_at)",
+            "CREATE INDEX IF NOT EXISTS ix_interrupt_ledger_terminal "
+            "ON interrupt_ledger(terminal_id, admitted_at)",
+        ),
+    ),
     # After both tables exist: rows from the retired shadow mode (#738) leave.
     ("delivery_retire_shadow_rows", (_retire_shadow_delivery_rows,)),
     ("seat_digest", (_SEAT_DIGEST_DDL,)),

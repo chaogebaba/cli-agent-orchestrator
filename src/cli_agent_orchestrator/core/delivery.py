@@ -156,6 +156,31 @@ class DeadReason(StrEnum):
     MAX_LIFETIME = "max_lifetime"
     EXPIRED = "expired"
 
+    # WP-ACP-PLANE A2.9(vi) — the three no-dispatch terminals of an INTERRUPT
+    # row.  They are reasons on the existing terminal state, not a fifth state:
+    # I1 fixes three terminal states and D8 already established that a caller
+    # expiry may not add one, so an interrupt that never reached the wire may
+    # not either.  All three can only bring death FORWARD, like the four above.
+    #
+    # ``INTERRUPT_UNCLAIMED``      — ``pending_deadline`` passed with I still
+    #                                unclaimed, or its claim fence was lost and
+    #                                could not be re-taken.  The charge STANDS
+    #                                (the quota was consumed at admission) and
+    #                                the terminal is freed for the next one.
+    # ``INTERRUPT_WINDOW_LOST``    — ``begin_cancel`` could not verify I's fence
+    #                                or could not fit the cancel reservation
+    #                                inside I's remaining lifetime.  N and the
+    #                                session actor are left untouched.
+    # ``INTERRUPT_CANCEL_TIMEOUT`` — the cancel did not settle inside the
+    #                                persisted deadline.  I was never dispatched,
+    #                                so it has no attempt and no dispatch intent;
+    #                                the TERMINAL then goes to recovery, which is
+    #                                a terminal-scoped condition rather than
+    #                                another fact on I.
+    INTERRUPT_UNCLAIMED = "interrupt_unclaimed"
+    INTERRUPT_WINDOW_LOST = "interrupt_window_lost"
+    INTERRUPT_CANCEL_TIMEOUT = "interrupt_cancel_timeout"
+
 
 class AttemptOutcome(StrEnum):
     """What one delivery attempt did, recorded per ``(msg_id, claim_id, carrier)``.

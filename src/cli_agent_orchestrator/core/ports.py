@@ -41,6 +41,26 @@ from cli_agent_orchestrator.core.delivery import (
     WakeEmission,
 )
 from cli_agent_orchestrator.core.events import AnyKind, EventDraft, WorkerEvent
+from cli_agent_orchestrator.core.interrupt import (
+    ActiveTurnHandle,
+    CallerPrincipal,
+    AdmissionOutcome,
+    CancelHandle,
+    CancelOutcome,
+    CancelSettlement,
+    CancelWindow,
+    ClaimedRow,
+    InterruptAdmission,
+    InterruptFence,
+    InterruptPreparation,
+    InterruptStateRow,
+    LedgerWindow,
+    LimiterDecision,
+    RecoveryWindow,
+    SubmitEnvelope,
+    SubmitReceipt,
+    WindowLost,
+)
 from cli_agent_orchestrator.core.findings import Finding, FindingCode
 from cli_agent_orchestrator.core.gate import (
     ArtifactManifest,
@@ -1115,3 +1135,281 @@ class ProviderAdapter(Protocol):
     def structured_events(self) -> bool: ...
 
     def event_source(self, terminal_id: str) -> EventSource | None: ...
+
+
+# ---------------------------------------------------------------------------
+# WP-ACP-PLANE — D5's three ports, and D6b(3)'s interrupt aggregate.
+#
+# D5 fixes exactly three: ``MessageTransport`` (submit), ``AgentSession``
+# (lifecycle) and ``CertificationStore`` (read).  ``SteeringCapability`` is
+# DISCOVERED DATA, not a port — two of its three wire shapes are vendor-
+# namespaced or entirely off-protocol, so a port would have to be widened by
+# every vendor that invents a fourth.  **The seat uses the same port as a
+# worker**; that identity is the decision, and a seat-only port would quietly
+# re-create the ``is_supervisor`` binary branch D20 and S1 exist to delete.
+#
+# ``InterruptStore`` is the fourth, and it is an AGGREGATE rather than a table
+# gateway: every operation on it owns exactly one ``BEGIN IMMEDIATE`` and no
+# operation calls another store.  AC-S1.28's static checks are over this
+# shape, and D6b(3) says plainly that if queue, state and journal do not share
+# one database, the build stops.
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class MessageTransport(Protocol):
+    """D5 — one envelope out, one typed outcome back.
+
+    The adapter owns BYTES, stream demultiplexing and the runtime
+    :class:`~cli_agent_orchestrator.core.interrupt.ActiveTurnHandle`.  It
+    receives no store and writes no journal or queue row (D6b(3)); it returns
+    typed events and the application owner records them.  That split is what
+    makes AC-S1.29's isolation provable: a port that could write would have to
+    be awaited inside a transaction.
+
+    ``prepare_interrupt`` is a PROBE, not a dispatch.  The driver reads its own
+    in-memory session state — it is the only reader of the ACP stream, so it is
+    authoritative for ``idle | active(handle)`` — and touches no wire.
+    """
+
+    def submit(self, *, terminal_id: str, envelope: SubmitEnvelope) -> SubmitReceipt:
+        """Write ONE prompt and report the local write receipt.
+
+        "Accepted" means the flush survived ``ACP_WRITE_SETTLE_S`` at
+        ``write_receipt_at`` — a local fact about this process's pipe, never a
+        claim about what the model did.  A dead peer fails here within
+        milliseconds; a WEDGED live peer never does, at any horizon, and the
+        design says so rather than pretending the receipt is an ack.
+        """
+        ...
+
+    def prepare_interrupt(self, *, terminal_id: str) -> InterruptPreparation:
+        """``IDLE`` or ``CANCEL_REQUIRED{active_turn}``.  No wire touch, no store."""
+        ...
+
+    def nudge(self, terminal_id: str) -> None:
+        """D7.2 — re-offer this receiver's rows now, on a protocol fact.
+
+        Called by the driver on ``stopReason``.  The 65-second reclaim floor
+        remains and is not replaced: AC-S1.14 fails a build where the nudge is
+        the only path OR the floor is the only path.
+        """
+        ...
+
+
+@runtime_checkable
+class AgentSession(Protocol):
+    """D5 — the lifecycle half: cancel, close, resume, terminate.
+
+    ``cancel_if_current`` is A2.9(viii) and is the one method whose CONTRACT is
+    a comparison: it compares the actor's exact current handle immediately
+    before writing cancel bytes, and returns race-lost on any mismatch without
+    writing anything.  A cancel issued against a handle that has already moved
+    would cancel the WRONG TURN — r18's named mutant "stale turn cancel" — and
+    no amount of care at the call site can prevent that, because the gap between
+    deciding and writing is exactly where the turn can move.
+    """
+
+    def cancel_if_current(self, expected: ActiveTurnHandle) -> CancelOutcome:
+        """Write ``session/cancel`` iff ``expected`` is still the live turn."""
+        ...
+
+    def await_cancel(self, handle: CancelHandle, deadline: datetime) -> CancelSettlement:
+        """Wait for the ``cancelled`` stop reason against the PERSISTED deadline.
+
+        ``deadline`` is the value ``begin_cancel`` computed and stored, passed
+        back in.  It is never recomputed from a fresh clock sample here: after a
+        restart the only honest bound is the one that was durable, and r18 lists
+        "await against recomputed time" as a mutant that must go RED.
+        """
+        ...
+
+    def close(self) -> bool:
+        """``session/close`` where the certification row advertises it."""
+        ...
+
+    def terminate_process_group(self, *, grace_s: float) -> bool:
+        """SIGTERM, wait at most ``grace_s``, SIGKILL, then prove absence.
+
+        The escalation is mandatory rather than defensive: S0 measured an
+        adapter that never exits on SIGTERM at all, so a teardown without the
+        kill leg would leave a live process group behind the "absence proven"
+        precondition ``expire_recovery`` requires.
+        """
+        ...
+
+
+@runtime_checkable
+class CertificationStore(Protocol):
+    """D5/D13 — certification is READ through a port and never imported.
+
+    Per ``(provider, protocolVersion, adapter package@version, CLI version)``,
+    pinned, with a recert trigger on any bump.  A port rather than a direct read
+    for the reason D5 gives: the routing table it is derived from churns on
+    another lane, and the churn is invisible to this WP by construction.
+    """
+
+    def steering_capability(self, terminal_id: str) -> str | None: ...
+
+    def interrupt_refusal(self, terminal_id: str) -> str | None:
+        """``None`` when rung 0 is certified; the typed reason when it is not.
+
+        A row whose ``cancel`` cell is not PASS refuses ``urgency:"interrupt"``
+        with a reason a human can act on — ``INTERRUPT_LATENCY_EXCEEDED``,
+        ``CANCEL_STOPREASON_UNRELIABLE`` — rather than accepting the request and
+        delivering a slower rung that looks the same in the journal.
+        """
+        ...
+
+
+@runtime_checkable
+class InterruptLimiterPort(Protocol):
+    """D6b(6)'s two bounds, as POLICY the store consults under its own write lock.
+
+    A port rather than a direct import because the two halves belong to different
+    layers and the contracts enforce it: the limiter is application policy
+    (``app/acp/interrupt_limiter.py``) and may not touch SQLite, while the bounds
+    must be evaluated inside the SAME ``BEGIN IMMEDIATE`` as the reservation CAS
+    or two concurrent admissions at the budget edge both pass — AC-S1.22(c)'s
+    named failure.  The composition root wires one into the other; the adapter
+    reads the window and hands it over as data.
+
+    ``decide`` takes no clock.  The instant is the receiver's single sample,
+    passed in, for the same reason ``begin_cancel`` takes one: a second clock
+    inside the transaction is a second authority on when the window began.
+    """
+
+    def decide(
+        self,
+        *,
+        principal: CallerPrincipal,
+        terminal_id: str,
+        now: datetime,
+        window: LedgerWindow,
+        force: bool,
+    ) -> LimiterDecision: ...
+
+
+@runtime_checkable
+class InterruptStore(Protocol):
+    """D6b(3) — the interrupt aggregate.  One operation, one ``BEGIN IMMEDIATE``.
+
+    Every method here is a TRANSITION, never a getter-plus-setter pair, because
+    the alternative is a caller composing two operations and a crash landing
+    between them.  AC-S1.27 injects a death at each of twenty-two named points
+    and the oracle is that rollback exposes all-or-none.
+
+    Three prohibitions hold for the whole protocol and are checked statically by
+    AC-S1.28: **no clock dependency** (the receiver task samples once and passes
+    ``now`` in), **no ``QueueStore`` call from inside an operation**, and **no
+    I/O of any kind under an open SQLite transaction**.
+    """
+
+    def admit_interrupt(self, request: InterruptAdmission) -> AdmissionOutcome:
+        """CAS ``none -> pending(I)`` FIRST, then charge quota, then write I's row.
+
+        The ordering is the decision.  A refused reservation must charge nothing
+        (r14, review r13 N2), so the CAS that can fail with
+        ``INTERRUPT_IN_PROGRESS`` runs before the limiter is consulted at all —
+        and viewer ``force`` bypasses only the two quota bounds, never this CAS.
+        """
+        ...
+
+    def claim_next(self, receiver_id: str, *, now: datetime, lease_owner: str) -> ClaimedRow | None:
+        """The ONLY claim path for a ``transport='acp'`` receiver — one row, ever.
+
+        Ordered ``urgency_rank, available_at, msg_id`` in the SQL itself, and
+        TOTAL over the phase set: ``none`` serves the next row, ``pending``
+        serves I by id, and ``cancelling``/``prompting``/``recovering`` serve
+        NOTHING.  The 64-row batch claim never runs for an ACP receiver, which
+        is what stops a second ``session/prompt`` being issued against an
+        ongoing turn (r14, review r13 B3).
+        """
+        ...
+
+    def begin_cancel(
+        self, fence: InterruptFence, active_turn: ActiveTurnHandle, now: datetime
+    ) -> CancelWindow | WindowLost:
+        """A2.9(iv)'s exact cancel window, in ONE transaction.
+
+        Computes ``deadline = now + ACP_CANCEL_SETTLE_S`` and the DISTINCT
+        ``lease_until = deadline + CANCEL_HOLD_MARGIN_S``, verifies I's fence and
+        that I's effective lifetime covers ``lease_until``, extends only I's
+        lease, copies the active turn's audit fields, persists the deadline, and
+        CASes ``pending -> cancelling``.  ``now`` is the receiver task's single
+        clock sample; this store neither holds a clock nor resamples one.
+        """
+        ...
+
+    def mark_cancel_sent(self, fence: InterruptFence, sent_at: datetime) -> bool:
+        """Persist that cancel bytes left.  Restart takes the timeout path either
+        way (r13, review r12 B3): a sent-but-unconsumed cancel and a never-written
+        one are indistinguishable once the stream that would settle them is gone."""
+        ...
+
+    def race_lost(self, fence: InterruptFence) -> bool:
+        """CAS ``cancelling -> pending``, clearing the consumed deadline and handle."""
+        ...
+
+    def settle_to_prompt(self, fence: InterruptFence, settle: CancelSettlement) -> bool:
+        """CAS ``cancelling -> prompting`` and record the cut, without touching N.
+
+        N's closed attempt stays ``DELIVERED`` and its ``presented`` fact stays
+        immutable.  If I explicitly named N in ``supersedes`` this appends N's
+        later ``superseded`` fact; otherwise I records ``cut_disposition:
+        "quarantined"`` and the unresolved-cut view derives the warning from I.
+        """
+        ...
+
+    def complete_prompt(self, fence: InterruptFence, receipt: SubmitReceipt) -> bool:
+        """CAS ``prompting -> none``, append I's ``presented``, close I's attempt.
+
+        Three authorities, ONE operation (r14, review r13 B2).  This commit IS
+        the durable receipt: there is no separate marker and no replay, and a
+        kill after the flush but before this commit resolves
+        ``SUBMISSION_UNCERTAIN`` on restart, honestly, because the subprocess did
+        not survive either way.
+        """
+        ...
+
+    def fail_interrupt(self, fence: InterruptFence, reason: DeadReason, phase: str) -> bool:
+        """Terminalize I with an appended ``dead`` fact carrying the audit object."""
+        ...
+
+    def begin_recovery(self, fence: InterruptFence, now: datetime) -> RecoveryWindow | None:
+        """Cancel timed out: kill I, CAS ``cancelling -> recovering`` (never ``none``).
+
+        ``recovering`` keeps the terminal NON-ADMISSIBLE until recovery is
+        durable (r13, review r12 B4).  Persists ``recovery_deadline`` and derives
+        ``teardown_at = recovery_deadline - (DELIVERY_TICK_S + ACP_KILL_GRACE_S)``,
+        which is what reserves one post-crash scan plus teardown inside the bound.
+        """
+        ...
+
+    def finish_recovery(self, terminal_id: str, expected_generation: int) -> bool:
+        """CAS ``recovering -> none``, but only after close (where certified),
+        ``session/new``/``resume`` AND the generation bind have all succeeded."""
+        ...
+
+    def expire_recovery(
+        self, terminal_id: str, expected_generation: int, expected_recovery_deadline: datetime
+    ) -> bool:
+        """Recovery failed to its deadline: record ONE terminal-scoped
+        ``exited{interrupt_recovery_failed}``, keep the terminal non-admissible,
+        delete the state row.  Called only after process-group absence is proven,
+        outside SQLite."""
+        ...
+
+    def finalize_no_resume_exit(self, terminal_id: str, expected_generation: int) -> bool:
+        """The no-close/no-resume seat's finalizer (r16, review r15 B3).
+
+        A cold ``session/new`` restores nothing for a SEAT — the killed
+        subprocess IS the product context — so the seat is marked ``exited`` and
+        a replacement is a human act.  A separate finalizer from
+        ``expire_recovery`` so neither can re-emit the other's condition.
+        """
+        ...
+
+    def read_state(self, terminal_id: str) -> InterruptStateRow | None:
+        """The persisted phase row.  A READ, and the only one on this protocol."""
+        ...
