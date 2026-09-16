@@ -719,6 +719,13 @@ class HerdrClient:
 
         Never raises: a failed read is a missing input, not a failed delivery.
         """
+        # The swap is safe because a ``HerdrClient`` is built per injection and
+        # driven by ONE caller — ``queue_carrier._herdr_client`` constructs a new
+        # one each time — so no concurrent request can observe the borrowed
+        # value, and the ``finally`` restores it on every path including
+        # cancellation.  Recorded rather than assumed (review r2 §10.5): if a
+        # client ever becomes shared or re-entrant, this must become a per-call
+        # argument threaded through ``request_once`` instead.
         original = self._request_timeout_s
         self._request_timeout_s = self._state_read_timeout_s
         try:

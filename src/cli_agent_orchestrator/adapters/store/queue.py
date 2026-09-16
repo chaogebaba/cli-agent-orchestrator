@@ -315,6 +315,18 @@ class SqliteQueueStore:
         nothing can ever claim it again, and the ``dead_by`` sweep below reaps it
         on the next tick after the deadline, as ``max_lifetime``.
 
+        **What it stops is a second SUBMISSION, not a second ANNOUNCEMENT**
+        (review r2 §7, which ran the probe).  A quarantined row is still
+        ``ready`` in the table, so the epoch digest composed for a LATER message
+        to the same receiver lists its id again.  That is the A2 at-least-once
+        contract and not this quarantine's business: the reviewer's control shows
+        a row taken to ``DELIVERED`` and left unacked behaves identically, and it
+        is true of the paste carrier too.  The hazard r1 found is the composer
+        CONCATENATION — a second ``agent.prompt`` carrying the same text — and no
+        second prompt is sent.  A reader who takes "never offered again" to mean
+        "the worker never hears about this id twice" has read more than is
+        written here, and that was never true of any carrier.
+
         Why the deadline and not a new state: ``dead_by`` is stamped ONCE at
         enqueue and is the row's whole life (D12), so a quarantine that ends
         there adds no bound anyone has to reason about, needs no schema change,

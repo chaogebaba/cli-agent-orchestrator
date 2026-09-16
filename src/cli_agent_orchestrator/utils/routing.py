@@ -332,6 +332,15 @@ def cell_certified(
 #: plus the two shas are the MATCH key, exactly as the provider block's are;
 #: ``herdr_version``/``herdr_sha256``/``protocol`` are D7's binary+protocol pin;
 #: the rest is the audit trail a reviewer reads.
+#:
+#: ``reduced_assurance`` is blueprint amendment (7)'s field and is OPTIONAL
+#: (WP-HERDR H2 review r2 §9/§10.2: the amendment required a home for the
+#: pre-state-race residual and the tuple had none, so the amendment was not
+#: mechanically satisfiable).  It names what the PASS does NOT cover — a known,
+#: accepted, unclosed hazard — and it is deliberately not part of the match key:
+#: a residual is a fact about the evidence, not about which cell the row
+#: certifies, and putting it in the key would make recording one invalidate the
+#: row that records it.
 HERDR_CERT_FIELDS = (
     "provider",
     "herdr_version",
@@ -342,7 +351,77 @@ HERDR_CERT_FIELDS = (
     "outcome",
     "date",
     "evidence",
+    "reduced_assurance",
 )
+
+#: The subset of :data:`HERDR_CERT_FIELDS` a row must carry to be read at all.
+#: Everything else is audit trail, and a row written before a field existed is
+#: still a valid certification of what it did certify — which is why
+#: :func:`herdr_reduced_assurance` answers ``None`` rather than refusing.
+HERDR_CERT_REQUIRED_FIELDS = (
+    "provider",
+    "position_sha",
+    "overlay_sha",
+    "outcome",
+)
+
+
+def herdr_reduced_assurance(position: str, provider: str, positions_dir: Path) -> Optional[str]:
+    """What this cell's PASS does NOT cover, or ``None``.
+
+    Amendment (7) requires the pre-state-race residual to be RECORDED on the
+    row, and recording is only half of it — something has to be able to read it
+    back, or the field is a comment. This is that reader.
+
+    **Absence is not an error.** A row written before the field existed carries
+    no ``reduced_assurance``, and it is still a valid certification of what it
+    certified; answering ``None`` is the difference between "no known residual
+    was recorded" and "this row is malformed". The same answer is given for an
+    uncertified cell, an absent position file and an unparseable one, because
+    none of them is a claim about assurance either.
+
+    Matched on the same key as :func:`herdr_cell_certified` — provider plus the
+    CURRENT sha pair — so a residual never outlives the row it was written on.
+    The binary pin is deliberately NOT re-checked: this answers "what did the
+    certification say it did not cover", which is a property of the row, while
+    the pin answers "does that row describe this machine", which is
+    :func:`herdr_cell_certified`'s question and is asked separately.
+    """
+    import frontmatter
+
+    from cli_agent_orchestrator.utils.profile_composition import overlay_sha, position_sha
+
+    pos_path = positions_dir / f"{position}.md"
+    if not pos_path.exists():
+        return None
+    try:
+        parsed = frontmatter.loads(pos_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    pos_sha = position_sha(parsed.content, dict(parsed.metadata))
+
+    overlays_dir = positions_dir.parent / "overlays"
+    frags: List[str] = []
+    base = overlays_dir / f"{provider}.md"
+    if base.exists():
+        frags.append(base.read_text(encoding="utf-8"))
+    per_pos = overlays_dir / f"{provider}.{position}.md"
+    if per_pos.exists():
+        frags.append(per_pos.read_text(encoding="utf-8"))
+    ov_sha = overlay_sha(frags)
+
+    for row in parsed.metadata.get("herdr_certification") or []:
+        if not isinstance(row, dict):
+            continue
+        if (
+            row.get("provider") == provider
+            and row.get("position_sha") == pos_sha
+            and row.get("overlay_sha") == ov_sha
+        ):
+            note = row.get("reduced_assurance")
+            return str(note) if isinstance(note, str) and note.strip() else None
+    return None
+
 
 #: Returned when the installed herdr binary cannot be found or hashed.
 _HERDR_BINARY_UNKNOWN = "BINARY-UNKNOWN"
