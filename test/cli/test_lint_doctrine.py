@@ -177,7 +177,8 @@ def test_c3_clean_when_every_claimed_id_resolves(tmp_path: Path) -> None:
     root = _workspace(tmp_path)
     result = _lint(root, tmp_path)
     assert [f for f in result.findings if f.check == "C3"] == []
-    assert "`E-DEMO-TOKEN` | script | `scripts/gated-merge.sh:1`" in result.inventory
+    assert "`E-DEMO-TOKEN` | script | `scripts/gated-merge.sh`" in result.inventory
+    assert ".sh:1`" not in result.inventory, "the inventory must not pin line numbers"
 
 
 def test_c3_true_positive_names_the_prose_only_claim(tmp_path: Path) -> None:
@@ -341,6 +342,40 @@ def test_a_comment_only_hit_loses_to_a_code_hit(tmp_path: Path) -> None:
         ["E-DEMO-TOKEN"], [("scripts/gated-merge.sh", "script", root / "scripts/gated-merge.sh")]
     )
     assert resolutions["E-DEMO-TOKEN"].location == "scripts/gated-merge.sh:2"
+    assert resolutions["E-DEMO-TOKEN"].kind == "script"
+
+
+def test_a_comment_only_hit_is_citation_only_and_fails_c3(tmp_path: Path) -> None:
+    """PINNED POLICY (A10 #673): a mention is not an implementation.
+
+    The alternative — counting a comment as a resolution — was measured on the live
+    tree: appending one comment line naming `queue-native-seat-carrier` to
+    `scripts/gated-merge.sh` made the AC8 true positive disappear. A coverage check
+    a comment can satisfy does not draw the line it exists to draw.
+    """
+    root = _workspace(
+        tmp_path,
+        section="Rule one. ^alpha\nRule two. ^beta\n",
+        ledger_rows=(
+            "| ^alpha | mechanism EXISTS [E-DEMO-TOKEN] |\n| ^beta | retained/compressed |\n"
+        ),
+        mechanism_source="# E-DEMO-TOKEN: named in passing, not implemented here.\n",
+    )
+    result = _lint(root, tmp_path)
+    findings = [f for f in result.findings if f.check == "C3"]
+    assert [f.subject for f in findings] == ["E-DEMO-TOKEN"]
+    assert "the only hit is a COMMENT at scripts/gated-merge.sh:1" in findings[0].detail
+    assert exit_code_for(result, "migration", "warn") == EXIT_COVERAGE
+    assert "| `E-DEMO-TOKEN` | CITATION-ONLY |" in result.inventory
+
+
+def test_a_later_code_hit_beats_an_earlier_comment_in_another_file(tmp_path: Path) -> None:
+    """A citation in the first source scanned must not shadow a real implementation."""
+    root = _workspace(tmp_path, mechanism_source="# E-DEMO-TOKEN mentioned first\n")
+    (root / "scripts/report-attest.sh").write_text('CODES="E-DEMO-TOKEN"\n', encoding="utf-8")
+    result = _lint(root, tmp_path)
+    assert [f for f in result.findings if f.check == "C3"] == []
+    assert "| `E-DEMO-TOKEN` | script | `scripts/report-attest.sh` |" in result.inventory
 
 
 # --------------------------------------------------------------------------
@@ -377,6 +412,40 @@ def test_c4_stale_row_may_cite_an_adjudicated_retirement(tmp_path: Path) -> None
         ledger_rows="| ^alpha | stale → superseded box list (deleted; B4-3) |\n| ^beta | retained/compressed |\n",
     )
     assert [f for f in _lint(root, tmp_path).findings if f.check == "C4"] == []
+
+
+def test_c4_a_bare_deleted_does_not_excuse_a_row(tmp_path: Path) -> None:
+    """The retirement has to cite the decision that took it, not merely say "deleted"."""
+    root = _workspace(
+        tmp_path,
+        ledger_rows=(
+            "| ^alpha | duplicate → a unit that was deleted long ago |\n"
+            "| ^beta | retained/compressed |\n"
+        ),
+    )
+    assert [f.subject for f in _lint(root, tmp_path).findings if f.check == "C4"] == ["^alpha"]
+
+    cited = _workspace(
+        tmp_path / "cited",
+        ledger_rows=(
+            "| ^alpha | duplicate → the old pin path (deleted in D2) |\n"
+            "| ^beta | retained/compressed |\n"
+        ),
+    )
+    assert [f for f in _lint(cited, tmp_path).findings if f.check == "C4"] == []
+
+
+def test_a_disposition_token_inside_a_longer_word_is_not_a_disposition(tmp_path: Path) -> None:
+    """A raw substring test read "staleness is a vibe" as the `stale` disposition."""
+    root = _workspace(
+        tmp_path,
+        ledger_rows=(
+            "| ^alpha | staleness is a vibe, not a disposition |\n"
+            "| ^beta | retained/compressed |\n"
+        ),
+    )
+    findings = [f for f in _lint(root, tmp_path).findings if f.check == "C4"]
+    assert any("unrecognized disposition" in f.detail for f in findings)
 
 
 def test_c4_rejects_an_unrecognized_disposition(tmp_path: Path) -> None:

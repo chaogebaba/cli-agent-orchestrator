@@ -15,10 +15,12 @@ Checks
 C1  composed playbook bytes per manifest variant against the phase limit.
 C2  ``orchestrator/GATE-RULES.md`` bytes, measured as-is.
 C3  coverage: every ``mechanism EXISTS [id]`` row in the migration ledger, and
-    every bracketed mechanism id cited in doctrine prose, resolves to real code;
-    every ``pending ASK [Axx]`` resolves to an OPEN milestone issue.  The id ->
-    location map is GENERATED into ``orchestrator/mechanism-inventory.md``
-    (``--emit-inventory``); a stale committed inventory is itself a C3 finding.
+    every bracketed mechanism id cited in doctrine prose, resolves to real CODE —
+    a hit that occurs only in a comment is ``CITATION-ONLY`` and fails, because a
+    mention is not an implementation; every ``pending ASK [Axx]`` resolves to an
+    OPEN milestone issue.  The id -> location map is GENERATED into
+    ``orchestrator/mechanism-inventory.md`` (``--emit-inventory``); a stale
+    committed inventory is itself a C3 finding.
 C4  ledger completeness: every anchor in the composed output has a ledger row,
     and every ``duplicate``/``stale`` row's surviving authority resolves (AC3).
 C5  exception validity: a ``[[exception]]`` whose ``until`` has passed fails
@@ -129,15 +131,19 @@ def authoritative(disposition: str) -> str:
     return disposition
 
 
-DISPOSITIONS = (
-    "retained/compressed",
-    "config projection",
-    "mechanism EXISTS",
-    "pending ASK",
-    "recipe ",
-    "duplicate",
-    "stale",
+# Word-anchored on purpose: a raw substring test matched "stale" inside
+# "staleness is a vibe, not a disposition" and called the row recognized.
+DISPOSITION_RE = re.compile(
+    r"\b(?:retained/compressed|config projection|mechanism EXISTS|pending ASK"
+    r"|recipe|duplicate|stale)\b"
 )
+
+# AC3's second branch: a row may retire an obligation with no successor, but the
+# retirement has to be ADJUDICATED. "deleted" alone excused
+# `duplicate -> a unit that was deleted long ago`; the marker now has to sit in a
+# parenthesised note that also cites the decision that took it.
+RETIREMENT_RE = re.compile(r"\(([^()]*\bdeleted\b[^()]*)\)", re.IGNORECASE)
+ADJUDICATION_RE = re.compile(r"\b(?:B4-\d+|AC\d+|D\d+|r\d+|#\d+)\b")
 
 
 class LintError(Exception):
@@ -179,9 +185,14 @@ class Claim:
 @dataclass(frozen=True)
 class Resolution:
     mechanism_id: str
-    kind: str
+    kind: str  # hook | script | runtime | CITATION-ONLY | UNRESOLVED
     location: str  # "path:line", or "" when unresolved
     matched: str = ""
+
+    @property
+    def path(self) -> str:
+        """The location without its line number — what the inventory records."""
+        return self.location.rsplit(":", 1)[0] if self.location else ""
 
 
 @dataclass
@@ -351,34 +362,43 @@ def _expand_claim(token: str) -> list[str]:
     return [one for one in ids if one]
 
 
-def ledger_mechanism_ids(rows: Sequence[LedgerRow], ledger_path: str) -> dict[str, list[str]]:
-    """``{mechanism id: [citation sites]}`` from ``mechanism EXISTS [...]`` rows."""
-    claims: dict[str, list[str]] = {}
+def ledger_mechanism_ids(
+    rows: Sequence[LedgerRow], ledger_path: str
+) -> dict[str, list[tuple[str, str]]]:
+    """``{mechanism id: [(precise site, stable site)]}`` from ``mechanism EXISTS`` rows.
+
+    Findings quote the precise ``path:line``; the generated inventory records the
+    stable ``path:<row label>``. A line number in a COMMITTED generated file makes
+    that file a mandatory co-edit of every unrelated ledger insertion above it.
+    """
+    claims: dict[str, list[tuple[str, str]]] = {}
     for row in rows:
         for group in MECHANISM_CLAIM_RE.findall(authoritative(row.disposition)):
             for token in group.split(";"):
                 for one in _expand_claim(token):
-                    claims.setdefault(one, []).append(f"{ledger_path}:{row.line}")
+                    claims.setdefault(one, []).append(
+                        (f"{ledger_path}:{row.line}", f"{ledger_path}:{row.label}")
+                    )
     return claims
 
 
 def prose_mechanism_sites(
     files: Sequence[tuple[str, str]], known_ids: Iterable[str]
-) -> dict[str, list[str]]:
+) -> dict[str, list[tuple[str, str]]]:
     """Find bracketed citations of a KNOWN mechanism id in doctrine prose.
 
     Restricting to ids the ledger already declares is what keeps prose labels
     (``[LIVE-ONLY]``) and ASK tags out of the mechanism universe.
     """
     known = set(known_ids)
-    sites: dict[str, list[str]] = {}
+    sites: dict[str, list[tuple[str, str]]] = {}
     for relpath, text in files:
         for number, line in enumerate(text.splitlines(), start=1):
             for group in PROSE_TOKEN_RE.findall(line):
                 for token in group.split(";"):
                     for one in _expand_claim(token):
                         if one in known:
-                            sites.setdefault(one, []).append(f"{relpath}:{number}")
+                            sites.setdefault(one, []).append((f"{relpath}:{number}", relpath))
     return sites
 
 
@@ -435,21 +455,27 @@ def _claim_pattern(mechanism_id: str) -> re.Pattern[str]:
     return re.compile(re.escape(mechanism_id) + r"(?![A-Za-z0-9_])")
 
 
-def _first_code_match(pattern: re.Pattern[str], text: str) -> re.Match[str] | None:
-    """First match on a non-comment line, else the first match anywhere.
+def _first_code_match(pattern: re.Pattern[str], text: str) -> tuple[re.Match[str] | None, bool]:
+    """``(match, comment_only)`` — the first hit on a code line, else on a comment.
 
-    A comment naming an id is a citation; the id's presence in live code is the
-    thing C3 is actually asserting.  Falling back keeps a comment-only hit as a
-    resolution rather than a false finding — it just loses the preference.
+    POLICY, pinned here rather than left implicit in a fallback, because drawing
+    exactly this line is what A10 #673 exists for: a comment naming an id is a
+    CITATION, not an implementation. A code hit wins outright. A comment-only hit
+    is still RECORDED, since locating the mention is what an author needs, but it
+    is reported as ``CITATION-ONLY`` and fails C3 like an absent mechanism —
+    "doctrine claims a mechanism no code implements" is true either way.
+
+    Measured 2026-09-16: all nineteen live claims resolve from a code line, so the
+    strict policy costs nothing today.
     """
-    first: re.Match[str] | None = None
+    comment_hit: re.Match[str] | None = None
     for match in pattern.finditer(text):
-        if first is None:
-            first = match
         line_start = text.rfind("\n", 0, match.start()) + 1
         if not text[line_start : match.start()].lstrip().startswith(("#", "//", "*")):
-            return match
-    return first
+            return match, False
+        if comment_hit is None:
+            comment_hit = match
+    return comment_hit, comment_hit is not None
 
 
 def resolve_mechanisms(
@@ -457,6 +483,7 @@ def resolve_mechanisms(
 ) -> dict[str, Resolution]:
     pending = {one: _claim_pattern(one) for one in ids}
     resolved: dict[str, Resolution] = {}
+    citations: dict[str, Resolution] = {}
     for relpath, kind, path in files:
         if not pending:
             break
@@ -465,21 +492,38 @@ def resolve_mechanisms(
         except OSError:
             continue
         for mechanism_id in sorted(pending):
-            match = _first_code_match(pending[mechanism_id], text)
+            match, comment_only = _first_code_match(pending[mechanism_id], text)
             if match is None:
                 continue
             line = text.count("\n", 0, match.start()) + 1
+            if comment_only:
+                # Keep looking — a later source may implement it for real. The
+                # citation is kept only if nothing else resolves the id.
+                citations.setdefault(
+                    mechanism_id,
+                    Resolution(mechanism_id, "CITATION-ONLY", f"{relpath}:{line}", match.group(0)),
+                )
+                continue
             resolved[mechanism_id] = Resolution(
                 mechanism_id, kind, f"{relpath}:{line}", match.group(0)
             )
             del pending[mechanism_id]
     for mechanism_id in pending:
-        resolved[mechanism_id] = Resolution(mechanism_id, "UNRESOLVED", "")
+        resolved[mechanism_id] = citations.get(
+            mechanism_id, Resolution(mechanism_id, "UNRESOLVED", "")
+        )
     return resolved
 
 
-def render_inventory(resolutions: dict[str, Resolution], sites: dict[str, list[str]]) -> str:
-    """Deterministic id -> location table.  No timestamps: two runs are byte-identical."""
+def render_inventory(
+    resolutions: dict[str, Resolution], sites: dict[str, list[tuple[str, str]]]
+) -> str:
+    """Deterministic id -> location table.
+
+    No timestamps and NO LINE NUMBERS: two runs are byte-identical, and an
+    unrelated insertion above a claim or above its implementation does not make
+    the committed copy stale. Findings still quote exact ``path:line``.
+    """
     lines = [
         "<!-- GENERATED by `cao-orchestrator lint-doctrine --emit-inventory`"
         " (F809 #666, A14/#681).",
@@ -496,8 +540,10 @@ def render_inventory(resolutions: dict[str, Resolution], sites: dict[str, list[s
     ]
     for mechanism_id in sorted(resolutions):
         row = resolutions[mechanism_id]
-        where = f"`{row.location}`" if row.location else "—"
-        claimed = "; ".join(f"`{site}`" for site in sorted(set(sites.get(mechanism_id, ()))))
+        where = f"`{row.path}`" if row.path else "—"
+        claimed = "; ".join(
+            f"`{stable}`" for stable in sorted({site[1] for site in sites.get(mechanism_id, ())})
+        )
         lines.append(f"| `{mechanism_id}` | {row.kind} | {where} | {claimed or '—'} |")
     lines.append("")
     return "\n".join(lines)
@@ -573,8 +619,11 @@ def _surviving_authority_resolves(
     recipe = re.search(r"recipe\s+([A-Za-z0-9._-]+\.md)", target)
     if recipe and (workspace / "doctrine" / "recipes" / recipe.group(1)).is_file():
         return True
-    if "deleted" in target.lower():
-        # An explicit adjudicated retirement is AC3's other branch.
+    retirement = RETIREMENT_RE.search(target)
+    if retirement and ADJUDICATION_RE.search(retirement.group(1)):
+        # AC3's other branch: an obligation may retire with no successor, but only
+        # as an ADJUDICATED retirement — a parenthesised note that cites the
+        # decision. Bare prose ("a unit that was deleted long ago") is not one.
         return True
     head = re.split(r"[(;]", target, maxsplit=1)[0].strip()
     if head and any(label.startswith(head) for label in labels):
@@ -691,15 +740,18 @@ def run_lint(
         claims.setdefault(mechanism_id, []).extend(sites)
     resolutions = resolve_mechanisms(claims, mechanism_files(workspace, MECHANISM_SOURCES))
     for mechanism_id in sorted(resolutions):
-        if resolutions[mechanism_id].kind == "UNRESOLVED":
-            where = "; ".join(sorted(set(claims.get(mechanism_id, ()))))
-            result.findings.append(
-                Finding(
-                    "C3",
-                    mechanism_id,
-                    f"claimed at {where} but resolves to no code in any mechanism source",
-                )
+        resolution = resolutions[mechanism_id]
+        if resolution.kind not in ("UNRESOLVED", "CITATION-ONLY"):
+            continue
+        where = "; ".join(sorted({site[0] for site in claims.get(mechanism_id, ())}))
+        if resolution.kind == "CITATION-ONLY":
+            detail = (
+                f"claimed at {where}; the only hit is a COMMENT at {resolution.location} — "
+                "a mention is not an implementation"
             )
+        else:
+            detail = f"claimed at {where} but resolves to no code in any mechanism source"
+        result.findings.append(Finding("C3", mechanism_id, detail))
     result.inventory = render_inventory(resolutions, claims)
     if inventory_out is not None:
         inventory_out.parent.mkdir(parents=True, exist_ok=True)
@@ -770,7 +822,7 @@ def run_lint(
                 )
             )
     for row in rows:
-        if not any(token in row.disposition for token in DISPOSITIONS):
+        if not DISPOSITION_RE.search(row.disposition):
             result.findings.append(
                 Finding(
                     "C4",
