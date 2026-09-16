@@ -343,3 +343,48 @@ def test_a_reachable_plane_records_the_url_and_pairing_code(
     assert reached["url"] == f"http://127.0.0.1:{port}"
     assert reached["code"], "the operator needs the pairing code"
     assert float(reached["expires"]) > 0
+
+
+def test_production_passes_the_public_url_through_to_bind_attempt(
+    tmp_path, monkeypatch, workspace: Path
+) -> None:
+    """The coverage gap a surviving mutant exposed.
+
+    The external-client arm calls ``bind_attempt`` itself, so it proves the
+    CONNECTOR honours ``public_base_url`` — not that PRODUCTION supplies it.
+    Setting it to None in production left that arm green. This one captures the
+    real call.
+    """
+    import cli_agent_orchestrator.chatgpt_web_runner.runtime as runtime
+    import cli_agent_orchestrator.services.workspace_read as workspace_read
+
+    port = _free_port()
+    public = f"http://127.0.0.1:{port}"
+    monkeypatch.setenv("CAO_ARTIFACTS_DIR", str(tmp_path))
+    monkeypatch.setenv("CHATGPT_PULL_BIND_PORT", str(port))
+    monkeypatch.setenv("CHATGPT_PULL_PUBLIC_BASE_URL", public)
+
+    seen: dict[str, object] = {}
+    real_bind = workspace_read.bind_attempt
+
+    def _spy(**kwargs: object) -> object:
+        seen.update(kwargs)
+        return real_bind(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(workspace_read, "bind_attempt", _spy, raising=False)
+
+    async def _launch(_options: object) -> object:
+        raise RuntimeError("stop after the plane is up")
+
+    monkeypatch.setattr(runtime, "launch", _launch, raising=False)
+    monkeypatch.setattr(runtime, "resolve_profile_dir", lambda: "/data/fake/profile", raising=False)
+    monkeypatch.setattr(runtime, "pin_fingerprint_seed", lambda _p: "epoch", raising=False)
+
+    log = _attempt(tmp_path, "reach-passthrough")
+    with pytest.raises(RuntimeError, match="stop after the plane is up"):
+        asyncio.run(_drive(log, "reach-passthrough", workspace))
+
+    assert seen.get("public_base_url") == public, (
+        "production must pass the configured public URL, or the connector "
+        "advertises a loopback issuer ChatGPT cannot reach"
+    )
