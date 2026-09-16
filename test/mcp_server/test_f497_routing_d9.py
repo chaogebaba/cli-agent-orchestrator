@@ -118,25 +118,41 @@ def _shas(positions: Path, position: str, provider: str) -> "tuple[str, str]":
     return p_sha, overlay_sha(frags)
 
 
-def _certify(positions: Path, position: str, provider: str, outcome: str) -> None:
-    """Append a certification row at the CURRENT sha pair for (position, provider)."""
-    import frontmatter
-
-    p_sha, o_sha = _shas(positions, position, provider)
-    path = positions / f"{position}.md"
-    parsed = frontmatter.loads(path.read_text(encoding="utf-8"))
-    rows = list(parsed.metadata.get("certification") or [])
-    rows.append(
-        {
-            "provider": provider,
-            "position_sha": p_sha,
-            "overlay_sha": o_sha,
-            "outcome": outcome,
-            "date": "2026-08-29",
-        }
+def _fixture_evidence(positions: Path, position: str, provider: str) -> Path:
+    """An evidence file the production writer accepts: a command and its output."""
+    path = positions.parent / f"evidence-{position}-{provider}.md"
+    path.write_text(
+        f"# D9 fixture smoke ({position}, {provider})\n"
+        f"$ cao-mcp-server assign --position {position} --provider {provider}\n"
+        "SMOKE OK: one callback round-trip\n",
+        encoding="utf-8",
     )
-    parsed.metadata["certification"] = rows
-    path.write_text(frontmatter.dumps(parsed) + "\n", encoding="utf-8")
+    return path
+
+
+def _certify(positions: Path, position: str, provider: str, outcome: str) -> None:
+    """Record a certification row through the PRODUCTION writer (F788 #645).
+
+    The test-only appender that used to live here is deleted. It was the ONLY
+    writer of PASS rows anywhere in the tree, which is how the live rows drifted
+    to a stale sha pair unnoticed: these tests proved the reader accepts rows that
+    no shipped code path produces. Now the fixture and the fleet write rows the
+    same way, so a change to the writer that breaks the reader turns this file red.
+    """
+    from cli_agent_orchestrator.cli.orchestrator_commands.certify import (
+        read_evidence,
+        write_certification_row,
+    )
+
+    write_certification_row(
+        positions,
+        position,
+        provider,
+        axis="provider",
+        outcome=outcome,
+        evidence=read_evidence(_fixture_evidence(positions, position, provider)),
+        date="2026-08-29",
+    )
 
 
 # --------------------------------------------------------------------------

@@ -11,6 +11,8 @@ from importlib.metadata import PackageNotFoundError, version
 
 import click
 
+from cli_agent_orchestrator.cli.orchestrator_commands.cert_status import cert_status
+from cli_agent_orchestrator.cli.orchestrator_commands.certify import certify
 from cli_agent_orchestrator.cli.orchestrator_commands.fold_corpus import fold_corpus
 from cli_agent_orchestrator.cli.orchestrator_commands.ledger import ledger
 from cli_agent_orchestrator.cli.orchestrator_commands.lint_doctrine import lint_doctrine
@@ -32,6 +34,8 @@ cli.add_command(ledger)
 cli.add_command(fold_corpus)
 cli.add_command(sync_routing)
 cli.add_command(lint_doctrine)
+cli.add_command(certify)
+cli.add_command(cert_status)
 
 
 if __name__ == "__main__":

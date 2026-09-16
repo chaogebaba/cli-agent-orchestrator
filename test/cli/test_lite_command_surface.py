@@ -29,7 +29,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # discovery left, so `cao fold FILE` is untouched and is asserted separately below.
 # `lint-doctrine` (F809 #666 A14/#681) is NEW here rather than moved, so base never carried
 # it and it gets no base stub; the disjointness assertion below still covers it.
-MOVED = ("ledger", "fold-corpus", "sync-routing", "lint-doctrine")
+MOVED = ("ledger", "fold-corpus", "sync-routing", "lint-doctrine", "certify", "cert-status")
 
 POINTER = "cao-orchestrator"
 
