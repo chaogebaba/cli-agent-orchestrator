@@ -460,6 +460,12 @@ _PROVIDER_HOME_SYMLINKS: tuple[str, ...] = (
     # rather than as an auth failure. Found while running the AC-LITE-1 fixture
     # against a real pi pane on grok-box-007 (2026-09-16).
     ".pi",
+    # claude_code: credentials live in Path.home()/'.claude' and the adjacent
+    # '.claude.json'. Same failure shape as pi -- an unauthenticated pane rather
+    # than an error. '.claude.json' is a FILE, which the loop below already
+    # handles because it tests `exists()` rather than `is_dir()`.
+    ".claude",
+    ".claude.json",
 )
 
 
