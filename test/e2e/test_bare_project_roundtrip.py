@@ -239,6 +239,12 @@ def _run_round_trip(project: Path, home: Path) -> Observables:
                     "-m",
                     "cli_agent_orchestrator.cli.main",
                     "diag",
+                    # `diag terminal` carries its OWN --db/--json (diag.py:168-173).
+                    # `cao diag --db X --json <id>` routes through _DiagGroup.resolve_command,
+                    # which rewrites the args to [terminal, <id>] and drops the group's flags,
+                    # so the subcommand silently used the DEFAULT database. Naming the view
+                    # explicitly is the documented form and the only one that reaches this DB.
+                    "terminal",
                     "--db",
                     str(server.db_path),
                     "--json",
@@ -346,9 +352,16 @@ def _delivery_rows(db_path: Path, receiver_id: str) -> list[dict[str, Any]]:
 
 
 def _diag_has_timeline(stdout: str) -> bool:
+    """True when diag emitted a parseable JSON payload naming the terminal it was asked about.
+
+    A bare project has no ingested worker events, so the timeline is legitimately empty -- what
+    must hold is that diag READ this database and answered in the requested format, not that it
+    found rows.
+    """
     with contextlib.suppress(json.JSONDecodeError):
-        return bool(json.loads(stdout))
-    return bool(stdout.strip())
+        payload = json.loads(stdout)
+        return isinstance(payload, (dict, list))
+    return False
 
 
 def _recover_reason(response: requests.Response) -> str:
