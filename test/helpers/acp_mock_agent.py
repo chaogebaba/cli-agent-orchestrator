@@ -45,6 +45,13 @@ STEERING = os.environ.get("MOCK_ACP_STEERING", "0") == "1"
 #: that only dies to SIGKILL.
 IGNORE_SIGTERM = os.environ.get("MOCK_ACP_IGNORE_SIGTERM", "0") == "1"
 
+#: ``1`` answers every ``session/prompt`` with a JSON-RPC ERROR instead of running
+#: a turn, reproducing what a live claude-agent-acp did on 2026-09-16 when its
+#: OAuth session had expired: the prompt is accepted onto the wire and comes back
+#: ``authentication_failed``, so a turn is opened that will never produce a
+#: ``stopReason``.
+PROMPT_ERRORS = os.environ.get("MOCK_ACP_PROMPT_ERROR", "0") == "1"
+
 _lock = threading.Lock()
 _state: dict[str, Any] = {"cancelled": False, "turn": None, "session": None, "prompts": []}
 
@@ -153,6 +160,19 @@ def _handle(frame: dict[str, Any]) -> None:
         _state["session"] = session_id
         _send({"jsonrpc": "2.0", "id": frame["id"], "result": {"sessionId": session_id}})
     elif method == "session/prompt":
+        if PROMPT_ERRORS:
+            _send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": frame["id"],
+                    "error": {
+                        "code": -32603,
+                        "message": "Internal error: Failed to authenticate",
+                        "data": {"errorKind": "authentication_failed"},
+                    },
+                }
+            )
+            return
         text = ""
         for block in params.get("prompt") or []:
             text += block.get("text", "")
