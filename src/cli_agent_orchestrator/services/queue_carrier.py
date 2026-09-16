@@ -780,10 +780,22 @@ class HerdrPromptInjector:
             return InjectionResult(
                 outcome=AttemptOutcome.SUBMISSION_UNCERTAIN, detail="herdr:unresolved_unreadable"
             )
-        if recorded is not None and state.state_change_seq is not None:
-            if state.state_change_seq > recorded:
-                self._clear_unresolved(terminal_id)
-                return None
+        if recorded is None:
+            # A submission whose SEQUENCE was never learned — the injection
+            # timed out after the text had gone.  With no baseline there is
+            # nothing to compare, so this read BECOMES the baseline and the
+            # block holds for one more round.  Adopting it is what keeps the
+            # rule bounded: without it, ``recorded is None`` could never be
+            # satisfied by any later read and the terminal's deliveries would be
+            # wedged until the process restarted, which is a worse failure than
+            # the double-submission the rule exists to prevent.
+            self._mark_unresolved(terminal_id, state.state_change_seq)
+            return InjectionResult(
+                outcome=AttemptOutcome.SUBMISSION_UNCERTAIN, detail="herdr:unresolved_baseline"
+            )
+        if state.state_change_seq is not None and state.state_change_seq > recorded:
+            self._clear_unresolved(terminal_id)
+            return None
         return InjectionResult(
             outcome=AttemptOutcome.SUBMISSION_UNCERTAIN, detail="herdr:unresolved_prior"
         )
