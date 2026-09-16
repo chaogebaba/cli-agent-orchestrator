@@ -67,6 +67,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "HERDR_AGENT_BLOCKED",
+    "HERDR_AGENT_NOT_FOUND",
     "HERDR_AGENT_PROMPT_STALLED",
     "HERDR_PROMPT_ACK_STATES",
     "HERDR_PROTOCOL",
@@ -101,6 +102,7 @@ HERDR_SCHEMA_VERSION = 1
 #: phrase "before any input is sent": that is what makes ``agent_blocked`` a
 #: refusal we may retry, and the other two submissions we may not.
 HERDR_AGENT_BLOCKED = "agent_blocked"
+HERDR_AGENT_NOT_FOUND = "agent_not_found"
 HERDR_AGENT_PROMPT_STALLED = "agent_prompt_stalled"
 HERDR_TIMEOUT = "timeout"
 
@@ -288,6 +290,58 @@ def _submission_from_result(result: dict[str, Any]) -> PromptSubmission:
     )
 
 
+def _qualify_success(
+    submission: PromptSubmission, before: PromptSubmission | None
+) -> PromptSubmission:
+    """Downgrade a success that the wait could not actually have witnessed.
+
+    ``agent.prompt --wait`` answers on "the first matching state observed after
+    submission".  Two ways that is satisfied WITHOUT the agent having taken our
+    text, both observed live rather than reasoned about:
+
+    * the agent was ALREADY in an ack state, so the match is the state it was
+      already in.  herdr's five-second submission gate does not even run here —
+      its own help scopes the gate to a submission that "starts from another
+      non-working state" — so there is no evidence in the reply at all.
+    * the agent's ``state_change_seq`` did not advance.  Nothing about the pane
+      moved between the submission and the reply, which is the same emptiness
+      by a different measure, and it catches the case where the pre-read raced.
+
+    Both become ``SUBMISSION_UNCERTAIN``: the text HAS been handed to the
+    runtime (so it may not be re-offered blindly) and nothing acknowledged it
+    (so it is not a delivery).  A non-success submission is returned untouched —
+    a refusal needs no qualifying.
+    """
+    if submission.outcome is not AttemptOutcome.DELIVERED:
+        return submission
+    if before is None:
+        return PromptSubmission(
+            outcome=AttemptOutcome.SUBMISSION_UNCERTAIN,
+            detail="no_pre_state",
+            agent_status=submission.agent_status,
+            state_change_seq=submission.state_change_seq,
+        )
+    if before.agent_status in HERDR_PROMPT_ACK_STATES:
+        return PromptSubmission(
+            outcome=AttemptOutcome.SUBMISSION_UNCERTAIN,
+            detail=f"submitted_while_{before.agent_status}",
+            agent_status=submission.agent_status,
+            state_change_seq=submission.state_change_seq,
+        )
+    if (
+        before.state_change_seq is not None
+        and submission.state_change_seq is not None
+        and submission.state_change_seq <= before.state_change_seq
+    ):
+        return PromptSubmission(
+            outcome=AttemptOutcome.SUBMISSION_UNCERTAIN,
+            detail="no_state_advance",
+            agent_status=submission.agent_status,
+            state_change_seq=submission.state_change_seq,
+        )
+    return submission
+
+
 def _submission_from_error_code(code: str, message: str) -> PromptSubmission:
     """Map one herdr ``agent.prompt`` error code.  The table is in the docstring
     of :meth:`HerdrClient.prompt_agent`; this is only its transcription."""
@@ -303,6 +357,14 @@ def _submission_from_error_code(code: str, message: str) -> PromptSubmission:
         )
     if code == HERDR_AGENT_BLOCKED:
         return PromptSubmission(outcome=AttemptOutcome.VETO_DIALOG, detail=HERDR_AGENT_BLOCKED)
+    if code == HERDR_AGENT_NOT_FOUND:
+        # The live arm on grok-box-005 (2026-09-16) is where this code came
+        # from: a prompt to a name herdr does not hold answers
+        # ``agent_not_found``.  Same BOUND as the unmapped default — both spend
+        # the attempt budget — but the pane injector already has a word for "no
+        # pane to write to" and using a different one for the same fact would
+        # make two carriers' journals disagree about one condition.
+        return PromptSubmission(outcome=AttemptOutcome.PANE_ABSENT, detail=HERDR_AGENT_NOT_FOUND)
     logger.debug("unmapped herdr agent.prompt error code %s: %s", code, message)
     return PromptSubmission(outcome=AttemptOutcome.VETO_UNVERIFIED, detail=f"herdr_error:{code}")
 
@@ -577,6 +639,20 @@ class HerdrClient:
         connection.  So Seam B never shares a socket with Seam A and cannot
         poison it.
 
+        **A success is QUALIFIED against the state the agent was in before.**
+        This is not defensive tidiness; it is the live arm's finding.  On
+        grok-box-005 (2026-09-16), a prompt issued while the pi pane was already
+        ``working`` came back successful in 302 ms — because ``wait`` matches
+        *the first state observed after submission* and ``working`` was already
+        true, and because herdr's own five-second submission gate is documented
+        to run only "when an accepted submission starts from another non-working
+        state".  So on a busy agent the reply proves the agent was busy, not that
+        it took the text.  Reporting ``DELIVERED`` there would be the exact
+        false receipt this seam exists to stop, so the pre-state is read first
+        and a success from an ack state is projected to
+        ``SUBMISSION_UNCERTAIN``.  The extra round-trip cost about 0.3 s on that
+        box, against a 20-second injection budget.
+
         **Exactly one submission per call, in every arm.**  There is no internal
         retry and no second ``agent.prompt`` on any path, including the arms
         below that return a retryable outcome — retrying is the delivery tick's
@@ -596,7 +672,10 @@ class HerdrClient:
         ``timeout``                      ``SUBMISSION_UNCERTAIN``  ``dead_by``
         transport failed AFTER flush     ``SUBMISSION_UNCERTAIN``  ``dead_by``
         transport failed BEFORE flush    ``VETO_UNVERIFIED``       attempt budget
+        ``agent_not_found``              ``PANE_ABSENT``           attempt budget
         any other error code             ``VETO_UNVERIFIED``       attempt budget
+        success, agent ALREADY busy      ``SUBMISSION_UNCERTAIN``  ``dead_by``
+        success, state seq did not move  ``SUBMISSION_UNCERTAIN``  ``dead_by``
         =============================== ========================= ==============
 
         ``agent_blocked`` is ``VETO_DIALOG`` and not an attempt-budget outcome
@@ -613,6 +692,7 @@ class HerdrClient:
         configuration fault that should die on the budget rather than sit open
         until ``dead_by``.
         """
+        before = await self.agent_state(target=target)
         params: dict[str, Any] = {
             "target": target,
             "text": text,
@@ -635,7 +715,7 @@ class HerdrClient:
                 outcome=AttemptOutcome.VETO_UNVERIFIED,
                 detail="herdr_transport_before_submit",
             )
-        return _submission_from_result(result)
+        return _qualify_success(_submission_from_result(result), before)
 
     async def agent_state(self, *, target: str) -> PromptSubmission | None:
         """Read one agent's current status and state sequence, or ``None``.

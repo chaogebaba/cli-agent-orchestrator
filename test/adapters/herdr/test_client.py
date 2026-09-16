@@ -835,6 +835,23 @@ def _prompts(server: FakeHerdrServer) -> list[dict[str, Any]]:
     return [r for r in server.requests if r.get("method") == "agent.prompt"]
 
 
+def _pre_state(status: str = "idle", seq: int = 1) -> Handler:
+    """A handler arm answering the pre-submission ``agent.get``.
+
+    Every prompt now reads the agent's state first, because the live arm showed
+    a success reply is not evidence when the agent was already in an ack state.
+    So the fake has to answer it, and the tests say WHAT it answers — the
+    pre-state is an input to the mapping, not scaffolding.
+    """
+
+    async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
+        await server.reply(
+            request["id"], {"agent": {"agent_status": status, "state_change_seq": seq}}
+        )
+
+    return handler
+
+
 async def test_a_successful_prompt_is_delivered(socket_path: str) -> None:
     """herdr observed an ack state, so the submission is acknowledged (D4)."""
 
@@ -847,6 +864,8 @@ async def test_a_successful_prompt_is_delivered(socket_path: str) -> None:
                     "agent": {"agent_status": "working", "state_change_seq": 41},
                 },
             )
+        elif request.get("method") == "agent.get":
+            await _pre_state()(server, request)
         else:
             await FakeHerdrServer._default_handler(server, request)
 
@@ -876,6 +895,8 @@ async def test_the_prompt_asks_for_the_ack_states_not_herdr_s_default_until(
             await server.reply(
                 request["id"], {"type": "agent_prompted", "agent": {"agent_status": "working"}}
             )
+        elif request.get("method") == "agent.get":
+            await _pre_state()(server, request)
         else:
             await FakeHerdrServer._default_handler(server, request)
 
@@ -903,6 +924,8 @@ async def test_agent_prompt_stalled_is_an_uncertain_submission(socket_path: str)
     async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
         if request.get("method") == "agent.prompt":
             await server.error(request["id"], HERDR_AGENT_PROMPT_STALLED, "no state observed")
+        elif request.get("method") == "agent.get":
+            await _pre_state()(server, request)
         else:
             await FakeHerdrServer._default_handler(server, request)
 
@@ -921,6 +944,8 @@ async def test_a_caller_timeout_is_the_same_fact_as_a_stall(socket_path: str) ->
     async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
         if request.get("method") == "agent.prompt":
             await server.error(request["id"], HERDR_TIMEOUT, "caller timeout")
+        elif request.get("method") == "agent.get":
+            await _pre_state()(server, request)
         else:
             await FakeHerdrServer._default_handler(server, request)
 
@@ -945,6 +970,8 @@ async def test_agent_blocked_is_a_dialog_veto_and_sends_no_second_prompt(
     async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
         if request.get("method") == "agent.prompt":
             await server.error(request["id"], HERDR_AGENT_BLOCKED, "agent is blocked")
+        elif request.get("method") == "agent.get":
+            await _pre_state()(server, request)
         else:
             await FakeHerdrServer._default_handler(server, request)
 
@@ -975,6 +1002,8 @@ async def test_a_transport_failure_after_the_flush_is_uncertain(socket_path: str
     async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
         if request.get("method") == "agent.prompt":
             await server.close_connection()
+        elif request.get("method") == "agent.get":
+            await _pre_state()(server, request)
         else:
             await FakeHerdrServer._default_handler(server, request)
 
@@ -997,6 +1026,8 @@ async def test_an_unmapped_error_code_dies_on_the_attempt_budget(socket_path: st
     async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
         if request.get("method") == "agent.prompt":
             await server.error(request["id"], "no_such_agent", "unknown target")
+        elif request.get("method") == "agent.get":
+            await _pre_state()(server, request)
         else:
             await FakeHerdrServer._default_handler(server, request)
 
@@ -1015,6 +1046,8 @@ async def test_an_unexpected_success_shape_is_not_read_as_delivered(socket_path:
     async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
         if request.get("method") == "agent.prompt":
             await server.reply(request["id"], {"type": "something_else"})
+        elif request.get("method") == "agent.get":
+            await _pre_state()(server, request)
         else:
             await FakeHerdrServer._default_handler(server, request)
 
@@ -1040,6 +1073,8 @@ async def test_the_prompt_never_shares_the_streaming_connection(socket_path: str
             await server.reply(
                 request["id"], {"type": "agent_prompted", "agent": {"agent_status": "working"}}
             )
+        elif request.get("method") == "agent.get":
+            await _pre_state()(server, request)
         else:
             await FakeHerdrServer._default_handler(server, request)
 
@@ -1064,6 +1099,8 @@ async def test_agent_state_reads_the_status_and_sequence(socket_path: str) -> No
             await server.reply(
                 request["id"], {"agent": {"agent_status": "idle", "state_change_seq": 7}}
             )
+        elif request.get("method") == "agent.get":
+            await _pre_state()(server, request)
         else:
             await FakeHerdrServer._default_handler(server, request)
 
@@ -1080,3 +1117,175 @@ async def test_agent_state_is_none_when_it_cannot_be_read(socket_path: str) -> N
     """No evidence either way is not an answer, and is never an error."""
     client = HerdrClient(socket_path + "-absent")
     assert await client.agent_state(target="%3") is None
+
+
+# --------------------------------------------------------------------------
+# The qualification rule, and why it exists.
+#
+# Live on grok-box-005 (2026-09-16): a prompt issued while the pi pane was
+# ALREADY ``working`` returned success in 302 ms, with the status between the
+# two prompts read as ``["working", 30]``.  ``--wait`` matches the first state
+# observed AFTER submission and ``working`` was already true, so the reply said
+# nothing about our text.  These tests pin the projection that finding forced.
+# --------------------------------------------------------------------------
+
+
+def _prompt_ok(status: str = "working", seq: int = 42) -> Handler:
+    async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
+        if request.get("method") == "agent.prompt":
+            await server.reply(
+                request["id"],
+                {
+                    "type": "agent_prompted",
+                    "agent": {"agent_status": status, "state_change_seq": seq},
+                },
+            )
+        else:
+            await FakeHerdrServer._default_handler(server, request)
+
+    return handler
+
+
+async def test_a_success_from_an_already_working_agent_is_uncertain(socket_path: str) -> None:
+    """The live finding, as a test.
+
+    herdr's own five-second submission gate is scoped to a submission that
+    "starts from another non-working state", so on a busy agent it does not run
+    at all and there is no evidence in the reply.  Calling that DELIVERED is the
+    false receipt this seam exists to stop.
+    """
+
+    async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
+        if request.get("method") == "agent.get":
+            await _pre_state("working", 30)(server, request)
+        else:
+            await _prompt_ok("working", 31)(server, request)
+
+    async with FakeHerdrServer(socket_path) as server:
+        server.on_request = handler
+        client = HerdrClient(socket_path)
+        result = await client.prompt_agent(target="%3", text="hello")
+        assert result.outcome is AttemptOutcome.SUBMISSION_UNCERTAIN
+        assert result.detail == "submitted_while_working"
+        # It still SUBMITTED — the text is with the runtime, which is exactly
+        # why the row may not simply be re-offered.
+        assert len(_prompts(server)) == 1
+
+
+async def test_a_success_from_a_blocked_agent_is_uncertain_too(socket_path: str) -> None:
+    """``blocked`` is an ack state, so it satisfies the wait without evidence."""
+
+    async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
+        if request.get("method") == "agent.get":
+            await _pre_state("blocked", 12)(server, request)
+        else:
+            await _prompt_ok("blocked", 12)(server, request)
+
+    async with FakeHerdrServer(socket_path) as server:
+        server.on_request = handler
+        client = HerdrClient(socket_path)
+        result = await client.prompt_agent(target="%3", text="hello")
+        assert result.outcome is AttemptOutcome.SUBMISSION_UNCERTAIN
+        assert result.detail == "submitted_while_blocked"
+
+
+async def test_a_success_whose_state_sequence_did_not_move_is_uncertain(
+    socket_path: str,
+) -> None:
+    """The second measure, which catches a pre-read that raced.
+
+    Nothing about the pane moved between the submission and the reply, so the
+    wait matched something that was already true.
+    """
+
+    async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
+        if request.get("method") == "agent.get":
+            await _pre_state("idle", 9)(server, request)
+        else:
+            await _prompt_ok("working", 9)(server, request)
+
+    async with FakeHerdrServer(socket_path) as server:
+        server.on_request = handler
+        client = HerdrClient(socket_path)
+        result = await client.prompt_agent(target="%3", text="hello")
+        assert result.outcome is AttemptOutcome.SUBMISSION_UNCERTAIN
+        assert result.detail == "no_state_advance"
+
+
+async def test_a_success_from_idle_with_an_advanced_sequence_is_delivered(
+    socket_path: str,
+) -> None:
+    """The one shape that IS evidence: herdr's gate ran and was satisfied."""
+
+    async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
+        if request.get("method") == "agent.get":
+            await _pre_state("idle", 9)(server, request)
+        else:
+            await _prompt_ok("working", 10)(server, request)
+
+    async with FakeHerdrServer(socket_path) as server:
+        server.on_request = handler
+        client = HerdrClient(socket_path)
+        result = await client.prompt_agent(target="%3", text="hello")
+        assert result.outcome is AttemptOutcome.DELIVERED
+        assert result.state_change_seq == 10
+
+
+async def test_an_unreadable_pre_state_is_not_a_delivery(socket_path: str) -> None:
+    """No pre-evidence means the qualification cannot be made, so it is not made
+    in our favour."""
+
+    async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
+        if request.get("method") == "agent.get":
+            await server.reply(request["id"], {})
+        else:
+            await _prompt_ok("working", 10)(server, request)
+
+    async with FakeHerdrServer(socket_path) as server:
+        server.on_request = handler
+        client = HerdrClient(socket_path)
+        result = await client.prompt_agent(target="%3", text="hello")
+        assert result.outcome is AttemptOutcome.SUBMISSION_UNCERTAIN
+        assert result.detail == "no_pre_state"
+
+
+async def test_a_refusal_is_never_qualified(socket_path: str) -> None:
+    """Only a SUCCESS needs qualifying; a refusal already says what happened."""
+
+    async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
+        if request.get("method") == "agent.get":
+            await _pre_state("working", 5)(server, request)
+        elif request.get("method") == "agent.prompt":
+            await server.error(request["id"], HERDR_AGENT_BLOCKED, "blocked")
+        else:
+            await FakeHerdrServer._default_handler(server, request)
+
+    async with FakeHerdrServer(socket_path) as server:
+        server.on_request = handler
+        client = HerdrClient(socket_path)
+        result = await client.prompt_agent(target="%3", text="hello")
+        assert result.outcome is AttemptOutcome.VETO_DIALOG
+
+
+async def test_agent_not_found_is_a_pane_absent(socket_path: str) -> None:
+    """herdr's real code for an unknown target, read off the live box.
+
+    Same bound as the unmapped default, but the pane injector already has a word
+    for "no pane to write to" and two carriers must not name one condition
+    differently in the same journal.
+    """
+
+    async def handler(server: FakeHerdrServer, request: dict[str, Any]) -> None:
+        if request.get("method") == "agent.get":
+            await _pre_state()(server, request)
+        elif request.get("method") == "agent.prompt":
+            await server.error(request["id"], "agent_not_found", "no such agent")
+        else:
+            await FakeHerdrServer._default_handler(server, request)
+
+    async with FakeHerdrServer(socket_path) as server:
+        server.on_request = handler
+        client = HerdrClient(socket_path)
+        result = await client.prompt_agent(target="nope", text="hello")
+        assert result.outcome is AttemptOutcome.PANE_ABSENT
+        assert result.detail == "agent_not_found"
