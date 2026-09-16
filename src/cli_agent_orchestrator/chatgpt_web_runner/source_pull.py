@@ -29,11 +29,13 @@ exercises the same code path the arms do.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import socket
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from cli_agent_orchestrator.chatgpt_web_runner.errors import (
@@ -320,3 +322,108 @@ def call_tool(
         return dict(json.loads(text))
     except json.JSONDecodeError:
         return {"error": {"message": "connector returned a non-JSON body"}}
+
+
+#: The ephemeral pairing-code file's name inside the attempt directory.
+PAIRING_CODE_FILENAME = "pairing.code"
+
+
+class PairingCodeFile:
+    """The raw pairing code's only on-disk home: 0600, and short-lived.
+
+    The durable ledger refuses raw secrets, so the operator's copy lives here
+    instead — next to the attempt, owner-only, and removed as soon as it stops
+    being useful. "Stops being useful" is not a timer: the file is unlinked when
+    the pairing session is no longer active, which is either because a client
+    consumed the code or because it expired. A consumed code left on disk is a
+    credential nobody is watching any more.
+
+    ``revoke()`` is idempotent and never raises, so teardown can always call it.
+    """
+
+    def __init__(self, attempt_dir: Path, pairing: Any) -> None:
+        self.path = Path(attempt_dir) / PAIRING_CODE_FILENAME
+        self._pairing = pairing
+        self._watcher: "Optional[asyncio.Task[None]]" = None
+
+    def write(self, code: str) -> str:
+        """Create the code file 0600 and return its SHA-256 for the ledger.
+
+        ``O_EXCL`` is the point, not decoration. Without it a pre-existing file
+        is ADOPTED and truncated, and since a mode argument applies only at
+        creation, the code is written into whatever mode that file already had —
+        world-readable, until a following ``chmod`` repairs it. The previous
+        revision said O_EXCL in a comment and did not pass it (B3 fixes-2
+        review, finding 2). With it there is no window at any mode but 0600, and
+        no file we did not create.
+
+        There is deliberately no ``revoke()`` before the open. Unlinking first
+        would make ``O_EXCL`` unobservable — every pre-existing file would be
+        silently replaced, which is the behaviour this is meant to refuse. The
+        path is per-attempt (``attempts/<attempt-id>/``) and ``write`` is called
+        once per attempt, so a file already there was not put there by us.
+        """
+        import errno
+        import hashlib
+        import os
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        try:
+            fd = os.open(str(self.path), flags, 0o600)
+        except FileExistsError as exc:
+            raise RunnerError(
+                RunnerErrorCode.ACCESS_DENIED,
+                f"refusing to write the pairing code: {self.path} already exists and is not "
+                "ours to replace — the attempt is refused rather than adopting a file whose "
+                "mode and owner we did not choose",
+                delivery_state=DeliveryState.NOTHING_SENT,
+            ) from exc
+        except OSError as exc:
+            if exc.errno == errno.EEXIST:  # pragma: no cover - platform variance
+                raise RunnerError(
+                    RunnerErrorCode.ACCESS_DENIED,
+                    f"refusing to write the pairing code: {self.path} already exists",
+                    delivery_state=DeliveryState.NOTHING_SENT,
+                ) from exc
+            raise
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(code + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+    def revoke(self) -> None:
+        """Remove the file. Idempotent; safe in a finally."""
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:  # pragma: no cover - teardown must not mask a run
+            pass
+
+    def start_watch(self, *, interval: float = 1.0) -> "asyncio.Task[None]":
+        """Unlink the file as soon as the pairing stops being active."""
+
+        async def _watch() -> None:
+            try:
+                while True:
+                    if not self._pairing.has_active_session():
+                        self.revoke()
+                        return
+                    await asyncio.sleep(interval)
+            except asyncio.CancelledError:  # pragma: no cover - teardown path
+                raise
+
+        self._watcher = asyncio.ensure_future(_watch())
+        return self._watcher
+
+    async def stop_watch(self) -> None:
+        """Cancel the watcher and remove the file unconditionally."""
+        watcher = self._watcher
+        self._watcher = None
+        if watcher is not None and not watcher.done():
+            watcher.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await watcher
+        self.revoke()
