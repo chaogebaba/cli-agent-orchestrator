@@ -149,8 +149,14 @@ async def test_real_page_post_is_held_by_the_production_handler(tmp_path):
             assert session.captured.url.endswith("/backend-api/f/conversation")
             assert b'"fake-user"' in session.captured.raw_body
             assert session.disposition is RouteDisposition.HELD
-            # The request never left the browser: the origin saw nothing.
-            assert origin.ledger.snapshot() == ()
+            # The request never left the browser: the origin saw nothing. A
+            # release started by the handler would land at the origin a few
+            # milliseconds later, so give it a bounded chance to appear rather
+            # than reading the ledger the instant the hold is announced -- an
+            # immediate read passes for a handler that DID release the route.
+            for _ in range(20):
+                await asyncio.sleep(0.05)
+                assert origin.ledger.snapshot() == (), origin.ledger.snapshot()
 
             log = _ledger(tmp_path)
             _record_held(log, session)
