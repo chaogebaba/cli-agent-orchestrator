@@ -295,3 +295,70 @@ class _NullPool:
 class _NullLimiter:
     def decide(self, **_: object) -> object:  # pragma: no cover
         raise AssertionError("not called")
+
+
+# ---------------------------------- AC-S1.28: await consumes the STORED deadline
+
+
+def test_await_cancel_is_called_with_the_window_the_store_returned() -> None:
+    """AC-S1.28's named check, statically.
+
+    The dynamic arm (``test_await_cancel_consumes_the_PERSISTED_deadline...``)
+    advances a clock and compares instants. This is the cheaper half and it fails
+    on a different thing: it reads the ARGUMENT EXPRESSION at the call site, so a
+    mutation that recomputes the deadline is refused even before anyone runs it.
+
+    Both are kept because they fail for different reasons. The dynamic arm would
+    also go red if the aggregate persisted the wrong value; this one would not,
+    and this one goes red on a recomputation the dynamic arm's clock happened not
+    to separate.
+    """
+    import ast
+
+    from cli_agent_orchestrator.app.acp import receiver_task
+
+    tree = ast.parse(Path(inspect.getfile(receiver_task)).read_text())
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "await_cancel"
+    ]
+    assert calls, "the receiver task no longer awaits a cancel at all"
+    for call in calls:
+        assert len(call.args) == 2, "await_cancel takes the handle and the deadline"
+        deadline = ast.unparse(call.args[1])
+        assert deadline == "window.deadline", (
+            f"await_cancel must consume the returned/stored CancelWindow deadline, "
+            f"got {deadline!r} — a recomputed bound is a second authority on when "
+            f"the cancel window opened"
+        )
+
+
+def test_no_clock_is_sampled_between_begin_cancel_and_await_cancel() -> None:
+    """The one-sample rule, over the statements BETWEEN the two calls.
+
+    A resample there is invisible to a signature check and to a fixed-clock
+    arm: it would produce a value that still looks like "the deadline", just
+    computed from a different instant.
+    """
+    import ast
+
+    from cli_agent_orchestrator.app.acp import receiver_task
+
+    source = Path(inspect.getfile(receiver_task)).read_text()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or node.name != "_cancel_then_submit":
+            continue
+        body = ast.unparse(node)
+        begin = body.index("begin_cancel")
+        await_at = body.index("await_cancel")
+        between = body[begin:await_at]
+        assert "clock.now" not in between, (
+            "the clock is sampled between begin_cancel and await_cancel; the "
+            "deadline must come from the ONE sample taken before the store call"
+        )
+        return
+    raise AssertionError("_cancel_then_submit not found")

@@ -488,3 +488,83 @@ class _Emission:
 
 
 _EMISSION = _Emission()
+
+
+# ============================== S7 / M1 — the transport's OWN busy guard
+
+
+class _CompliantClient:
+    """A client that does NOT refuse a mid-turn prompt.
+
+    The review's M1 deleted ``if state.turn_open:`` from ``AcpTransport.emit``
+    and all 25 transport arms stayed green, because ``AcpClient.prompt`` refuses
+    independently and ``emit`` maps that refusal back to the same reason. Two
+    guards, one of them unexercised — defence in depth with a half nobody tests
+    is a half that can be deleted.
+
+    This double is the missing half's test harness: it accepts every prompt, so
+    the transport's own guard is the ONLY thing standing between a busy receiver
+    and a second prompt on the wire.
+    """
+
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+        self._turn_open = False
+
+    def session_state(self) -> object:
+        client = self
+
+        class _State:
+            session_id = "sess-1"
+            turn_open = client._turn_open
+            open_request_id = 1
+            last_stop_reason = None
+            steering_advertised = False
+
+        return _State()
+
+    def prompt(self, text: str, *, callback_id: str | None = None) -> int:
+        del callback_id
+        self.prompts.append(text)
+        self._turn_open = True
+        return len(self.prompts)
+
+    def settle(self) -> None:
+        self._turn_open = False
+
+
+def test_the_transports_own_guard_refuses_a_busy_receiver() -> None:
+    """S7: exercised against a client that would happily take the second prompt.
+
+    With ``AcpClient``'s guard removed from the picture, the transport's
+    ``turn_open`` branch is load-bearing on its own — and AC-S1.3's invariant is
+    that NO second prompt reaches the wire, not that one of two guards happens to
+    catch it.
+    """
+    client = _CompliantClient()
+    transport = AcpTransport(lambda _tid: client)
+
+    first = transport.emit(
+        terminal_id=RECEIVER, line="first", sender_key="w", sender_name="w", msg_id="m-1"
+    )
+    assert first.verified is True
+    assert client.prompts == ["first"]
+
+    second = transport.emit(
+        terminal_id=RECEIVER, line="second", sender_key="w", sender_name="w", msg_id="m-2"
+    )
+    assert second.reason == AcpTransport.BUSY_REASON
+    assert client.prompts == ["first"], "the transport's own guard let a second prompt through"
+
+
+def test_the_transport_delivers_again_once_the_turn_settles() -> None:
+    """The control: the guard must be a GUARD, not a permanent refusal."""
+    client = _CompliantClient()
+    transport = AcpTransport(lambda _tid: client)
+    transport.emit(terminal_id=RECEIVER, line="first", sender_key="w", sender_name="w", msg_id="1")
+    client.settle()
+    again = transport.emit(
+        terminal_id=RECEIVER, line="second", sender_key="w", sender_name="w", msg_id="2"
+    )
+    assert again.reason is None
+    assert client.prompts == ["first", "second"]

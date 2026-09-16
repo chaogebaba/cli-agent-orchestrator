@@ -31,6 +31,7 @@ from cli_agent_orchestrator.app.acp.receiver_task import (
 )
 from cli_agent_orchestrator.core.interrupt import (
     ActiveTurnHandle,
+    CancelWindow,
     CallerPrincipal,
     CancelHandle,
     CancelRaceLost,
@@ -626,3 +627,120 @@ def test_the_task_holds_no_transaction_across_any_await() -> None:
     assert "immediate_transaction" not in source
     assert "BEGIN IMMEDIATE" not in source
     assert "sqlite3" not in source
+
+
+# ============================== B3 / M5 — the recomputed-deadline mutant
+
+
+class AdvancingClock:
+    """A clock that MOVES between samples.
+
+    The fixed clock every other arm uses cannot tell a persisted deadline from a
+    recomputed one, because with time standing still the two are equal. That is
+    exactly why the review's M5 survived: replacing
+    ``await_cancel(handle, window.deadline)`` with a freshly computed
+    ``now() + ACP_CANCEL_SETTLE_S`` passed the entire 1,370-test selection.
+    """
+
+    def __init__(self, start: datetime = T0, step_s: float = 7.0) -> None:
+        self.value = start
+        self.step_s = step_s
+        self.samples = 0
+
+    def now(self) -> datetime:
+        self.samples += 1
+        value = self.value
+        self.value = value + timedelta(seconds=self.step_s)
+        return value
+
+
+class DeadlineRecordingSession(FakeSession):
+    """Records the deadline it was handed, so the arm can compare instants."""
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self.deadline_seen: datetime | None = None
+
+    def await_cancel(self, handle: CancelHandle, deadline: datetime) -> CancelSettlement:
+        self.deadline_seen = deadline
+        return super().await_cancel(handle, deadline)
+
+
+def test_await_cancel_consumes_the_PERSISTED_deadline_not_a_recomputed_one(
+    store: SqliteInterruptStore,
+) -> None:
+    """AC-S1.26's "await against recomputed time" mutant, made RED.
+
+    The clock advances by seven seconds on every sample, so the instant the
+    aggregate persisted and any instant recomputed later are provably different.
+    The arm asserts THREE things, and it takes all three to pin the property:
+
+    1. the deadline handed to ``await_cancel`` is exactly the one ``begin_cancel``
+       returned;
+    2. it equals the one the STORE persisted, so a restart reading the row gets
+       the same answer;
+    3. it is derived from the FIRST clock sample — the receiver task's single
+       sample — and not from a later one.
+
+    Without (3) a mutant that resampled once more before the store call would
+    still satisfy (1) and (2) while moving the bound.
+    """
+    admit(store)
+    clock = AdvancingClock()
+    session = DeadlineRecordingSession()
+    task, _, _, _ = build(
+        store, preparation=cancel_required(), session=session, clock=clock  # type: ignore[arg-type]
+    )
+    report = task.run_once()
+
+    assert report.outcome is TaskOutcome.DELIVERED
+    assert report.window is not None
+    assert session.deadline_seen == report.window.deadline, "a recomputed deadline was consumed"
+
+    persisted = store.read_state(TERMINAL)
+    # The row has moved on to ``none`` by now and cleared the consumed deadline,
+    # which is itself the contract — so the durable check is that the value the
+    # store RETURNED was the value it wrote, asserted while it was still in the
+    # row by the sibling arm below.
+    assert persisted is not None
+
+    from cli_agent_orchestrator.core.timing import ACP_CANCEL_SETTLE_S
+
+    # The task samples the clock ONCE, immediately before ``begin_cancel``. The
+    # claim above it took a sample too, so the cancel window is built from the
+    # SECOND tick of this clock, not from a later one.
+    expected = T0 + timedelta(seconds=clock.step_s) + timedelta(seconds=ACP_CANCEL_SETTLE_S)
+    assert (
+        report.window.deadline == expected
+    ), "the cancel deadline was not derived from the task's single clock sample"
+
+
+def test_the_persisted_deadline_is_readable_from_the_row_while_cancelling(
+    store: SqliteInterruptStore,
+) -> None:
+    """The durable half: the value is IN THE ROW, which is what a restart reads.
+
+    A restarted server has no clock sample and no returned value — only the row —
+    so if the deadline were never persisted, every recovered ``cancelling`` would
+    have to invent a bound.
+    """
+    admit(store)
+    clock = AdvancingClock()
+    claimed = store.claim_next(TERMINAL, now=clock.now(), lease_owner="tick")
+    assert claimed is not None
+
+    sample = clock.now()
+    window = store.begin_cancel(claimed.fence, handle(), sample)
+    assert isinstance(window, CancelWindow)
+
+    state = store.read_state(TERMINAL)
+    assert state is not None
+    assert state.phase is InterruptPhase.CANCELLING
+    assert state.deadline == window.deadline
+    # And it is the SAMPLE's deadline, not "twenty seconds from whenever you ask".
+    from cli_agent_orchestrator.core.timing import ACP_CANCEL_SETTLE_S
+
+    assert state.deadline == sample + timedelta(seconds=ACP_CANCEL_SETTLE_S)
+    assert clock.now() > state.deadline - timedelta(
+        seconds=ACP_CANCEL_SETTLE_S
+    ), "the clock really did move, so a recomputed value would differ"
