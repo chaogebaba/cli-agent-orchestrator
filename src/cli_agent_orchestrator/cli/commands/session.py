@@ -85,6 +85,15 @@ def session():
     "Mirrors 'cao launch --yolo'. Mutually exclusive with --tools.",
 )
 @click.option("--env", "env_pairs", multiple=True)
+@click.option(
+    "--mode",
+    "surface_mode",
+    type=click.Choice(["bare", "skill"], case_sensitive=False),
+    default=None,
+    help="MCP tool surface for this seat (WP-ACP-PLANE D21) [default: bare]: "
+    "'bare' is the five infrastructure tools, 'skill' the full orchestration "
+    "surface. Mirrors `cao launch --mode`; travels to the seat as CAO_MCP_MODE.",
+)
 @click.option("--allow-incomplete-brief", is_flag=True)
 @click.option("--memory", is_flag=True)
 @click.option("--json", "as_json", is_flag=True)
@@ -96,6 +105,7 @@ def start(
     allowed_tools,
     yolo,
     env_pairs,
+    surface_mode,
     allow_incomplete_brief,
     memory,
     as_json,
@@ -132,9 +142,18 @@ def start(
         params["allow_incomplete_brief"] = "true"
     if memory:
         params["memory"] = "true"
-    kwargs = {"params": params}
-    if env_pairs:
-        kwargs["json"] = {"env_vars": _parse_env_pairs(env_pairs)}
+    # WP-ACP-PLANE D21: the surface mode is fixed at launch, and rides the
+    # forwarded-env channel for the reason `cao launch` does — that is the one
+    # path reaching the supervisor's process environment. Applied AFTER --env so
+    # an explicit `--env CAO_MCP_MODE=...` cannot disagree with `--mode`.
+    from cli_agent_orchestrator.cli.commands.launch import _MCP_MODE_ENV_VAR
+
+    forwarded_env = _parse_env_pairs(env_pairs) if env_pairs else {}
+    if surface_mode is not None:
+        forwarded_env[_MCP_MODE_ENV_VAR] = str(surface_mode).lower()
+    kwargs: dict = {"params": params}
+    if forwarded_env:
+        kwargs["json"] = {"env_vars": forwarded_env}
     response = cao_http.post(f"/sessions/start", **kwargs)
     payload = response.json()
     if response.status_code == 422 and payload.get("bootstrap", {}).get("status") == "seed_failed":

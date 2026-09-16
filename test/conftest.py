@@ -87,6 +87,17 @@ os.environ["CAO_HOME_DIR"] = str(_TEST_CAO_HOME)
 # install_agent (or another provider-file write) clobbers the user's live agent
 # configs (incident 2026-08-28). Set at import, BEFORE constants.py binds it.
 os.environ["CAO_AGENTS_DIR"] = str(_TEST_CAO_HOME / "kiro-agents")
+# WP-ACP-PLANE D21: the MCP surface mode is fixed at IMPORT and defaults to
+# `bare` (five tools). The in-process suite asserts over the FULL surface — tool
+# ordering, the UX roster, per-tool behaviour — so it declares `skill` here, in
+# the one place a test process can say what kind of deployment it is. Set before
+# any cli_agent_orchestrator import, like the two pins above.
+#
+# This is not a way of hiding the default: AC-S1.11's arms SPAWN the real server
+# and read `tools/list` off the wire precisely because an in-process assertion
+# cannot exercise an import-time gate, and one of those arms launches with no
+# mode at all and requires five tools.
+os.environ.setdefault("CAO_MCP_MODE", "skill")
 
 from cli_agent_orchestrator.clients.database import engine, init_db  # noqa: E402
 

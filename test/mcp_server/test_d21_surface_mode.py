@@ -21,6 +21,7 @@ import pytest
 
 from cli_agent_orchestrator.mcp_server.server import (
     BARE_MODE_TOOLS,
+    InvalidSurfaceMode,
     _resolve_surface_mode,
 )
 
@@ -46,12 +47,17 @@ def _server_binary() -> str:
 def _spawned_tool_names(mode: str, *, via_argv: bool = False) -> list[str]:
     """Launch the real server in ``mode`` and read ``tools/list`` over stdio."""
     env = dict(os.environ)
-    argv = [_server_binary()]
+    extra: list[str] = []
     if via_argv:
-        argv += ["--mode", mode]
+        extra = ["--mode", mode]
         env.pop("CAO_MCP_MODE", None)
     else:
         env["CAO_MCP_MODE"] = mode
+    return _spawned_tool_names_with_env(env, extra)
+
+
+def _spawned_tool_names_with_env(env: dict[str, str], extra_argv: list[str]) -> list[str]:
+    argv = [_server_binary(), *extra_argv]
     process = subprocess.Popen(
         argv,
         stdin=subprocess.PIPE,
@@ -129,41 +135,182 @@ def test_skill_mode_pins_its_count_by_name() -> None:
 
 
 @pytest.mark.slow
+def test_a_spawned_server_with_no_mode_at_all_is_bare() -> None:
+    """The ruling's first arm, end to end: absent -> 5 tools, in a real process."""
+    env = dict(os.environ)
+    env.pop("CAO_MCP_MODE", None)
+    names = _spawned_tool_names_with_env(env, [])
+    assert names == sorted(BARE_MODE_TOOLS)
+
+
+@pytest.mark.slow
 def test_the_mode_can_be_given_as_argv_too() -> None:
     """``cao launch --mode bare|skill`` is D21's stated surface; the env var is
     how it reaches a SPAWNED MCP process, which is where it is actually read."""
     assert _spawned_tool_names("bare", via_argv=True) == sorted(BARE_MODE_TOOLS)
 
 
-def test_an_absent_mode_is_the_compatibility_position() -> None:
-    """DEVIATION FROM D21's WORDING, deliberate and recorded.
+@pytest.mark.slow
+def test_a_spawned_server_refuses_an_unreadable_mode() -> None:
+    """The refusal is not merely raisable — it stops the process.
 
-    D21 says the ``cao launch --mode bare|skill`` FLAG defaults to ``bare``.
-    That flag does not exist yet, so a process that names no mode is a pre-D21
-    process rather than a caller asking for BARE — and answering BARE would take
-    47 tools away from every deployment that has never heard of this switch.
-    The absent position is therefore ``skill``, and it goes away when
-    ``cao launch --mode`` starts passing the flag.
+    A server that logged the refusal and carried on would be the guess this
+    ruling exists to forbid, dressed as a warning nobody reads.
     """
-    assert _resolve_surface_mode([], {}) == "skill"
+    env = dict(os.environ)
+    env["CAO_MCP_MODE"] = "doctrine"
+    process = subprocess.run(
+        [_server_binary()],
+        input="",
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=_HANDSHAKE_TIMEOUT_S,
+    )
+    assert process.returncode != 0
+    assert "InvalidSurfaceMode" in process.stderr or "not a surface mode" in process.stderr
+
+
+# --------------------------------------------------- the flag that sets it
+
+
+def test_cao_launch_carries_the_mode_to_the_seat(monkeypatch: pytest.MonkeyPatch) -> None:
+    """D21's flag, and the variable it sets.
+
+    Asserted over the REQUEST BODY, because the forwarded-env channel is the one
+    path that reaches the supervisor's process environment and every worker
+    spawned later in the session — which is exactly the mode's scope.
+    """
+    from click.testing import CliRunner
+
+    from cli_agent_orchestrator.cli.commands import launch as launch_cmd
+
+    captured: dict[str, object] = {}
+
+    class _Response:
+        status_code = 500
+        text = "stop here"
+
+        def json(self) -> dict[str, object]:
+            return {"detail": "stop here"}
+
+    def _post(url: str, **kwargs: object) -> _Response:
+        captured.update(kwargs)
+        return _Response()
+
+    monkeypatch.setattr(launch_cmd.cao_http, "post", _post)
+    CliRunner().invoke(
+        launch_cmd.launch,
+        ["--agents", "developer", "--mode", "skill", "--headless", "--auto-approve"],
+    )
+    body = captured.get("json") or {}
+    assert body.get("env_vars", {}).get("CAO_MCP_MODE") == "skill"
+
+
+def test_cao_launch_sends_nothing_when_the_flag_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ "Default bare" is a property of the READER, not of the wire.
+
+    The flag's default and the server's default are the same value, so
+    transmitting ``bare`` for a launch that said nothing would change no
+    behaviour while breaking the standing contract that a launch with no
+    ``--env`` sends no request body at all.
+    """
+    from click.testing import CliRunner
+
+    from cli_agent_orchestrator.cli.commands import launch as launch_cmd
+
+    captured: dict[str, object] = {}
+
+    class _Response:
+        status_code = 500
+        text = "stop here"
+
+        def json(self) -> dict[str, object]:
+            return {"detail": "stop here"}
+
+    monkeypatch.setattr(
+        launch_cmd.cao_http, "post", lambda url, **kw: (captured.update(kw), _Response())[1]
+    )
+    CliRunner().invoke(launch_cmd.launch, ["--agents", "developer", "--headless", "--auto-approve"])
+    body = captured.get("json") or {}
+    assert "CAO_MCP_MODE" not in body.get("env_vars", {})
+    # ...and the seat that receives no variable resolves BARE, which is the arm
+    # that makes the silence safe.
+    assert _resolve_surface_mode([], {}) == "bare"
+
+
+@pytest.mark.parametrize("command", ["launch", "session-start"])
+def test_the_cli_refuses_an_unreadable_mode_before_anything_is_launched(command: str) -> None:
+    """The ruling's "refused at launch": ``click.Choice`` rejects it at the CLI
+    boundary, so the server is never asked to interpret it."""
+    from click.testing import CliRunner
+
+    from cli_agent_orchestrator.cli.commands.launch import launch as launch_cmd
+    from cli_agent_orchestrator.cli.commands.session import session as session_cmd
+
+    if command == "launch":
+        result = CliRunner().invoke(launch_cmd, ["--agents", "developer", "--mode", "doctrine"])
+    else:
+        result = CliRunner().invoke(
+            session_cmd, ["start", "--agents", "developer", "--mode", "doctrine"]
+        )
+    assert result.exit_code == 2
+    assert "'bare'" in result.output and "'skill'" in result.output
+
+
+def test_the_flag_and_the_reader_share_one_variable_name() -> None:
+    """A second literal is how a flag comes to set a variable nothing reads."""
+    from cli_agent_orchestrator.cli.commands.launch import _MCP_MODE_ENV_VAR
+    from cli_agent_orchestrator.mcp_server.server import _MODE_ENV_VAR
+
+    assert _MCP_MODE_ENV_VAR == _MODE_ENV_VAR == "CAO_MCP_MODE"
+
+
+def test_bare_is_the_default() -> None:
+    """D21: the plane is infrastructure first, and BARE is the mode that must
+    always work.  A deployment that wants the doctrine surface asks for it."""
+    assert _resolve_surface_mode([], {}) == "bare"
 
 
 @pytest.mark.parametrize("value", ["", "  "])
-def test_a_cleared_variable_is_the_same_as_an_unset_one(value: str) -> None:
-    """An operator who blanked the variable did not ask for BARE."""
-    assert _resolve_surface_mode([], {"CAO_MCP_MODE": value}) == "skill"
-
-
-@pytest.mark.parametrize("value", ["SKILLED", "doctrine", "1", "true"])
-def test_an_explicit_unparseable_mode_resolves_to_bare(value: str) -> None:
-    """Fails toward the SMALLER surface, but only when something was ASKED FOR.
-
-    This runs at import in a server whose boot must not be failed by a
-    configuration typo, and the directions are not symmetric: a missing tool is
-    visible the moment something tries to use it, an unexpectedly exposed one is
-    not visible at all.
-    """
+def test_a_cleared_variable_is_a_withdrawn_request_not_an_unreadable_one(value: str) -> None:
+    """Clearing a variable is how an operator withdraws a request, so it takes
+    the default rather than the refusal."""
     assert _resolve_surface_mode([], {"CAO_MCP_MODE": value}) == "bare"
+
+
+@pytest.mark.parametrize("value", ["SKILLED", "doctrine", "1", "true", "BARE-ISH"])
+def test_an_explicit_unparseable_mode_is_REFUSED(value: str) -> None:
+    """The operator ASKED for something and the server cannot tell what.
+
+    Guessing is the one outcome nobody could debug from the outside: a seat
+    serving 5 tools when its operator typed something meaning 52 looks exactly
+    like a seat that was launched bare on purpose.  Deliberately unlike
+    ``core/switches.py``, whose refusals are values — there a caller can decline
+    ONE subsystem and keep booting, and here the subsystem IS the process.
+    """
+    with pytest.raises(InvalidSurfaceMode) as raised:
+        _resolve_surface_mode([], {"CAO_MCP_MODE": value})
+    message = str(raised.value)
+    assert "'bare'" in message and "'skill'" in message, "the refusal names what is accepted"
+    assert "cao launch --mode" in message, "and carries the literal line to type"
+
+
+def test_an_unparseable_argv_mode_is_refused_too() -> None:
+    """Both spellings, because both reach the same import-time resolution."""
+    with pytest.raises(InvalidSurfaceMode):
+        _resolve_surface_mode(["--mode", "doctrine"], {})
+    with pytest.raises(InvalidSurfaceMode):
+        _resolve_surface_mode(["--mode=doctrine"], {})
+
+
+@pytest.mark.parametrize("value", ["BARE", "Skill", " skill "])
+def test_a_recognised_mode_is_case_and_whitespace_tolerant(value: str) -> None:
+    """Tolerant about SPELLING, strict about MEANING — the refusal above is for
+    values that mean nothing, not for a capital letter."""
+    assert _resolve_surface_mode([], {"CAO_MCP_MODE": value}) == value.strip().lower()
 
 
 def test_argv_beats_the_environment() -> None:
