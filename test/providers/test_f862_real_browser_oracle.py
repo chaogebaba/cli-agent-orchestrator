@@ -339,10 +339,13 @@ async def _run_teardown_arm(
     *,
     arm: str,
     cancel_holder: bool = False,
+    detached_chromium: bool = False,
 ) -> dict:
     """One AC-25 pre-invocation arm; returns the evidence row it produced."""
     with FakeOrigin(tmp_path / "tls") as origin:
-        async with RealBrowserHarness(origin=origin) as harness:
+        async with RealBrowserHarness(
+            origin=origin, detached_chromium=detached_chromium
+        ) as harness:
             session = await harness.arm_route(action=_teardown_action)
             await _hold_and_capture(harness, session)
             log = _ledger(tmp_path)
@@ -486,14 +489,20 @@ async def test_arm_chromium_kill_before_invocation(tmp_path):
 
 @pytest.mark.timeout(180)
 async def test_arm_driver_death_chromium_surviving(tmp_path):
-    """The node driver dies while Chromium lives; custody is still fail-closed."""
+    """The node driver dies while Chromium lives; custody is still fail-closed.
+
+    Chromium is spawned by the harness and Playwright attaches over CDP, so
+    killing the driver really does leave the browser running; a
+    ``chromium.launch()`` browser is the driver's own child and would die with
+    it, which is a different arm that ``chromium_kill`` already covers.
+    """
     observed: dict = {}
 
     async def inject(harness, _session):
         await harness.inject_driver_death()
         observed["chromium_alive"] = harness.chromium_alive()
 
-    row = await _run_teardown_arm(tmp_path, inject, arm="driver_death")
+    row = await _run_teardown_arm(tmp_path, inject, arm="driver_death", detached_chromium=True)
     # Whether Chromium releases the paused request when its client vanishes is
     # a browser-owned behaviour; the design only requires that the runner never
     # treats it as proved non-delivery and never issues a second POST.

@@ -18,6 +18,8 @@ import asyncio
 import contextlib
 import os
 import signal
+import socket
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -109,6 +111,13 @@ def _pids_with(token: str) -> list[int]:
         if token.encode() in cmdline:
             found.append(int(entry.name))
     return found
+
+
+def _free_port() -> int:
+    """A port the OS has just confirmed is free (CDP endpoint for the arm)."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
 
 
 def _descendant_driver_pid() -> Optional[int]:
@@ -203,9 +212,17 @@ class RealBrowserHarness:
         *,
         origin: Any,
         headless: bool = True,
+        detached_chromium: bool = False,
     ) -> None:
         self.origin = origin
         self.headless = headless
+        #: When true, WE spawn Chromium and Playwright merely connects to it
+        #: over CDP. Only the driver-death arm needs this: `chromium.launch()`
+        #: makes Chromium a child of the node driver, so killing the driver
+        #: takes Chromium with it and the arm silently degenerates into a
+        #: second "everything died" case instead of D1's "driver died while
+        #: Chromium survived".
+        self.detached_chromium = detached_chromium
         self.token = f"f862-{uuid.uuid4().hex[:12]}"
         self.playwright: Any = None
         self.browser: Any = None
@@ -216,6 +233,8 @@ class RealBrowserHarness:
         self._release = asyncio.Event()
         self._chromium_pids: list[int] = []
         self._driver_pid: Optional[int] = None
+        self._chromium_proc: Any = None
+        self._user_data_dir: Optional[str] = None
 
     # --- lifecycle --------------------------------------------------------
     async def __aenter__(self) -> "RealBrowserHarness":
@@ -223,19 +242,67 @@ class RealBrowserHarness:
 
         self.playwright = await async_playwright().start()
         self._driver_pid = self._discover_driver_pid()
-        self.browser = await self.playwright.chromium.launch(
-            headless=self.headless,
-            args=[
-                f"{HARNESS_SWITCH}={self.token}",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
+        if self.detached_chromium:
+            self.browser = await self._connect_detached_chromium()
+        else:
+            self.browser = await self.playwright.chromium.launch(
+                headless=self.headless,
+                args=[
+                    f"{HARNESS_SWITCH}={self.token}",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            )
         self._chromium_pids = _pids_with(self.token)
         self.context = await self.browser.new_context(ignore_https_errors=True)
         self.page = await self.context.new_page()
         self.generations = LiveGenerations(self.page, self.context)
         return self
+
+    async def _connect_detached_chromium(self) -> Any:
+        """Spawn Chromium ourselves, then attach Playwright over CDP."""
+        import subprocess
+        import tempfile
+        import urllib.error
+        import urllib.request
+
+        executable = self.playwright.chromium.executable_path
+        port = _free_port()
+        self._user_data_dir = tempfile.mkdtemp(prefix="f862-chromium-")
+        self._chromium_proc = subprocess.Popen(  # noqa: S603
+            [
+                executable,
+                f"--remote-debugging-port={port}",
+                f"--user-data-dir={self._user_data_dir}",
+                f"{HARNESS_SWITCH}={self.token}",
+                "--headless=new" if self.headless else "--new-window",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                # The loopback origin uses a self-signed certificate; with CDP
+                # attach there is no new_context(ignore_https_errors) for the
+                # browser's own initial context, so tell Chromium directly.
+                "--ignore-certificate-errors",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "about:blank",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        endpoint = f"http://127.0.0.1:{port}"
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if self._chromium_proc.poll() is not None:
+                raise RuntimeError("detached Chromium exited before its CDP port opened")
+            try:
+                with urllib.request.urlopen(f"{endpoint}/json/version", timeout=1):
+                    break
+            except (urllib.error.URLError, OSError):
+                await asyncio.sleep(0.1)
+        else:
+            raise RuntimeError("detached Chromium never opened its CDP port")
+        return await self.playwright.chromium.connect_over_cdp(endpoint)
 
     async def __aexit__(self, *_exc: object) -> None:
         for closer in (self.context, self.browser):
@@ -245,10 +312,17 @@ class RealBrowserHarness:
         if self.playwright is not None:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(self.playwright.stop(), 5)
+        if self._chromium_proc is not None:
+            with contextlib.suppress(Exception):
+                self._chromium_proc.kill()
         # Orphans from the kill/driver-death arms.
         for pid in _pids_with(self.token):
             with contextlib.suppress(OSError):
                 os.kill(pid, signal.SIGKILL)
+        if self._user_data_dir is not None:
+            import shutil
+
+            shutil.rmtree(self._user_data_dir, ignore_errors=True)
 
     def _discover_driver_pid(self) -> Optional[int]:
         """PID of the node driver process this Playwright instance just spawned.
