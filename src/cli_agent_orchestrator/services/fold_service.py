@@ -152,60 +152,6 @@ class P10Report:
         return findings + statuses
 
 
-@dataclass(frozen=True)
-class FoldCorpusResult:
-    violations: tuple[str, ...]
-    p9_reports: tuple[P9Report, ...]
-    p9_unused_mappings: tuple[RepoMapping, ...]
-    p10_reports: tuple[P10Report, ...]
-
-    @property
-    def p9_summary_lines(self) -> tuple[str, ...]:
-        population = sum(report.population_eligible for report in self.p9_reports)
-        defects = sum(report.defect_count for report in self.p9_reports)
-        ambiguous = sum(report.ambiguous_basename for report in self.p9_reports)
-        resolved = sum(report.basename_resolved for report in self.p9_reports)
-        adjacency = sum(report.ambiguous_adjacency for report in self.p9_reports)
-        denominator = ambiguous + resolved
-        rate = (100.0 * ambiguous / denominator) if denominator else 0.0
-        return (
-            f"P9 POPULATION: {population}",
-            f"P9 COVERAGE: {population}/{population} graded",
-            f"P9 DENOMINATOR: {defects} path-missing defect firings",
-            f"P9 HYGIENE: ambiguous-basename={ambiguous}/{denominator} ({rate:.4f}%) "
-            f"ambiguous-adjacency={adjacency}",
-        )
-
-    @property
-    def p9_unused_mapping_lines(self) -> tuple[str, ...]:
-        return tuple(
-            f"P9 STATUS MAPPING-UNUSED - {mapping.name}={mapping.path}"
-            for mapping in self.p9_unused_mappings
-        )
-
-    @property
-    def p10_summary_lines(self) -> tuple[str, str, str, str]:
-        population = sum(report.population_eligible for report in self.p10_reports)
-        coverage = sum(report.covered for report in self.p10_reports if report.population_eligible)
-        denominator = sum(report.defect_count for report in self.p10_reports)
-        counts = P10StatusCounts(
-            skipped=sum(report.status_counts.skipped for report in self.p10_reports),
-            undeclared=sum(report.status_counts.undeclared for report in self.p10_reports),
-            no_parser=sum(report.status_counts.no_parser for report in self.p10_reports),
-            unparseable=sum(report.status_counts.unparseable for report in self.p10_reports),
-            ineligible=sum(report.status_counts.ineligible for report in self.p10_reports),
-        )
-        return (
-            f"P10 POPULATION: {population}",
-            f"P10 COVERAGE: {coverage}/{population} annotated",
-            f"P10 DENOMINATOR: {denominator} defect firings",
-            "P10 STATUS: "
-            f"skipped={counts.skipped} undeclared={counts.undeclared} "
-            f"no-parser={counts.no_parser} unparseable={counts.unparseable} "
-            f"ineligible={counts.ineligible}",
-        )
-
-
 @dataclass
 class _Edit:
     edit_id: int
