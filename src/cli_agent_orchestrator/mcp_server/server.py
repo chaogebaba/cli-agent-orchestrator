@@ -4555,7 +4555,12 @@ async def list_outstanding(
     terminal_id = os.environ.get("CAO_TERMINAL_ID")
     if not terminal_id:
         return {"error": "no_terminal", "how": "CAO_TERMINAL_ID must be set"}
-    response = cao_http.get(f"/terminals/{terminal_id}/outstanding", params={"limit": limit})
+    response = cao_http.get(
+        f"/terminals/{terminal_id}/outstanding",
+        params={"limit": limit},
+        timeout=_mcp_timeout(),
+        headers=_api_headers(),
+    )
     if response.status_code == 404:
         # An older cao-server has no such route.  Degrade to the empty answer
         # with a named reason rather than raising: a BARE seat with no doctrine
