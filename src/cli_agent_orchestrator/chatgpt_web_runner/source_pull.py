@@ -289,7 +289,12 @@ def call_tool(
         }
     ).encode()
     request = urllib.request.Request(
-        f"{base_url.rstrip('/')}/mcp",
+        # The TRAILING SLASH matters: the connector mounts the MCP app at
+        # ``/mcp`` and Starlette answers a bare ``/mcp`` POST with a 307 to
+        # ``/mcp/``. Starlette's TestClient follows that silently; a real HTTP
+        # client does not carry the body through, so it must be addressed
+        # directly.
+        f"{base_url.rstrip('/')}/mcp/",
         data=payload,
         headers={
             "Content-Type": "application/json",

@@ -456,6 +456,7 @@ markers = [
     "requires_git_object: test requires a specific git object reachable in the repo",
     "requires_tmux: test requires tmux on PATH",
     "serial_only: quarantined test that must run serial (xdist_group quarantine-serial)",
+    "browser_oracle: F862 Amendment D origin-receipt oracle. Needs a real Chromium (`uv run playwright install chromium`) and is ALSO e2e+slow, so the ordinary merge selection deselects it. The CI arm selects it explicitly with CAO_F862_REQUIRE_BROWSER=1, which turns an absent browser into a failure instead of a skip — see scripts/ci-f862-browser-oracle.sh",
     "xdist_group(name): pytest-xdist grouping mark; registered here so collection does not INTERNALERROR under -p no:xdist + --strict-markers (the plugin registers it only when loaded)",
 ]
 asyncio_mode = "strict"

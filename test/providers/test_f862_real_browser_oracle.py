@@ -51,6 +51,9 @@ from cli_agent_orchestrator.chatgpt_web_runner.send_intent import (
 pytestmark = [
     pytest.mark.e2e,
     pytest.mark.slow,
+    # The CI arm's selector: `-m browser_oracle` runs exactly these two modules
+    # without having to re-enable every e2e+slow test in the suite.
+    pytest.mark.browser_oracle,
     pytest.mark.asyncio,
     pytest.mark.xdist_group("f862-real-browser"),
     # Skips only an EXPLORATORY run. Under CAO_F862_REQUIRE_BROWSER the
