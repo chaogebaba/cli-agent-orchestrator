@@ -9,8 +9,9 @@ projection and the detached conversation GET remains authoritative.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 _SAFE_KEYS = {"message", "status", "model_slug", "thinking_effort", "finish_details"}
 _FORBIDDEN_KEY_FRAGMENTS = (
@@ -99,3 +100,49 @@ class SSEProjection:
         if safe in ({}, [], None):
             return None
         return {"kind": "progress", "event": event, "data": safe}
+
+
+#: Amendment D: the conversation and assistant ids come from the stream PYTHON
+#: drained, never from the browser's address bar or the app's own GET. The safe
+#: projection deliberately drops ``conversation_id`` (it is not in the depth-0
+#: allowlist), so this scanner is the seam that recovers exactly the two
+#: identifiers the authoritative GET needs — and nothing else.
+_CONVERSATION_ID_RE = re.compile(r'"conversation_id"\s*:\s*"([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})"')
+_ASSISTANT_ID_RE = re.compile(
+    r'"id"\s*:\s*"([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})"'
+    r'\s*,\s*"author"\s*:\s*\{\s*"role"\s*:\s*"assistant"'
+)
+
+
+@dataclass
+class StreamIdScanner:
+    """Recover the conversation / assistant ids from the raw origin stream.
+
+    Bounded and write-only: it keeps at most one trailing window of bytes so an
+    identifier split across two chunks is still matched, and it retains nothing
+    but the two ids. It never sees a header, cookie or token, because it is fed
+    only the response body.
+    """
+
+    #: Enough to span any single frame carrying the ids, never the whole stream.
+    window_bytes: int = 16 * 1024
+    conversation_id: Optional[str] = None
+    assistant_message_id: Optional[str] = None
+    _tail: str = ""
+
+    def feed(self, chunk: bytes) -> None:
+        if self.conversation_id and self.assistant_message_id:
+            return
+        try:
+            text = self._tail + chunk.decode("utf-8", errors="ignore")
+        except Exception:  # pragma: no cover - decode errors are swallowed above
+            return
+        if self.conversation_id is None:
+            match = _CONVERSATION_ID_RE.search(text)
+            if match:
+                self.conversation_id = match.group(1)
+        if self.assistant_message_id is None:
+            match = _ASSISTANT_ID_RE.search(text)
+            if match:
+                self.assistant_message_id = match.group(1)
+        self._tail = text[-self.window_bytes :]

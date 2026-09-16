@@ -30,14 +30,13 @@ import time
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Awaitable, Dict, List, Optional, Sequence, cast
+from typing import TYPE_CHECKING, Any, Awaitable, Optional, cast
 
 from cli_agent_orchestrator.chatgpt_web_runner.errors import (
     DeliveryState,
     RunnerError,
     RunnerErrorCode,
 )
-from cli_agent_orchestrator.chatgpt_web_runner.snapshot_upload import AttachmentIdentity
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +44,6 @@ logger = logging.getLogger(__name__)
 SEL_COMPOSER = "div.ProseMirror[contenteditable='true']"
 SEL_USER_TURN = "div[data-message-author-role='user']"
 SEL_ASSISTANT_TURN = "div[data-message-author-role='assistant']"
-SEL_FILE_INPUT = "input#upload-files"
-SEL_PLUS_BTN = "#composer-plus-btn"
 
 
 class RouteDisposition(str, Enum):
@@ -461,14 +458,6 @@ def synthetic_v1_stream(
 
 
 @dataclass(frozen=True)
-class SubmitOutcome:
-    """The classified result of the submit-confirm window (D7)."""
-
-    delivery_state: DeliveryState
-    conversation_id: Optional[str]
-
-
-@dataclass(frozen=True)
 class FailureSurface:
     """A classified chrome/driver-state failure (D4). NEVER classified from
     assistant TEXT — only from chrome/driver state (D4 Do-NOT)."""
@@ -509,41 +498,6 @@ def classify_failure_surface(
         # Unknown 403 with no explicit challenge marker: fail closed.
         return FailureSurface(RunnerErrorCode.ACCESS_DENIED, subtype="unknown")
     return None
-
-
-def build_conversation_fetch_script(conversation_id: str) -> str:
-    """Return the in-page JS that reads the conversation GET (D3).
-
-    The bearer is acquired from ``/api/auth/session`` and used ONLY inside this
-    in-page fetch; it is never returned to the host. The returned object carries
-    HTTP status, node count, and the current node's allowlisted fields — NEVER a
-    header, cookie or bearer value (AC-11). The conversation id is validated by
-    the caller against the owned id BEFORE this runs (read containment, AC-11b).
-    """
-    # The id is a validated uuid by the time this is built; still, embed it as a
-    # JSON string to avoid any template injection.
-    import json as _json
-
-    cid = _json.dumps(conversation_id)
-    return (
-        "async () => {\n"
-        "  let bearer = '';\n"
-        "  try {\n"
-        "    const s = await fetch('/api/auth/session', {credentials:'include'});\n"
-        "    const sj = await s.json();\n"
-        "    bearer = (sj && sj.accessToken) || '';\n"
-        "  } catch (e) {}\n"
-        "  const headers = {};\n"
-        "  if (bearer) headers['authorization'] = 'Bearer ' + bearer;\n"
-        f"  const r = await fetch('/backend-api/conversation/' + {cid}, "
-        "{credentials:'include', headers});\n"
-        "  const ra = r.headers.get('retry-after');\n"
-        "  const out = {httpStatus: r.status, ok: r.ok, retryAfter: ra ? Number(ra) : null, body: null};\n"
-        "  if (!r.ok) return out;\n"
-        "  try { out.body = JSON.parse(await r.text()); } catch (e) {}\n"
-        "  return out;\n"
-        "}"
-    )
 
 
 def readback_ok(source_text: str, composer_non_space_len: int, *, ratio: float = 0.6) -> bool:
@@ -602,50 +556,12 @@ class Transport:
     ) -> None:
         self.page = page
         self.owned_conversation_id = owned_conversation_id
-        self.saw_send = False
         # F862 (#718) D7/D16 r6: the durable send-intent record for THIS attempt.
-        # ``submit_and_confirm`` refuses to press Enter without one, so a crash
-        # between intent and dispatch is resolvable on restart. Optional only so
-        # the offline DOM tests can drive the transport without a filesystem;
-        # ``run_production_review`` always supplies it.
+        # ``trigger_composer_mint`` refuses to press Enter without one, so a
+        # crash between intent and dispatch is resolvable on restart. Optional
+        # only so the offline DOM tests can drive the transport without a
+        # filesystem; ``run_production_review`` always supplies it.
         self.intent_log: Optional["SendIntentLog"] = intent_log
-        # The REAL backend conversation id, learned from a page-owned
-        # /backend-api/conversation/<uuid> response (NOT the /c/WEB:<uuid> route
-        # id — F862 r2: they differ; the route uuid 404s on the backend).
-        self.backend_conversation_id: Optional[str] = None
-
-    def arm_send_observer(self) -> None:
-        """Observe page-owned responses for early conversation-id discovery (D6).
-
-        Two signals, both page-owned and same-origin:
-          - the SSE send response ``POST /backend-api/f/conversation`` (not
-            ``/prepare``) sets ``saw_send`` (ask.ts:633-645);
-          - any ``/backend-api/conversation/<uuid>`` the APP itself fetches
-            reveals the REAL backend conversation id (the ``/c/WEB:<uuid>`` route
-            id in the address bar is NOT the backend id — F862 r2 probe: the URL
-            uuid 404s; the backend id is a different uuid the app GETs itself).
-        """
-        import re as _re
-
-        from cli_agent_orchestrator.chatgpt_web_runner.submit_ids import is_send_response_url
-
-        backend_get_re = _re.compile(
-            r"/backend-api/conversation/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
-        )
-
-        def _on_response(resp: Any) -> None:
-            try:
-                url = resp.url
-                if is_send_response_url(url):
-                    self.saw_send = True
-                m = backend_get_re.search(url)
-                if m:
-                    # The app's own conversation GET names the real backend id.
-                    self.backend_conversation_id = m.group(1)
-            except Exception:
-                pass
-
-        self.page.on("response", _on_response)
 
     async def type_prompt(self, text: str) -> None:
         """Type via insert_text (never fill), then read back (ask.ts:429/423)."""
@@ -666,316 +582,6 @@ class Transport:
                 delivery_state=DeliveryState.NOTHING_SENT,
             )
 
-    async def attach_file(
-        self, path: str, *, ready_timeout_s: float = 60.0
-    ) -> "AttachmentIdentity":
-        """Attach one file via ``input#upload-files`` and wait for readiness (D8/AC-9).
-
-        Sets the file on the composer's general-purpose file input (present
-        without opening the plus menu), records the pre-upload identity, and waits
-        until BOTH calibrated readiness signals are present: the chip's filename
-        AND a "Document" label (stable from ~2s). A decorative spinner is NOT a
-        permitted signal. On timeout without both signals, raises
-        ``upload_unconfirmed`` BEFORE any Enter (AC-9).
-        """
-        import time as _time
-        from pathlib import Path as _Path
-
-        from cli_agent_orchestrator.chatgpt_web_runner.snapshot_upload import (
-            build_attachment_identity,
-            readiness_reached,
-        )
-
-        data = _Path(path).read_bytes()
-        filename = _Path(path).name
-        identity = build_attachment_identity(data, filename)
-
-        file_input = self.page.locator(SEL_FILE_INPUT).first
-        if await file_input.count() == 0:
-            # Mount the input via the plus menu without choosing a menu item.
-            if await self.page.locator(SEL_PLUS_BTN).count() > 0:
-                await self.page.locator(SEL_PLUS_BTN).click(timeout=8000)
-                await self.page.wait_for_timeout(800)
-                await self.page.keyboard.press("Escape")
-        # Wait for the input to actually exist before setting files (a race here
-        # left the chip empty on a fresh page — F862 r2). Then set, and if the
-        # filename chip does not appear within a few seconds, set once more.
-        try:
-            await self.page.locator(SEL_FILE_INPUT).first.wait_for(state="attached", timeout=10_000)
-        except Exception:
-            pass
-        await self.page.locator(SEL_FILE_INPUT).first.set_input_files(path, timeout=30_000)
-        for _ in range(6):
-            await self.page.wait_for_timeout(500)
-            here = await self.page.evaluate(
-                "(n) => ((document.body && document.body.innerText) || '').includes(n)", filename
-            )
-            if here:
-                break
-        else:
-            # One re-set attempt (still nothing sent — safe).
-            await self.page.locator(SEL_FILE_INPUT).first.set_input_files(path, timeout=30_000)
-
-        deadline = _time.monotonic() + ready_timeout_s
-        while _time.monotonic() < deadline:
-            present = await self.page.evaluate(
-                "(name) => {\n"
-                "  const body = (document.body && document.body.innerText) || '';\n"
-                "  const errored = /failed to upload|couldn.t upload|upload failed|"
-                "unsupported file|file is too large|error processing/i.test(body);\n"
-                "  const filename = body.includes(name);\n"
-                "  const stem = name.replace(/\\.[^.]+$/, '');\n"
-                "  const filename_stem = body.includes(stem);\n"
-                "  const document_label = /\\bDocument\\b/.test(body);\n"
-                "  // capture labels near any chip that mentions the stem\n"
-                "  let chip = '';\n"
-                "  const els = [...document.querySelectorAll('*')].filter(e => "
-                "(e.textContent||'').includes(stem) && (e.textContent||'').length < 120);\n"
-                "  if (els.length) chip = (els[els.length-1].textContent || '').slice(0, 100);\n"
-                "  return {errored, filename, filename_stem, document_label, chip};\n"
-                "}",
-                filename,
-            )
-            if present.get("errored"):
-                raise RunnerError(
-                    RunnerErrorCode.UPLOAD_UNCONFIRMED,
-                    "attachment upload reported an error/unsupported state",
-                    delivery_state=DeliveryState.NOTHING_SENT,
-                )
-            signals = set()
-            if present.get("filename"):
-                signals.add("filename_chip")
-            if present.get("document_label"):
-                signals.add("document_label")
-            logger.debug(
-                "chatgpt_web attach-diag filename=%s stem=%s document_label=%s chip=%r",
-                present.get("filename"),
-                present.get("filename_stem"),
-                present.get("document_label"),
-                present.get("chip"),
-            )
-            if readiness_reached(signals):
-                logger.debug("chatgpt_web attachment ready: %s", sorted(signals))
-                # r3 (user live observation): the two calibrated CHIP signals can
-                # appear while the upload is still finalizing server-side (spinner
-                # spinning, send button disabled). Wait for the upload-COMPLETE
-                # state — spinner GONE and the send button ENABLED — with a bounded
-                # timeout, so a later submit cannot hang; on timeout emit the typed
-                # attach_timeout CONDITION (never hang to the watchdog).
-                await self._wait_upload_complete(filename, timeout_s=90.0)
-                # D8/AC-9: capture a STABLE composer-side attachment reference for
-                # the identity tuple. Prefer a chip test id / dom id; fall back to
-                # the chip's own trimmed text. Non-empty is required (r2 gate B3).
-                import dataclasses as _dc
-
-                ref = await self.page.evaluate(
-                    "(stem) => {\n"
-                    "  // Prefer a stable chip handle: a data-testid or id on an\n"
-                    "  // element whose text includes the filename stem; else fall\n"
-                    "  // back to the chip's own displayed text (a stable, non-empty\n"
-                    "  // composer-side reference for the attachment).\n"
-                    "  const all = [...document.querySelectorAll('*')].filter(e => "
-                    "(e.textContent||'').includes(stem) && (e.textContent||'').length < 200);\n"
-                    "  if (!all.length) return '';\n"
-                    "  const el = all[all.length - 1];\n"
-                    "  const tid = el.getAttribute('data-testid') || el.id || '';\n"
-                    "  if (tid) return 'chip:' + tid;\n"
-                    "  return 'chip-text:' + (el.textContent || '').trim().slice(0, 80);\n"
-                    "}",
-                    filename.rsplit(".", 1)[0],
-                )
-                ref_str = str(ref or "").strip()
-                if not ref_str:
-                    # No stable composer reference observed -> fail closed (AC-9).
-                    raise RunnerError(
-                        RunnerErrorCode.ATTACHMENT_IDENTITY,
-                        "no composer-side attachment reference observed on the chip",
-                        delivery_state=DeliveryState.NOTHING_SENT,
-                    )
-                return _dc.replace(identity, composer_attachment_ref=ref_str)
-            await self.page.wait_for_timeout(700)
-        raise RunnerError(
-            RunnerErrorCode.UPLOAD_UNCONFIRMED,
-            "attachment did not reach both calibrated readiness signals before Enter",
-            delivery_state=DeliveryState.NOTHING_SENT,
-        )
-
-    async def _wait_upload_complete(self, filename: str, *, timeout_s: float = 90.0) -> None:
-        """Wait for the upload-COMPLETE state before Enter (r3).
-
-        The AUTHORITATIVE completion signal is the send button being present and
-        ENABLED — that is the state in which ChatGPT accepts the turn with the
-        attachment. A page-global upload spinner (``.animate-spin`` /
-        ``[role=progressbar]``) is NOT a reliable veto: live runs show unrelated
-        chrome keeps such a node mounted after the upload finishes, so requiring
-        "spinner gone" produced a false ``attach_timeout`` while send was already
-        enabled (user-confirmed: "the upload is done"). We therefore gate on
-        send-enabled; the spinner is captured only for diagnostics. On timeout,
-        record a DOM excerpt under the artifacts dir and raise the typed
-        ``attach_timeout`` condition rather than hanging to the process watchdog.
-        """
-        import time as _time
-
-        deadline = _time.monotonic() + timeout_s
-        started = _time.monotonic()
-        last: dict[str, Any] = {}
-        # r6 (Amendment C owed-code row 5; AC-9, D8 readiness predicate) — the
-        # RE-PROBE. The send-enabled gate above rests on ONE live operator
-        # observation plus the r3 stall-DOM artifact, which is an anecdote, not a
-        # calibration. Every upload now records its full signal TRAJECTORY, so a
-        # run produces a probe sample instead of a claim: at what elapsed time
-        # each signal flipped, and — the discriminating fact the gate turns on —
-        # whether ``send_enabled`` was ever true WHILE ``spinning`` was still
-        # true. Three such samples replace the single observation.
-        trajectory: list[dict[str, Any]] = []
-        while _time.monotonic() < deadline:
-            last = await self.page.evaluate(
-                "() => {\n"
-                "  const spinning = !!document.querySelector("
-                "\"[role='progressbar'], svg[class*='spin' i], .animate-spin\");\n"
-                "  const btn = document.querySelector(\"[data-testid='send-button']\");\n"
-                "  const send_present = !!btn;\n"
-                "  const send_enabled = !!btn && !btn.disabled && "
-                "btn.getAttribute('aria-disabled') !== 'true';\n"
-                "  return {spinning, send_present, send_enabled};\n"
-                "}"
-            )
-            trajectory.append(
-                {
-                    "t": round(_time.monotonic() - started, 2),
-                    "spinning": bool(last.get("spinning")),
-                    "send_present": bool(last.get("send_present")),
-                    "send_enabled": bool(last.get("send_enabled")),
-                }
-            )
-            # Send-enabled is the authoritative upload-complete signal; a lingering
-            # page-global spinner must NOT veto an enabled send button.
-            if last.get("send_enabled"):
-                logger.debug(
-                    "chatgpt_web upload complete: send enabled (spinner=%s)",
-                    last.get("spinning"),
-                )
-                self._record_readiness_probe(filename, trajectory, outcome="complete")
-                return
-            await self.page.wait_for_timeout(1000)
-        # Timed out waiting for upload-complete — record the DOM state and emit a
-        # typed condition (never hang).
-        self._record_readiness_probe(filename, trajectory, outcome="attach_timeout")
-        self._record_stall_dom("attach_timeout", filename, last)
-        raise RunnerError(
-            RunnerErrorCode.ATTACH_TIMEOUT,
-            f"attachment did not reach upload-complete (send button enabled) "
-            f"within {int(timeout_s)}s; last DOM state {last}",
-            delivery_state=DeliveryState.NOTHING_SENT,
-        )
-
-    @staticmethod
-    def summarize_readiness_probe(trajectory: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Reduce a readiness trajectory to the facts the D8 predicate rests on.
-
-        Pure, so the offline fixture tests assert the same reduction the live
-        probe records. The load-bearing field is
-        ``send_enabled_while_spinning``: r3 gated on "spinner gone AND send
-        enabled" and produced a false ``attach_timeout`` because unrelated page
-        chrome keeps a spinner node mounted. If that field is true in a sample,
-        the spinner is proven to be a bad veto for THAT sample; if it is false
-        across every sample, the r3 conjunction was never actually contradicted
-        and the gate should be revisited.
-        """
-        first_enabled = next((s for s in trajectory if s.get("send_enabled")), None)
-        spin_gone = next((s for s in trajectory if not s.get("spinning")), None)
-        return {
-            "samples": len(trajectory),
-            "send_enabled_at": (first_enabled or {}).get("t"),
-            "spinner_gone_at": (spin_gone or {}).get("t"),
-            "send_enabled_while_spinning": bool(
-                first_enabled is not None and first_enabled.get("spinning")
-            ),
-            "spinner_still_up_at_completion": bool(trajectory and trajectory[-1].get("spinning")),
-        }
-
-    def _record_readiness_probe(
-        self, filename: str, trajectory: List[Dict[str, Any]], *, outcome: str
-    ) -> None:
-        """Write ONE re-probe sample for the send-enabled upload-complete gate.
-
-        Amendment C owes "a probe arm re-calibrating the send-enabled
-        upload-complete gate"; this is that arm's recorder. Non-secret by
-        construction — it holds boolean composer chrome signals, elapsed times
-        and the filename, never page text, never a token. Best-effort: a probe
-        that cannot be written must never fail an upload that succeeded.
-        """
-        import json as _json
-        import os as _os
-        import time as _time
-        from pathlib import Path as _Path
-
-        try:
-            out_dir = (
-                _Path(
-                    _os.environ.get("CAO_ARTIFACTS_DIR")
-                    or "/data/cao-scratch/worker-scratch/f862-build"
-                )
-                / "readiness-probe"
-            )
-            out_dir.mkdir(parents=True, exist_ok=True)
-            sample = {
-                "outcome": outcome,
-                "filename": filename,
-                "recorded_at": int(_time.time()),
-                "summary": self.summarize_readiness_probe(trajectory),
-                "trajectory": trajectory,
-            }
-            (out_dir / f"readiness-{int(_time.time() * 1000)}.json").write_text(
-                _json.dumps(sample, indent=2), encoding="utf-8"
-            )
-            logger.info("chatgpt_web readiness probe recorded: %s", sample["summary"])
-        except Exception:  # pragma: no cover - diagnostics are best-effort
-            pass
-
-    def _record_stall_dom(self, reason: str, filename: str, state: dict[str, Any]) -> None:
-        """Best-effort: write a DOM/state excerpt for a stalled attach to the
-        artifacts dir (NON-SECRET — composer chrome only, no tokens)."""
-        import json as _json
-        import os as _os
-        import time as _time
-        from pathlib import Path as _Path
-
-        try:
-            out_dir = _Path(
-                _os.environ.get("CAO_ARTIFACTS_DIR")
-                or "/data/cao-scratch/worker-scratch/f862-build/r3-artifacts"
-            )
-            out_dir.mkdir(parents=True, exist_ok=True)
-            stamp = int(_time.time())
-            (out_dir / f"attach-stall-{reason}-{stamp}.json").write_text(
-                _json.dumps(
-                    {
-                        "reason": reason,
-                        "filename": filename,
-                        "dom_state": state,
-                        "url": getattr(self.page, "url", ""),
-                    },
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-            logger.warning("chatgpt_web attach stall (%s) recorded: %s", reason, state)
-        except Exception:  # pragma: no cover - diagnostics are best-effort
-            pass
-
-    async def read_conversation(self, conversation_id: str) -> dict[str, Any]:
-        """Read the conversation GET via the containment-checked in-page fetch."""
-        from cli_agent_orchestrator.chatgpt_web_runner.snapshot_upload import (
-            enforce_read_allowed,
-        )
-
-        url = f"https://chatgpt.com/backend-api/conversation/{conversation_id}"
-        enforce_read_allowed(url, conversation_id)
-        script = build_conversation_fetch_script(conversation_id)
-        result = await self.page.evaluate(script)
-        return result if isinstance(result, dict) else {"httpStatus": 0, "ok": False, "body": None}
-
     # ── D7/D16 send-intent custody ───────────────────────────────────────
 
     def _dispatch_submit_action(self) -> None:
@@ -991,27 +597,24 @@ class Transport:
             return
         self.intent_log.record_submit_dispatch()
 
-    def _recover_and_redispatch(self, composer_text: str) -> bool:
-        """Spend the ONE recovery to re-press Enter, or refuse (D7/D16).
+    async def trigger_composer_mint(self) -> None:
+        """Press Enter EXACTLY ONCE to mint the conversation POST (D1/D6).
 
-        ``composer_text`` is the demonstrated-non-dispatch evidence: the composer
-        still holds the prompt, so the app did not send. Returns True when the
-        caller may press Enter again, False when the budget (or the deadline) is
-        spent — in which case the caller must NOT press.
+        Amendment D's composer has one job: cause the browser to issue the
+        conversation POST that the preinstalled route handler holds. Everything
+        the old ``submit_and_confirm`` did after the keypress is deleted by D10
+        — there is no delivery classification from the DOM, no URL-derived
+        conversation id, no grace loop waiting for the app's own GET, and above
+        all NO second Enter. The held route is the proof of interception, the
+        Python POST is the send, and the detached GET is the acceptance.
+
+        ``record_submit_dispatch`` fsyncs DISPATCHED *before* the keypress and
+        raises if this attempt already dispatched, so "after that dispatch,
+        never repeat the submit action" is enforced by the durable record rather
+        than by a recovery budget that a loop could spend.
         """
-        if self.intent_log is None:
-            return True
-        from cli_agent_orchestrator.chatgpt_web_runner.send_intent import SendIntentViolation
-
-        try:
-            self.intent_log.demonstrate_non_dispatch(
-                f"composer still holds {len(composer_text)} chars after Enter"
-            )
-            self.intent_log.record_submit_dispatch()
-        except SendIntentViolation as exc:
-            logger.info("chatgpt_web submit recovery refused (D7/D16): %s", exc)
-            return False
-        return True
+        self._dispatch_submit_action()
+        await self.page.locator(SEL_COMPOSER).first.press("Enter")
 
     def _observe_send(self) -> None:
         """Record a correlated send (D7/D16, AC-20 counters). No-op offline."""
@@ -1023,233 +626,3 @@ class Transport:
             self.intent_log.record_send_observed()
         except SendIntentViolation as exc:  # pragma: no cover - defensive
             logger.warning("chatgpt_web send-observation not recorded: %s", exc)
-
-    async def submit_and_confirm(self, timeout_s: float = 30.0) -> "SubmitOutcome":
-        """Press Enter, then run the four-way submit-confirm window (D7).
-
-        Returns the classified DeliveryState and the resolved conversation id
-        (from the URL or the observed SSE). Never resends.
-        """
-        import time as _time
-
-        from cli_agent_orchestrator.chatgpt_web_runner.submit_ids import (
-            SubmitObservation,
-            classify_delivery,
-            extract_conversation_id,
-        )
-
-        users_before = await self.page.locator(SEL_USER_TURN).count()
-
-        # F862 (#718) D7/D16 r6 — the submit-triggering action is gated on the
-        # durable intent record. ``record_submit_dispatch`` persists (and
-        # fsyncs) DISPATCHED BEFORE the keypress, so a crash on the very next
-        # instruction leaves an attempt that recovery resolves by READING, never
-        # by resending. It also raises if this attempt already dispatched, which
-        # is the invariant "after that dispatch, never repeat the submit action".
-        self._dispatch_submit_action()
-        await self.page.locator(SEL_COMPOSER).first.press("Enter")
-        deadline = _time.monotonic() + timeout_s
-        conv_id: Optional[str] = self.owned_conversation_id
-        delivered = False
-        last_enter = _time.monotonic()
-        while _time.monotonic() < deadline and not delivered:
-            await self.page.wait_for_timeout(500)
-            url = self.page.url
-            found = extract_conversation_id(url)
-            if found:
-                conv_id = found
-            users_now = await self.page.locator(SEL_USER_TURN).count()
-            if users_now > users_before or self.saw_send or conv_id or self.backend_conversation_id:
-                delivered = True
-                break
-            # With an attachment, a single early Enter can be ignored while the
-            # upload finalizes server-side (the composer keeps its text).
-            #
-            # r6 (D7/D16): this re-press is a RECOVERY, and the budget is ONE.
-            # Before r6 the loop re-pressed every ~4s for the whole window, so a
-            # slow-but-successful send could take several Enters — repeating the
-            # submit action after it had already been dispatched, which D7/D16
-            # forbids outright. The composer still holding the prompt is the
-            # "demonstrated non-dispatch" the rule requires, so it is passed as
-            # the evidence; when the single recovery is already spent
-            # ``_recover_and_redispatch`` returns False and the loop simply waits
-            # out the deadline and classifies, rather than pressing again.
-            composer_now = (await self.page.locator(SEL_COMPOSER).first.inner_text()).strip()
-            if composer_now and (_time.monotonic() - last_enter) >= 4.0:
-                if not self._recover_and_redispatch(composer_now):
-                    continue
-                await self.page.locator(SEL_COMPOSER).first.press("Enter")
-                last_enter = _time.monotonic()
-        # The REAL backend id (learned from a page-owned conversation GET) is
-        # authoritative for polling; the /c/WEB:<uuid> route id is NOT (F862 r2).
-        # Give the app a short grace to issue its own conversation GET.
-        if delivered and not self.backend_conversation_id:
-            for _ in range(20):
-                if self.backend_conversation_id:
-                    break
-                await self.page.wait_for_timeout(500)
-        resolved = self.backend_conversation_id or conv_id
-        composer_text = (await self.page.locator(SEL_COMPOSER).first.inner_text()).strip()
-        logger.debug(
-            "chatgpt_web submit-confirm delivered=%s conv=%s backend=%s saw_send=%s cleared=%s",
-            delivered,
-            bool(conv_id),
-            bool(self.backend_conversation_id),
-            self.saw_send,
-            composer_text == "",
-        )
-        obs = SubmitObservation(
-            enter_dispatched=True,
-            new_user_turn=delivered and resolved is not None,
-            send_response_seen=self.saw_send,
-            conversation_id=resolved,
-            composer_cleared=(composer_text == ""),
-            deadline_exhausted=not delivered,
-        )
-        state = classify_delivery(obs)
-        # r6 (AC-20, NB-6): count the OBSERVED send against the dispatched
-        # submit actions. Acceptance later fails if the two disagree, which is
-        # how a hidden duplicate submission is caught.
-        if state is DeliveryState.DELIVERED:
-            self._observe_send()
-        self.owned_conversation_id = resolved
-        return SubmitOutcome(delivery_state=state, conversation_id=resolved)
-
-    async def poll_to_gate(
-        self,
-        conversation_id: str,
-        submitted_user_msg_id: str,
-        run_id: str,
-        bundle_sha: str,
-        *,
-        timeout_s: float = 900.0,
-    ) -> Any:
-        """Poll the conversation GET to the binary done-gate (D6).
-
-        Reads no faster than one per 3 seconds (AC-11b). Returns an
-        AcceptedAnswer or raises a typed RunnerError; on deadline with a partial
-        it raises truncated_answer carrying a dom/get partial source.
-        """
-        import time as _time
-
-        from cli_agent_orchestrator.chatgpt_web_runner.poll_gate import (
-            AcceptedAnswer,
-            GatePending,
-            evaluate_gate,
-        )
-
-        deadline = _time.monotonic() + timeout_s
-        last_partial: Optional[str] = None
-        polls = 0
-        # D3: read no faster than 1/3s; back off to 10s while pending; honor
-        # Retry-After on a 429. Start at the 3s floor and grow toward 10s.
-        base_interval = 3.0
-        pending_interval = 10.0
-        interval = base_interval
-        resolved_uid = submitted_user_msg_id
-        while _time.monotonic() < deadline:
-            polls += 1
-            probe = await self.read_conversation(conversation_id)
-            body = probe.get("body")
-            status = probe.get("httpStatus")
-            self._log_gate_diag(polls, probe, resolved_uid, run_id, bundle_sha)
-            if probe.get("ok") and isinstance(body, dict):
-                # Lazily resolve the submitted user-turn id from the SAME body if
-                # it was not resolvable before polling (a slow/429'd first GET
-                # left it empty — F862 r2). A fresh conversation has exactly one
-                # user turn, so the newest user node IS ours.
-                if not resolved_uid:
-                    resolved_uid = _newest_user_msg_id(body)
-                if not resolved_uid:
-                    interval = base_interval
-                    await self.page.wait_for_timeout(int(interval * 1000))
-                    continue
-                try:
-                    result = evaluate_gate(
-                        body,
-                        submitted_user_msg_id=resolved_uid,
-                        run_id=run_id,
-                        bundle_sha=bundle_sha,
-                    )
-                except RunnerError as exc:
-                    logger.warning(
-                        "chatgpt_web gate typed-error poll=%s code=%s", polls, exc.code.value
-                    )
-                    raise
-                if isinstance(result, AcceptedAnswer):
-                    logger.debug("chatgpt_web gate ACCEPTED after %s polls", polls)
-                    return result
-                if isinstance(result, GatePending) and result.partial_text:
-                    last_partial = result.partial_text
-                interval = pending_interval  # successful read, still pending (D3)
-            elif status == 429:
-                ra = probe.get("retryAfter")
-                interval = max(pending_interval, float(ra) if isinstance(ra, (int, float)) else 0.0)
-            else:
-                interval = pending_interval  # transient 400/5xx — do not hammer
-            await self.page.wait_for_timeout(int(interval * 1000))
-        err = RunnerError(
-            RunnerErrorCode.TRUNCATED_ANSWER,
-            "poll deadline exhausted before the gate closed",
-            delivery_state=DeliveryState.DELIVERED,
-        )
-        if last_partial:
-            from cli_agent_orchestrator.chatgpt_web_runner.output import PartialSource
-
-            err.partial_source = PartialSource.CONVERSATION_GET  # type: ignore[attr-defined]
-        raise err
-
-    def _log_gate_diag(
-        self,
-        polls: int,
-        probe: dict[str, Any],
-        submitted_user_msg_id: str,
-        run_id: str,
-        bundle_sha: str,
-    ) -> None:
-        """Log a compact, NON-SECRET summary of the current node for gate debugging."""
-        body = probe.get("body")
-        if not isinstance(body, dict):
-            logger.debug(
-                "chatgpt_web gate-diag poll=%s httpStatus=%s ok=%s no-body",
-                polls,
-                probe.get("httpStatus"),
-                probe.get("ok"),
-            )
-            return
-        cur = body.get("current_node")
-        mapping_obj = body.get("mapping")
-        mapping: dict[str, Any] = mapping_obj if isinstance(mapping_obj, dict) else {}
-        node = mapping.get(cur) if isinstance(cur, str) else None
-        msg = node.get("message") if isinstance(node, dict) else None
-        if not isinstance(msg, dict):
-            logger.debug(
-                "chatgpt_web gate-diag poll=%s cur=%s no-message nodes=%s", polls, cur, len(mapping)
-            )
-            return
-        author = msg.get("author") or {}
-        meta = msg.get("metadata") or {}
-        content = msg.get("content") or {}
-        parts = content.get("parts") if isinstance(content, dict) else None
-        text = "".join(p for p in parts if isinstance(p, str)) if isinstance(parts, list) else ""
-        sentinel = f"END_REVIEW:{run_id}:{bundle_sha}"
-        logger.debug(
-            "chatgpt_web gate-diag poll=%s role=%s status=%s end_turn=%s model=%s effort=%s "
-            "answer_len=%s sentinel_present=%s submitted_uid=%s cur=%s",
-            polls,
-            author.get("role") if isinstance(author, dict) else None,
-            msg.get("status"),
-            msg.get("end_turn"),
-            meta.get("model_slug") if isinstance(meta, dict) else None,
-            meta.get("thinking_effort") if isinstance(meta, dict) else None,
-            len(text),
-            sentinel in text,
-            submitted_user_msg_id[:12],
-            str(cur)[:16],
-        )
-        # On a FINISHED assistant node missing the sentinel, log the answer TAIL
-        # once (non-secret: it is the model's own findings text) to diagnose
-        # prompt-adherence — never a token.
-        role = author.get("role") if isinstance(author, dict) else None
-        if role == "assistant" and msg.get("end_turn") and sentinel not in text:
-            logger.debug("chatgpt_web gate-diag answer_tail=%r", text[-240:])

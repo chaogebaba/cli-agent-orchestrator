@@ -22,7 +22,7 @@ from cli_agent_orchestrator.chatgpt_web_runner.send_intent import (
     AttemptState,
     SendIntentLog,
 )
-from cli_agent_orchestrator.chatgpt_web_runner.sse_stream import SSEProjection
+from cli_agent_orchestrator.chatgpt_web_runner.sse_stream import SSEProjection, StreamIdScanner
 from cli_agent_orchestrator.chatgpt_web_runner.stream_relay import AttemptRelay
 
 API_DRIVE_IMPERSONATE = "chrome136"
@@ -40,6 +40,10 @@ class OriginResult:
     bytes_drained: int
     relay_status: str
     projection: tuple[dict[str, Any], ...]
+    #: Recovered from the stream PYTHON drained (D10: the browser's address bar
+    #: and the app's own conversation GET are no longer an id source).
+    conversation_id: Optional[str] = None
+    assistant_message_id: Optional[str] = None
 
 
 def validate_impersonation(posture: str) -> None:
@@ -144,6 +148,7 @@ async def send_once(
         session.cookies.set(name, value, domain=domain, path=path)
 
     projection = SSEProjection()
+    ids = StreamIdScanner()
     projected: list[dict[str, Any]] = []
     drained = 0
     try:
@@ -157,6 +162,7 @@ async def send_once(
             drained += len(chunk)
             # Ignore False: relay closure must not stop the origin drain.
             await relay.publish(chunk)
+            ids.feed(chunk)
             projected.extend(projection.feed(chunk))
         await relay.finish()
         intent_log.transition(
@@ -169,6 +175,8 @@ async def send_once(
             bytes_drained=drained,
             relay_status=relay.status,
             projection=tuple(projected),
+            conversation_id=ids.conversation_id,
+            assistant_message_id=ids.assistant_message_id,
         )
     finally:
         close = getattr(session, "close", None)

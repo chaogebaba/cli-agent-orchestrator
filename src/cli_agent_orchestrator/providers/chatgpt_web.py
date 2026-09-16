@@ -132,8 +132,13 @@ class ChatGptWebProvider(BaseProvider):
     def paste_enter_count(self) -> int:
         return 1
 
+    # A staticmethod on purpose: nothing in the body reads provider instance
+    # state, and the RUNNER (a separate process with no provider object) is the
+    # caller that has to mint the attempt. Keeping it on the provider keeps the
+    # D6 contract in one place; making it static means the runner does not have
+    # to fabricate an instance to reach it.
+    @staticmethod
     def start_attempt(
-        self,
         *,
         run_id: Optional[str] = None,
         attempt_id: Optional[str] = None,
