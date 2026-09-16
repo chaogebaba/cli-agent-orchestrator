@@ -25,6 +25,7 @@ from test.fixtures.chatgpt_web_real_browser import (
     HeldRouteSession,
     RealBrowserHarness,
     chromium_available,
+    chromium_unavailable_reason,
 )
 from typing import Any
 
@@ -49,7 +50,7 @@ pytestmark = [
     pytest.mark.xdist_group("f862-real-browser"),
     pytest.mark.skipif(
         not chromium_available(),
-        reason="Playwright Chromium build not installed for this interpreter",
+        reason=f"real-browser oracle needs Chromium: {chromium_unavailable_reason()}",
     ),
 ]
 

@@ -39,19 +39,46 @@ CONVERSATION_GLOB = "**/backend-api/f/conversation"
 HARNESS_SWITCH = "--f862-harness-id"
 
 
+_UNAVAILABLE_REASON: Optional[str] = None
+
+
 def chromium_available() -> bool:
-    """True when a Playwright Chromium build is installed for this interpreter."""
+    """True when a launchable Playwright Chromium build exists for this interpreter.
+
+    Asks Playwright's own registry for ``chromium.executable_path`` rather than
+    guessing at the browsers directory layout. A layout guess is a silent
+    false-negative machine: it turns "the browser moved" into "13 tests
+    skipped", which is exactly how a load-bearing oracle stops being run
+    without anyone noticing. ``chromium_unavailable_reason()`` carries the
+    diagnosis into the skip message so a skipped run is still legible.
+    """
+    global _UNAVAILABLE_REASON
     try:
-        from playwright.async_api import async_playwright  # noqa: F401
-    except Exception:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:  # pragma: no cover - import guard
+        _UNAVAILABLE_REASON = f"playwright python package not importable: {exc!r}"
         return False
-    root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or str(Path.home() / ".cache" / "ms-playwright")
-    base = Path(root)
-    if not base.is_dir():
+    try:
+        with sync_playwright() as p:
+            executable = Path(p.chromium.executable_path)
+    except Exception as exc:
+        _UNAVAILABLE_REASON = (
+            f"playwright driver/registry unusable: {exc!r}; "
+            f"PLAYWRIGHT_BROWSERS_PATH={os.environ.get('PLAYWRIGHT_BROWSERS_PATH', '<unset>')}"
+        )
         return False
-    return any(base.glob("chromium*/**/chrome")) or any(
-        base.glob("chromium*/**/headless_shell")
-    )
+    if not executable.exists():
+        _UNAVAILABLE_REASON = (
+            f"chromium build missing at {executable} "
+            f"(run `uv run playwright install chromium`)"
+        )
+        return False
+    return True
+
+
+def chromium_unavailable_reason() -> str:
+    """Why :func:`chromium_available` said no (empty when it said yes)."""
+    return _UNAVAILABLE_REASON or ""
 
 
 def _pids_with(token: str) -> list[int]:
