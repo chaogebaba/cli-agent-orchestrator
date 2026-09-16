@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Callable
 from typing import Any, Optional
 
 from cli_agent_orchestrator.core.delivery import (
@@ -55,6 +56,7 @@ from cli_agent_orchestrator.core.delivery import (
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "AcpTransport",
     "LegacyInboxAdoption",
     "LegacyReceiverDirectory",
     "adopt_enqueue",
@@ -764,3 +766,101 @@ class HerdrPromptInjector:
             DELIVERY_INJECT_BUDGET_S,
         )
         return InjectionResult(outcome=submission.outcome, detail=submission.detail)
+
+
+class AcpTransport:
+    """WP-ACP-PLANE D16/B1 — the seat's wake over the ACP message plane.
+
+    The FOURTH implementation in this module, beside ``NativeSeatCarrier``,
+    ``PaneWorkerInjector`` and H2's ``HerdrPromptInjector``.  The blueprint's
+    collision row calls three implementations in one module "the intended
+    shape", and this is the fourth of the same kind: one port, one transport, no
+    conditional inside another carrier.
+
+    **It satisfies ``SeatCarrier``, not ``PaneInjector``, and the difference is
+    the point.**  D7 made those separate ports so K8's kill is a property of the
+    call graph: the seat branch holds no reference to the pane injector at all,
+    so no conditional inside an injector can be got wrong later.  AC-S1.7 asks
+    that no ``send_keys`` path be REACHABLE for an ACP seat, and the way to make
+    that checkable is for this class to have no way to reach one — not for it to
+    decline.
+
+    **No pane, no coordinates, no registry.**  ``NativeSeatCarrier`` reads
+    ``tmux_session``/``tmux_window`` and refuses ``no_tmux_coordinates`` without
+    them; for a ``transport='acp'`` row those columns are NULL BY DESIGN (D20),
+    which is exactly why a per-terminal dispatch chooses between the two rather
+    than one carrier learning to branch.
+
+    The submission itself is the plane's own rule: **CAO tracks mid-turn from its
+    own stream and never writes a second prompt into an open turn.**  ACP has no
+    wire busy class — S0's AC-S0.3c/S0.4 disproved the ``-32003`` model — so a
+    busy receiver is reported ``acp_busy_retry``, the row keeps its lease, no
+    attempt is spent, and it is delivered on the first ``stopReason`` through
+    ``DeliveryTick.nudge`` or, if the driver's stream is severed, by the ordinary
+    reclaim floor (AC-S1.3, AC-S1.14).
+    """
+
+    #: The typed refusal for a receiver whose turn is still open.  A string
+    #: rather than an exception for the reason every other carrier reason is one:
+    #: ``classify_wake_reason`` turns carrier reasons into outcomes, and a
+    #: carrier that raised would make "busy" an error the tick had to interpret.
+    BUSY_REASON = "acp_busy_retry"
+
+    #: No session bound yet for this terminal.  Returns when the seat's first
+    #: call does, so it is bounded by the row's own deadline rather than by the
+    #: attempt budget — the same reading ``wake_unreachable`` gets.
+    UNBOUND_REASON = "acp_session_unbound"
+
+    def __init__(self, sessions: Callable[[str], Any] | None = None) -> None:
+        """``sessions`` resolves a terminal id to its live ACP client.
+
+        Injected rather than looked up, so this class holds no registry of its
+        own and a test can hand it a mock agent's client.  The composition root
+        supplies the real resolver, which is the one place that knows how seats
+        are spawned.
+        """
+        self._sessions = sessions
+
+    def emit(
+        self,
+        *,
+        terminal_id: str,
+        line: str,
+        sender_key: str,
+        sender_name: str,
+        msg_id: str,
+    ) -> WakeEmission:
+        """Write ONE prompt, or report a typed reason.  Never a second prompt."""
+        del sender_key, sender_name, msg_id  # the ACP envelope carries its own id
+        client = self._sessions(terminal_id) if self._sessions is not None else None
+        if client is None:
+            return WakeEmission(reason=self.UNBOUND_REASON)
+
+        state = client.session_state()
+        if state.session_id is None:
+            return WakeEmission(reason=self.UNBOUND_REASON)
+        if state.turn_open:
+            # The decision AC-S1.3 asserts: the row is NEVER SUBMITTED, so no
+            # second ``session/prompt`` leaves CAO.  Reported, not raised, and
+            # not queued here — the queue is the tick's, and holding a line in
+            # this object would be a second queue nobody could see.
+            return WakeEmission(reason=self.BUSY_REASON, detail="turn_open")
+
+        try:
+            client.prompt(line)
+        except Exception as exc:  # noqa: BLE001 — a transport fault is a typed reason
+            # A refused prompt is this client's own busy guard firing on a race
+            # between the check above and the write; everything else is the
+            # transport. Both are reasons, never exceptions the tick must catch.
+            reason = (
+                self.BUSY_REASON
+                if exc.__class__.__name__ == "PromptRefused"
+                else "acp_write_failed"
+            )
+            return WakeEmission(reason=reason, detail=exc.__class__.__name__)
+
+        # ``verified`` is TRUE here and that is a narrower claim than it looks:
+        # the local write receipt survived, which is what D5 calls "accepted".
+        # It is not an acknowledgement from the agent, and the design says so
+        # rather than letting a flushed pipe stand in for a read message.
+        return WakeEmission(verified=True, detail="acp")

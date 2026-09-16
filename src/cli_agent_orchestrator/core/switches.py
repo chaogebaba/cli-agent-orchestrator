@@ -33,6 +33,7 @@ __all__ = [
     "BOOT_SWITCH_ON",
     "Rejected",
     "boot_switch_enabled",
+    "boot_switch_selected",
     "retired_position",
 ]
 
@@ -67,6 +68,35 @@ def boot_switch_enabled(env_var: str, source: Mapping[str, str]) -> bool:
     it never had a third.
     """
     return source.get(env_var) == BOOT_SWITCH_ON
+
+
+def boot_switch_selected(env_var: str, value: str, source: Mapping[str, str]) -> bool:
+    """Is this two-position boot switch set to ``value``?
+
+    :func:`boot_switch_enabled` with the ON token as a parameter, for a switch
+    whose positions are NAMED rather than numbered.  WP-ACP-PLANE D16 fixes
+    ``CAO_SEAT_TRANSPORT=acp|native`` with ``native`` as the default, and those
+    are the words the decision uses; spelling the armed position ``1`` to reuse
+    the numbered helper would make the variable unreadable from a process
+    listing, which is the exact property :data:`BOOT_SWITCH_ON` exists to
+    protect.
+
+    The idiom's three properties are unchanged and are why this is a sibling
+    rather than a hand-rolled comparison at the call site:
+
+    * **Default OFF.**  An absent variable is ``False``, so merging a phase
+      leaves its branch inert and ``main`` byte-identical in behaviour until a
+      live round says otherwise.
+    * **Strictly equal.**  No case folding, no stripping, no ``"true"``.  A
+      switch whose position cannot be read off a process listing is a switch
+      nobody can state the position of.
+    * **PURE.**  It takes the mapping rather than reading ``os.environ``.
+
+    The DEFAULT position needs no token here: anything that is not ``value`` is
+    the default, which is what makes ``CAO_SEAT_TRANSPORT=native`` and an unset
+    variable the same thing rather than two spellings a reader has to reconcile.
+    """
+    return source.get(env_var) == value
 
 
 @dataclass(frozen=True)

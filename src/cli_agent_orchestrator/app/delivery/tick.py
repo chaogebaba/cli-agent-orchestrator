@@ -283,6 +283,37 @@ class DeliveryTick:
         for row in result.dead:
             self._announce_death(row, now, report)
 
+    def nudge(self, terminal_id: str, *, now: datetime | None = None) -> int:
+        """D7.2 — the ACP driver says this receiver just went idle. Serve it NOW.
+
+        Called from the adapter on a ``stopReason``. The tick remains the SINGLE
+        retry/queue authority (D7): this does not deliver anything itself and
+        holds no queue state — it returns the receiver's busy-parked rows to
+        ``ready`` and runs the ordinary serve for that one receiver, through the
+        same claim, the same fence and the same attempt accounting every other
+        delivery takes.
+
+        **It is an accelerator, never the only path**, and AC-S1.14 fails a build
+        where either half is missing. With the driver's stream severed no nudge
+        ever arrives, the lease expires, and ``reclaim`` re-offers on the
+        65-second floor exactly as before — slower, and still correct. That is
+        why this returns a COUNT rather than raising when it finds nothing: a
+        nudge for a receiver whose rows another path already served is normal.
+
+        Exceptions are swallowed for the reason ``serve`` swallows them per
+        receiver: this is called from the adapter's stream-reading thread, and a
+        raise there would take down the reader that every other terminal's
+        lifecycle events arrive on.
+        """
+        stamp = now if now is not None else self._clock.now()
+        try:
+            released = self._store.release_busy(terminal_id, now=stamp)
+            self._serve_receiver(terminal_id, stamp, TickReport())
+            return released
+        except Exception:  # noqa: BLE001 — a nudge must not kill the stream reader
+            logger.exception("delivery tick: nudge for %s failed", terminal_id)
+            return 0
+
     def serve(self, now: datetime, report: TickReport) -> None:
         for receiver_id in self._store.ready_receivers():
             try:

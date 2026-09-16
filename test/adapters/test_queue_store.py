@@ -219,6 +219,13 @@ def test_the_mode_conjunct_in_claim_is_the_only_enforcement_left() -> None:
         "pending_for_receiver",
         "settle_through",
         "cancel_on_complete",
+        # WP-ACP-PLANE D7.2 (AC-S1.14). ``release_busy`` is a WRITE that returns
+        # rows to ``ready``, so it sits with ``claim`` on the enforcement side
+        # rather than with the five reads: without the conjunct a nudge could
+        # make a non-live row deliverable again, which is the one thing the
+        # filter exists to prevent — and it would do it through a path the boot
+        # guard never covered even when the boot guard existed.
+        "release_busy",
     }, sorted(filtering)
 
     assert not hasattr(store, "occupancy"), (
