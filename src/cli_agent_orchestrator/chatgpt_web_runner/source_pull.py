@@ -427,3 +427,81 @@ class PairingCodeFile:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await watcher
         self.revoke()
+
+
+#: D9.1: the connector auth store is keyed by CONNECTOR IDENTITY — the public
+#: base URL the operator authorised — not by attempt. Pairing is a human step
+#: that takes a browser, a settings page and a typed code; making every attempt
+#: repeat it is what made the live turn unrunnable.
+CONNECTOR_AUTH_DIRNAME = "connector-auth"
+
+
+def connector_auth_dir(artifacts_dir: Path, public_base_url: str) -> Path:
+    """The durable auth-store directory for one connector identity, 0700.
+
+    Hashed rather than slugged because the URL is not a safe path component and
+    because the digest reads the same on every host. Sixteen hex characters is
+    plenty to separate the handful of connectors one operator runs, and the
+    value is not a secret — it is derived from a URL the model is told anyway.
+    """
+    import hashlib
+    import os
+
+    key = hashlib.sha256(public_base_url.encode("utf-8")).hexdigest()[:16]
+    path = Path(artifacts_dir) / CONNECTOR_AUTH_DIRNAME / key
+    path.mkdir(parents=True, exist_ok=True)
+    # mkdir's mode is umask-dependent; set it explicitly on every call so an
+    # inherited 0755 from an earlier build does not persist.
+    os.chmod(path, 0o700)
+    return path
+
+
+class PairingExpired(RuntimeError):
+    """The operator did not complete the pairing inside the code's lifetime."""
+
+
+async def await_pairing_consumed(
+    pairing: Any,
+    *,
+    expires_at: float,
+    announce: Any,
+    poll_interval: float = 1.0,
+    countdown_interval: float = 30.0,
+    clock: Any = None,
+) -> float:
+    """Block until the operator pairs, or raise :class:`PairingExpired`.
+
+    This is the operator gate. Pairing needs a human in a second tab: open
+    Settings, find the connector, click Connect, type the code. The runner used
+    to print the code and then spend 5-15 seconds launching the browser,
+    navigating and minting — on the very page the human would have to navigate
+    away from. Nothing waited, so the pairing could not be completed and the
+    audit came back empty.
+
+    Waiting HERE, before any profile touch, is what makes the gate cheap: a turn
+    the operator abandons costs no browser launch and no mint.
+
+    Returns the seconds waited. ``announce`` receives a countdown line roughly
+    every ``countdown_interval`` seconds so a blocked runner never looks hung.
+    """
+    import time as _time
+
+    now = clock or _time.monotonic
+    started = now()
+    deadline_in = max(0.0, expires_at - _time.time())
+    next_announce = 0.0
+    while True:
+        if not pairing.has_active_session():
+            # Consumed (or invalidated). Either way the gate is open: the
+            # authorisation either exists now or never will for this code.
+            return now() - started
+        waited = now() - started
+        remaining = deadline_in - waited
+        if remaining <= 0:
+            raise PairingExpired(
+                f"the pairing code expired after {waited:.0f}s with no authorization"
+            )
+        if waited >= next_announce:
+            announce(f"PULL-PAIRING-WAIT {remaining:.0f}s left — pair in ChatGPT Settings")
+            next_announce = waited + countdown_interval
+        await asyncio.sleep(min(poll_interval, remaining))

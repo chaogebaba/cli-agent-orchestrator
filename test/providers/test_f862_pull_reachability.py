@@ -36,6 +36,22 @@ def workspace(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def _skip_pairing_gate(monkeypatch) -> None:
+    """Let an arm past the D9.1 operator gate without pairing.
+
+    The gate blocks until a human pairs, which is exactly right in production
+    and useless in an arm about something else. Arms that ARE about the gate
+    drive the real one (see the gate section); these state plainly that they are
+    not, instead of quietly depending on a timeout.
+    """
+    import cli_agent_orchestrator.chatgpt_web_runner.source_pull as source_pull
+
+    async def _instant(_pairing, **_kwargs):
+        return 0.0
+
+    monkeypatch.setattr(source_pull, "await_pairing_consumed", _instant, raising=False)
+
+
 def _free_port() -> int:
     import socket
 
@@ -314,6 +330,8 @@ def test_a_reachable_plane_records_the_url_and_pairing_code(
     import cli_agent_orchestrator.chatgpt_web_runner.runtime as runtime
     from cli_agent_orchestrator.chatgpt_web_runner.send_intent import AttemptState, SendIntentLog
 
+    _skip_pairing_gate(monkeypatch)
+
     port = _free_port()
     monkeypatch.setenv("CAO_ARTIFACTS_DIR", str(tmp_path))
     monkeypatch.setenv("CHATGPT_PULL_BIND_PORT", str(port))
@@ -360,6 +378,8 @@ def test_production_passes_the_public_url_through_to_bind_attempt(
     """
     import cli_agent_orchestrator.chatgpt_web_runner.runtime as runtime
     import cli_agent_orchestrator.services.workspace_read as workspace_read
+
+    _skip_pairing_gate(monkeypatch)
 
     port = _free_port()
     public = f"http://127.0.0.1:{port}"
@@ -411,6 +431,8 @@ def test_the_raw_pairing_code_is_absent_from_the_ledger_and_present_in_the_file(
     """
     import hashlib
     import stat
+
+    _skip_pairing_gate(monkeypatch)
 
     import cli_agent_orchestrator.chatgpt_web_runner.runtime as runtime
     from cli_agent_orchestrator.chatgpt_web_runner.send_intent import SendIntentLog
@@ -568,6 +590,7 @@ def _early_failure_turn(tmp_path, monkeypatch, workspace: Path, attempt_id: str,
         """The arm proves nothing unless the plane was really up when it broke."""
         return code_path.exists() and not _port_is_closed(port)
 
+    _skip_pairing_gate(monkeypatch)
     break_at(monkeypatch, runtime, observed, _plane_up)
 
     log = _attempt(tmp_path, attempt_id)

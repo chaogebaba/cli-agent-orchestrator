@@ -22,6 +22,7 @@ D4 mapping (code -> condition/status intent, resolved in the provider, NOT here)
     proc_exited        -> PROC_EXITED
     access_denied      -> ERROR (unknown 403 fails closed, human-gated)
     source_correlation -> ERROR (AC-33 pull-plane correlation failed)
+    pairing_expired    -> ERROR (D9.1 operator never completed the pairing)
 """
 
 from __future__ import annotations
@@ -63,6 +64,12 @@ class RunnerErrorCode(str, Enum):
 
     # --- Report integrity ---------------------------------------------------
     REPORT_INVALID = "report_invalid"
+
+    #: D9.1: the operator did not complete the connector pairing inside the
+    #: code's 300s lifetime. Provably nothing was sent — the gate sits before
+    #: any profile touch — so this is NOTHING_SENT and the attempt may simply be
+    #: re-dispatched once the operator is ready.
+    PAIRING_EXPIRED = "pairing_expired"
 
     # --- Pull-plane correlation (D5/AC-33) ----------------------------------
     #: The accepted answer could not be correlated to what the connector
