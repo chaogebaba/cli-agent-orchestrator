@@ -89,8 +89,8 @@ class FakeOrigin(AbstractContextManager["FakeOrigin"]):
         sse_body: bytes = DEFAULT_SSE,
         conversation_body: Optional[dict[str, Any]] = None,
     ) -> None:
-        if response_mode not in {"complete", "reset"}:
-            raise ValueError("response_mode must be complete or reset")
+        if response_mode not in {"complete", "reset", "slow_sse"}:
+            raise ValueError("response_mode must be complete, reset or slow_sse")
         self.directory = directory
         self.response_mode = response_mode
         self.sse_body = sse_body
@@ -100,6 +100,17 @@ class FakeOrigin(AbstractContextManager["FakeOrigin"]):
             "mapping": {},
         }
         self.ledger = OriginReceiptLedger()
+        #: ``slow_sse`` only. The server writes the first SSE chunk, opens
+        #: ``first_chunk_sent``, then blocks on ``release_stream`` before
+        #: writing the rest. That makes "tear the browser down MID-STREAM" an
+        #: exact instant the test chooses rather than a sleep race.
+        self.first_chunk_sent = threading.Event()
+        self.release_stream = threading.Event()
+        #: ``slow_sse`` only. Counts conversation GETs, so the during-GET arm
+        #: can prove the poll really was in flight.
+        self.get_gate_reached = threading.Event()
+        self.release_get = threading.Event()
+        self.gate_timeout_s = 30.0
         self.server: Optional[ThreadingHTTPServer] = None
         self.thread: Optional[threading.Thread] = None
         self.cert_path: Optional[Path] = None
@@ -127,6 +138,9 @@ class FakeOrigin(AbstractContextManager["FakeOrigin"]):
                     self._reply(200, "text/html; charset=utf-8", DETERMINISTIC_PAGE)
                     return
                 if self.path.startswith("/backend-api/conversation/"):
+                    owner.get_gate_reached.set()
+                    if owner.response_mode == "slow_sse":
+                        owner.release_get.wait(owner.gate_timeout_s)
                     body = json.dumps(owner.conversation_body, separators=(",", ":")).encode()
                     self._reply(200, "application/json", body)
                     return
@@ -151,7 +165,34 @@ class FakeOrigin(AbstractContextManager["FakeOrigin"]):
                         pass
                     self.connection.close()
                     return
+                if owner.response_mode == "slow_sse":
+                    self._reply_slow_sse(owner.sse_body)
+                    return
                 self._reply(200, "text/event-stream", owner.sse_body)
+
+            def _reply_slow_sse(self, body: bytes) -> None:
+                """Chunked SSE that pauses, on command, after its first frame."""
+                head, _, tail = body.partition(b"\n\n")
+                first = head + b"\n\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self._write_chunk(first)
+                owner.first_chunk_sent.set()
+                owner.release_stream.wait(owner.gate_timeout_s)
+                if tail:
+                    self._write_chunk(tail)
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+                self.close_connection = True
+
+            def _write_chunk(self, payload: bytes) -> None:
+                self.wfile.write(f"{len(payload):x}\r\n".encode())
+                self.wfile.write(payload)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
 
             def _reply(self, status: int, content_type: str, body: bytes) -> None:
                 self.send_response(status)
