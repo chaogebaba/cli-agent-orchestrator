@@ -86,6 +86,7 @@ SKILL_ALLOWLIST = (
     "src/cli_agent_orchestrator/cli/orchestrator_commands/__init__.py",
     "src/cli_agent_orchestrator/cli/orchestrator_commands/ledger.py",
     "src/cli_agent_orchestrator/cli/orchestrator_commands/lint_doctrine.py",
+    "src/cli_agent_orchestrator/cli/orchestrator_commands/gate_check.py",
     "src/cli_agent_orchestrator/cli/orchestrator_commands/fold_corpus.py",
     "src/cli_agent_orchestrator/cli/orchestrator_commands/sync_routing.py",
 )

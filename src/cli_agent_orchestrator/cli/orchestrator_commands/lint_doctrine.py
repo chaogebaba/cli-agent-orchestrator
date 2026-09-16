@@ -90,6 +90,16 @@ MECHANISM_SOURCES: tuple[tuple[str, str], ...] = (
 )
 SOURCE_SUFFIXES = (".py", ".sh", ".json")
 
+# The skill CLI is scanned only for the modules named here.  B1 skipped the whole
+# ``orchestrator_commands`` package, which was right for the linter itself — an id
+# resolved against the module that CHECKS ids makes C3 self-satisfying, and a
+# docstring line is not a comment line, so the package's prose would outrank real
+# implementations.  But from B2 on the package also holds mechanisms doctrine
+# genuinely claims (``gate-check``, F809 A01 #672), and a claim that resolves
+# nowhere is indistinguishable from a prose-only claim.  Opt-in, one filename per
+# verb, so a citation-heavy module is never scanned by accident.
+SKILL_MECHANISM_MODULES: tuple[str, ...] = ("gate_check.py",)
+
 
 def runtime_source() -> Path:
     """The installed ``cli_agent_orchestrator`` package directory.
@@ -417,9 +427,10 @@ def mechanism_files(
             if not path.is_file() or path.suffix not in SOURCE_SUFFIXES:
                 continue
             # The skill CLI CITES mechanism ids (this module's own docstring names
-            # FROZEN-PIN); a citation is not an implementation, and resolving an id
-            # against the linter that checks it would make C3 self-satisfying.
-            if "orchestrator_commands" in path.parts:
+            # one); a citation is not an implementation, and resolving an id against
+            # the linter that checks it would make C3 self-satisfying.  Only the
+            # modules that IMPLEMENT a claimed mechanism are opted in.
+            if "orchestrator_commands" in path.parts and path.name not in SKILL_MECHANISM_MODULES:
                 continue
             resolved = path.resolve()
             if resolved in seen:

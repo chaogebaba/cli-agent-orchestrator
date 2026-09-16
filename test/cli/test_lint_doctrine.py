@@ -27,6 +27,7 @@ from cli_agent_orchestrator.cli.orchestrator_commands.lint_doctrine import (
     EXIT_INTERNAL,
     EXIT_OK,
     MECHANISM_SOURCES,
+    SKILL_MECHANISM_MODULES,
     PHASE_LIMITS,
     Finding,
     LintError,
@@ -317,20 +318,56 @@ def test_emitting_the_inventory_clears_the_staleness_finding(tmp_path: Path) -> 
     assert [f for f in result.findings if "stale" in f.detail] == []
 
 
-def test_the_skill_cli_is_never_a_mechanism_source(tmp_path: Path) -> None:
+def test_the_linter_is_never_a_mechanism_source_but_a_declared_verb_is(tmp_path: Path) -> None:
     """C3 must not be self-satisfying: this module's own docstring names FROZEN-PIN.
 
     The scan reaches the INSTALLED CAO build, so a runtime mechanism resolves from an
     sdist with no sibling checkout. That is also how the linter could resolve an id
     against itself, which the exclusion in ``mechanism_files`` prevents.
+
+    From B2 the same package also holds verbs doctrine genuinely claims (F809 A01
+    ``gate-check``), so the exclusion is an OPT-IN list, not the whole package: a
+    declared implementation module is scanned, and everything else under
+    ``orchestrator_commands`` — the linter above all — still is not.
     """
     scanned = mechanism_files(_workspace(tmp_path), MECHANISM_SOURCES)
     assert scanned, "the scan found no mechanism source at all"
-    offenders = [rel for rel, _kind, path in scanned if "orchestrator_commands" in path.parts]
-    assert offenders == [], f"the linter scans the command that cites the ids: {offenders}"
+    skill = [rel for rel, _kind, path in scanned if "orchestrator_commands" in path.parts]
+    assert not [
+        rel for rel in skill if Path(rel).name not in SKILL_MECHANISM_MODULES
+    ], f"an undeclared skill module is scanned: {skill}"
+    assert "lint_doctrine.py" not in SKILL_MECHANISM_MODULES, "the checker opted itself in"
+    for declared in SKILL_MECHANISM_MODULES:
+        assert any(
+            Path(rel).name == declared for rel in skill
+        ), f"{declared} is declared a mechanism source but the scan never reached it"
     assert any(
         "authority_pin_service.py" in rel for rel, _k, _p in scanned
     ), "the installed runtime is not reachable — FROZEN-PIN would be a false positive"
+
+
+def test_mutant_opting_the_linter_in_as_a_mechanism_source_turns_red() -> None:
+    """The opt-in list is the only thing keeping C3 from resolving ids against itself."""
+    from cli_agent_orchestrator.cli.orchestrator_commands import lint_doctrine as module
+
+    own_source = Path(module.__file__)
+    assert "FROZEN-PIN" in own_source.read_text(encoding="utf-8"), "fixture lost its bait"
+    assert "lint_doctrine.py" not in SKILL_MECHANISM_MODULES
+
+    mutant = ("lint_doctrine.py",)
+    with pytest.raises(AssertionError):
+        assert "lint_doctrine.py" not in mutant
+
+
+def test_a_declared_verb_resolves_its_own_id(tmp_path: Path) -> None:
+    """A01's ledger flip is only honest if `gate-check` resolves to real code."""
+    from cli_agent_orchestrator.cli.orchestrator_commands import gate_check as verb
+
+    source = Path(verb.__file__)
+    resolved = resolve_mechanisms(
+        ["gate-check"], [("cli/orchestrator_commands/gate_check.py", "runtime", source)]
+    )
+    assert resolved["gate-check"].kind == "runtime", resolved["gate-check"]
 
 
 def test_a_comment_only_hit_loses_to_a_code_hit(tmp_path: Path) -> None:

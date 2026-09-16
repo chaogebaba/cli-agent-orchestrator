@@ -27,9 +27,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # The skill CLI's whole visible command set: the three commands A.4 moves, plus every verb
 # added since under the encode-by-default ruling. `fold` itself stays on base — only corpus
 # discovery left, so `cao fold FILE` is untouched and is asserted separately below.
-# `lint-doctrine` (F809 #666 A14/#681) is NEW here rather than moved, so base never carried
-# it and it gets no base stub; the disjointness assertion below still covers it.
-MOVED = ("ledger", "fold-corpus", "sync-routing", "lint-doctrine")
+# `lint-doctrine` (F809 #666 A14/#681) and `gate-check` (F809 A01/#672) are NEW here rather
+# than moved, so base never carried either and neither gets a base stub; the disjointness
+# assertion below still covers them.  `gate-check` is deliberately NOT spelled `gate`: base
+# owns a different `gate` command (slice 2a's read-only run view), and this tuple asserts
+# name-level disjointness in both directions.
+MOVED = ("ledger", "fold-corpus", "sync-routing", "lint-doctrine", "gate-check")
 
 POINTER = "cao-orchestrator"
 

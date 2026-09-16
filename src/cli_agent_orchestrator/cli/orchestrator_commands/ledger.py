@@ -7,9 +7,12 @@ import click
 
 from cli_agent_orchestrator.services.verification_service import find_workspace_file
 
-# Recognized status tokens (case-insensitive).
-_DRAINED_STATUSES = {"drained-pass", "drained-fail", "verified"}
-_PENDING_STATUSES = {"pending", "pending-activation"}
+# Recognized status tokens (case-insensitive).  PUBLIC because `gate-check`
+# (F809 A01 #672) decides a claimed ledger row's staleness from the same
+# vocabulary: two spellings of "this row is drained" would let a gate pass a
+# row this command calls consumed.
+DRAINED_STATUSES = {"drained-pass", "drained-fail", "verified"}
+PENDING_STATUSES = {"pending", "pending-activation"}
 
 # Canonical ledger heading pattern (S2):
 # - "## Live ledger" (exact)
@@ -28,7 +31,7 @@ def _extract_ledger_section(text: str) -> str | None:
     if not matches:
         return None
     last = matches[-1]
-    after = text[last.end():]
+    after = text[last.end() :]
     # Find next H2 boundary.
     next_h2 = re.search(r"^## ", after, re.M)
     if next_h2:
@@ -62,9 +65,28 @@ def _parse_bullet_rows(section: str) -> list[tuple[str, str]]:
         if status_match:
             # Feature name is the first meaningful token(s) after the bullet.
             # Typically: "- F213 ... status: PENDING"
-            feature_match = re.match(r"[-*]\s+(.+?)(?:\s+\.{2,}|\s+status:)", stripped, re.IGNORECASE)
+            feature_match = re.match(
+                r"[-*]\s+(.+?)(?:\s+\.{2,}|\s+status:)", stripped, re.IGNORECASE
+            )
             feature = feature_match.group(1).strip() if feature_match else ""
             rows.append((feature, status_match.group(1)))
+    return rows
+
+
+def live_ledger_rows(text: str) -> list[tuple[str, str]] | None:
+    """``[(feature, status)]`` for the live ledger section, or ``None`` if absent.
+
+    The single definition of "a live-ledger row", shared with `gate-check`
+    (F809 A01 #672).  `None` is NOT an empty ledger: it means the file carries no
+    canonical section at all, which a caller has to treat as untrusted state
+    rather than as "no rows, therefore fine".
+    """
+    section = _extract_ledger_section(text)
+    if section is None:
+        return None
+    rows = _parse_table_rows(section)
+    if not rows:
+        rows = _parse_bullet_rows(section)
     return rows
 
 
@@ -97,28 +119,25 @@ def check() -> None:
     reentry_text = reentry_match.group(0) if reentry_match else ""
 
     # Scope to the live-ledger section.
-    ledger_section = _extract_ledger_section(text)
-    if ledger_section is None:
+    rows = live_ledger_rows(text)
+    if rows is None:
         click.echo("warning: no live ledger section found in HANDOFF.md")
         click.echo("pending-row count: 0")
         return
-
-    # Parse both formats; table takes precedence if present.
-    rows = _parse_table_rows(ledger_section)
-    if not rows:
-        rows = _parse_bullet_rows(ledger_section)
 
     stale: list[str] = []
     pending = 0
     for feature, raw_status in rows:
         status = raw_status.strip().lower()
-        if status in _DRAINED_STATUSES:
+        if status in DRAINED_STATUSES:
             if feature and _feature_in_reentry(feature, reentry_text):
                 stale.append(feature)
-        elif status in _PENDING_STATUSES:
+        elif status in PENDING_STATUSES:
             pending += 1
         else:
-            click.echo(f"warning: unrecognized ledger status '{raw_status.strip()}' for '{feature}'")
+            click.echo(
+                f"warning: unrecognized ledger status '{raw_status.strip()}' for '{feature}'"
+            )
 
     for feature in stale:
         click.echo(f"warning: POST-RESTART RE-ENTRY names drained feature: {feature}")
