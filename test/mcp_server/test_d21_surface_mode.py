@@ -159,6 +159,14 @@ def test_a_spawned_server_refuses_an_unreadable_mode() -> None:
     """
     env = dict(os.environ)
     env["CAO_MCP_MODE"] = "doctrine"
+    _assert_spawn_refuses(env)
+    # And the empty value, which the N2 ruling made unparseable rather than
+    # absent: the refusal has to reach the PROCESS, not just the parser.
+    env["CAO_MCP_MODE"] = ""
+    _assert_spawn_refuses(env)
+
+
+def _assert_spawn_refuses(env: dict[str, str]) -> None:
     process = subprocess.run(
         [_server_binary()],
         input="",
@@ -275,10 +283,26 @@ def test_bare_is_the_default() -> None:
 
 
 @pytest.mark.parametrize("value", ["", "  "])
-def test_a_cleared_variable_is_a_withdrawn_request_not_an_unreadable_one(value: str) -> None:
-    """Clearing a variable is how an operator withdraws a request, so it takes
-    the default rather than the refusal."""
-    assert _resolve_surface_mode([], {"CAO_MCP_MODE": value}) == "bare"
+def test_an_empty_mode_is_unparseable_not_absent(value: str) -> None:
+    """N2, ruled 2026-09-16: D21 stays literal.
+
+    D21 names two positions and ``""`` is neither, so reading an empty value as
+    "unset" would invent a third the decision does not have. An operator who
+    wants the default UNSETS the variable, and the refusal says exactly that —
+    the distinction that survives is between never-set and set-to-nothing.
+    """
+    with pytest.raises(InvalidSurfaceMode) as raised:
+        _resolve_surface_mode([], {"CAO_MCP_MODE": value})
+    message = str(raised.value)
+    assert "'bare'" in message and "'skill'" in message
+    assert "UNSET" in message, "the refusal must say how to ask for the default"
+
+
+def test_only_a_never_set_variable_takes_the_default() -> None:
+    """The other side of the same ruling, so the pair cannot drift."""
+    assert _resolve_surface_mode([], {}) == "bare"
+    with pytest.raises(InvalidSurfaceMode):
+        _resolve_surface_mode([], {"CAO_MCP_MODE": ""})
 
 
 @pytest.mark.parametrize("value", ["SKILLED", "doctrine", "1", "true", "BARE-ISH"])

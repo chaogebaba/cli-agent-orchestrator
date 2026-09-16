@@ -6773,8 +6773,10 @@ def _resolve_surface_mode(argv: list[str], environ: Mapping[str, str]) -> str:
     * an explicitly-set value that cannot be parsed — :class:`InvalidSurfaceMode`.
       The operator ASKED for something and the server cannot tell what, so the
       honest answer is to refuse rather than to serve a surface nobody requested.
-      A set-but-EMPTY value is treated as unset, because clearing a variable is
-      how an operator withdraws a request rather than makes an unreadable one.
+      **A set-but-EMPTY value is unparseable, not absent** (ruling 2026-09-16): D21
+      names two positions and ``""`` is neither, so treating it as unset would be
+      a third position the decision does not have. Unsetting the variable is how
+      an operator asks for the default, and the refusal says so.
     """
     for index, token in enumerate(argv):
         if token == "--mode" and index + 1 < len(argv):
@@ -6790,16 +6792,22 @@ def _resolve_surface_mode(argv: list[str], environ: Mapping[str, str]) -> str:
 def _parse_surface_mode(raw: str, *, source: str) -> str:
     """One mode value, or a refusal naming what was typed and what is accepted."""
     candidate = raw.strip().lower()
-    if candidate == "":
-        # Clearing a variable is how an operator WITHDRAWS a request, not how
-        # they make an unreadable one.
-        return "bare"
     if candidate in ("bare", "skill"):
         return candidate
+    # An EMPTY value is unparseable, not absent (supervisor ruling 2026-09-16,
+    # closing N2). D21 names two positions and "" is neither. The earlier reading
+    # — that clearing a variable withdraws a request — was a third position the
+    # decision does not have, and a switch with an unnamed position is one nobody
+    # can state the position of.
+    #
+    # The distinction that survives: a variable that was never SET is absent and
+    # takes the default. A variable set to nothing is an operator who typed
+    # something the server cannot read, and the answer to that is the same as for
+    # any other unreadable value.
     raise InvalidSurfaceMode(
         f"{source}={raw!r} is not a surface mode; accepted values are 'bare' and "
-        f"'skill'. Set it with `cao launch --mode skill`, or export "
-        f"{_MODE_ENV_VAR}=skill for a seat launched by hand."
+        f"'skill'. Set it with `cao launch --mode skill`, or UNSET "
+        f"{_MODE_ENV_VAR} for bare."
     )
 
 
