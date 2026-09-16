@@ -397,13 +397,16 @@ def _composed_turn_with_fakes(monkeypatch, tmp_path, attempt_id="a1"):
     # The relay registry is process-global and transient; each test owns one
     # attempt, so clear it rather than colliding on a reused id.
     get_relay_hub().reset_for_tests()
-    handle = ChatGptWebProvider.start_attempt(
+    ChatGptWebProvider.start_attempt(
         run_id="r1", attempt_id=attempt_id, prompt_sha="0" * 64, artifacts_dir=tmp_path
     )
     from cli_agent_orchestrator.chatgpt_web_runner.send_intent import SendIntentLog
 
     log = SendIntentLog(tmp_path / "attempts" / attempt_id)
     log.load()
+    # Same single-writer rule run_production_review applies (see its comment):
+    # the relay must share this record, not the one start_attempt created.
+    get_relay_hub().get(attempt_id).intent_log = log
 
     from cli_agent_orchestrator.chatgpt_web_runner.errors import RunnerError
 
@@ -415,7 +418,6 @@ def _composed_turn_with_fakes(monkeypatch, tmp_path, attempt_id="a1"):
                 attempt_id=attempt_id,
                 prompt_sha="0" * 64,
                 intent_log=log,
-                relay_token=handle.relay_token,
                 manifest=[],
                 frozen_worktree=None,
                 reviewed_commit=None,
@@ -507,3 +509,53 @@ def test_prepare_is_never_held(tmp_path, monkeypatch) -> None:
     prepare = _Route("https://chatgpt.com/backend-api/f/conversation/prepare", "POST", b"{}")
     asyncio.run(dispatcher(prepare))
     assert prepare.continued is True
+
+
+# ── D3/D6: the relay binding window, and who owns it ─────────────────────────
+def test_the_runner_does_not_consume_the_single_relay_binding(tmp_path, monkeypatch) -> None:
+    """The one subscriber is whoever presented the token, not the runner.
+
+    ``AttemptRelay.bind`` mints the subscriber id and writes
+    RELAY_BOUND_OR_SKIPPED itself, so a runner that called it would take the
+    single binding and lock the real subscriber out with a 409.
+    """
+    monkeypatch.setenv("CAO_ARTIFACTS_DIR", str(tmp_path))
+    _composed_turn_with_fakes(monkeypatch, tmp_path, attempt_id="relay-a")
+
+    from cli_agent_orchestrator.chatgpt_web_runner.send_intent import SendIntentLog
+    from cli_agent_orchestrator.chatgpt_web_runner.stream_relay import get_relay_hub
+
+    relay = get_relay_hub().get("relay-a")
+    # Nothing bound, so the window closed as an explicit SKIP before the mint.
+    assert relay.is_bound is False
+    assert relay.status == "skipped"
+
+    log = SendIntentLog(tmp_path / "attempts" / "relay-a")
+    record = log.load()
+    assert record is not None
+    assert record.skipped_at is not None
+    assert record.subscriber_id is None
+
+
+def test_a_real_subscriber_keeps_its_binding_through_the_turn(tmp_path, monkeypatch) -> None:
+    """A subscriber that bound BEFORE the mint is still the bound one after."""
+    import asyncio
+
+    monkeypatch.setenv("CAO_ARTIFACTS_DIR", str(tmp_path))
+
+    from cli_agent_orchestrator.chatgpt_web_runner.stream_relay import get_relay_hub
+    from cli_agent_orchestrator.providers.chatgpt_web import ChatGptWebProvider
+
+    get_relay_hub().reset_for_tests()
+    handle = ChatGptWebProvider.start_attempt(
+        run_id="r2", attempt_id="relay-b", prompt_sha="0" * 64, artifacts_dir=tmp_path
+    )
+    relay = get_relay_hub().get("relay-b")
+    binding = asyncio.run(relay.bind(handle.relay_token))
+    assert relay.is_bound is True
+
+    # The turn runs (and fails on the hold timeout) without touching the binding.
+    _composed_turn_with_fakes(monkeypatch, tmp_path / "second", attempt_id="relay-b2")
+
+    assert relay.binding is binding
+    assert relay.status == "bound"

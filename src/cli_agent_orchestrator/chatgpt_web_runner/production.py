@@ -154,6 +154,20 @@ class _HeldRouteCustody:
     entered: asyncio.Event = field(default_factory=asyncio.Event)
     release: asyncio.Event = field(default_factory=asyncio.Event)
     finished: asyncio.Event = field(default_factory=asyncio.Event)
+    #: Public Playwright request events seen for the held request, in order.
+    events: list[str] = field(default_factory=list)
+    #: Observation tasks queued by those events; awaited before a disposition
+    #: is read, so an assertion never races an event that has not landed.
+    pending: "list[asyncio.Task[Any]]" = field(default_factory=list)
+
+    async def settle(self, timeout: float = 2.0) -> None:
+        await asyncio.sleep(0)
+        if self.pending:
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    asyncio.gather(*list(self.pending), return_exceptions=True), timeout
+                )
+        await asyncio.sleep(0)
 
 
 def run_production_review(
@@ -222,6 +236,17 @@ def run_production_review(
             delivery_state=DeliveryState.NOTHING_SENT,
         )
 
+    # ONE writer per attempt file. ``start_attempt`` registered the relay with
+    # the log object IT created, which still holds the LOCKED record in memory.
+    # Left alone, the relay's own ledger writes (bind / skip) would serialize
+    # that stale record over the file and silently drop every transition this
+    # process had made — and the next transition from this process would then
+    # drop the relay row straight back. Re-pointing the relay at the loaded log
+    # makes the two paths share one record instead of racing over one file.
+    from cli_agent_orchestrator.chatgpt_web_runner.stream_relay import get_relay_hub
+
+    get_relay_hub().get(handle.attempt_id).intent_log = intent_log
+
     #: Filled by the composed turn so publication can be correlated (AC-33).
     pull_evidence: dict[str, Any] = {}
 
@@ -242,7 +267,6 @@ def run_production_review(
                 attempt_id=handle.attempt_id,
                 prompt_sha=prompt_sha,
                 intent_log=intent_log,
-                relay_token=handle.relay_token,
                 manifest=manifest,
                 frozen_worktree=frozen_worktree,
                 reviewed_commit=reviewed_commit,
@@ -300,7 +324,6 @@ async def _drive_composed_turn(
     attempt_id: str,
     prompt_sha: str,
     intent_log: Any,
-    relay_token: str,
     manifest: list[str],
     frozen_worktree: Optional[str],
     reviewed_commit: Optional[str],
@@ -416,6 +439,7 @@ async def _drive_composed_turn(
             return
         custody.captured = captured
         custody.holder = captured.route_holder
+        _wire_request_events(page, custody, captured.route_holder.request)
         custody.entered.set()
         try:
             await custody.release.wait()
@@ -438,16 +462,17 @@ async def _drive_composed_turn(
         attempt_nonce=attempt_nonce,
     )
 
-    # ── relay binding closes at MINT_RESERVED (D3/D6) ─────────────────────
+    # ── the relay binding window closes HERE, before the mint (D3/D6) ─────
+    # The runner does NOT bind: the relay has exactly one subscriber and it is
+    # whoever presented the token on the public CAO route. ``bind()`` mints the
+    # subscriber id and writes RELAY_BOUND_OR_SKIPPED itself, so a runner that
+    # called it would consume the single binding and lock the real subscriber
+    # out. All the runner owes is the EXPLICIT close: if nobody has bound by the
+    # time the mint is about to be reserved, the attempt records a skip, so the
+    # durable row always says which of the two happened.
     relay = get_relay_hub().get(attempt_id)
-    try:
-        await relay.bind(relay_token)
-        intent_log.record_relay_bound(subscriber_id=attempt_id, bound_at=time.time())
-    except Exception:
-        # An unbound relay is an explicit SKIP, never an implicit one: the
-        # handshake state must say which happened before the mint is reserved.
+    if not relay.is_bound:
         await relay.mark_skipped()
-        intent_log.record_relay_skipped(skipped_at=time.time())
 
     answer: Optional[AcceptedAnswer] = None
     try:
@@ -524,6 +549,22 @@ async def _drive_composed_turn(
                 final_text=answer.text,
             )
         )
+        await custody.settle()
+        # D11 BUILD STOP. `released_to_origin` means the BROWSER's copy of the
+        # conversation POST also reached the origin after Python had already
+        # invoked it: two sends for one mint, which is the outcome Amendment D
+        # exists to prevent. It is never recoverable and never publishable.
+        if RouteDisposition.RELEASED_TO_ORIGIN in (disposition, holder.disposition):
+            intent_log.record_ack_unknown(
+                route_disposition=RouteDisposition.RELEASED_TO_ORIGIN.value,
+                page_disposition="open",
+            )
+            raise RunnerError(
+                RunnerErrorCode.SUBMIT_UNKNOWN,
+                "D11 build stop: the held browser copy was released to the origin after "
+                "the Python invocation — two sends for one mint",
+                delivery_state=DeliveryState.ACK_UNKNOWN,
+            )
         if disposition is RouteDisposition.FULFILLED:
             intent_log.transition(AttemptState.BROWSER_FULFIL)
         else:
@@ -569,6 +610,44 @@ async def _drive_composed_turn(
             await connector_listener.stop()
         with contextlib.suppress(Exception):
             await context.close()
+
+
+def _wire_request_events(page: Any, custody: _HeldRouteCustody, request: Any) -> None:
+    """Feed the page's PUBLIC request events for the held request into the holder.
+
+    Without this the D1 disposition oracle is blind in production. ``HeldRoute``
+    decides `released_to_origin` vs `fulfilled` vs `lost` from
+    ``requestfailed`` / ``requestfinished`` / ``response`` on the held request —
+    and ``released_to_origin`` after a Python invocation is D11's build stop. A
+    composition that never called ``observe()`` could not detect the one outcome
+    the whole amendment exists to prevent, so the arms would be proving a
+    property production does not have.
+
+    Only PUBLIC Playwright events are used; no private field is inspected.
+    """
+
+    def _make(event_name: str) -> Any:
+        def _on(payload: Any) -> None:
+            observed = getattr(payload, "request", payload)
+            if observed is not request and getattr(observed, "url", None) != getattr(
+                request, "url", None
+            ):
+                return
+            custody.events.append(event_name)
+            custody.pending.append(asyncio.ensure_future(_observe(custody, event_name)))
+
+        return _on
+
+    for name in ("requestfailed", "requestfinished", "response"):
+        with contextlib.suppress(Exception):
+            page.on(name, _make(name))
+
+
+async def _observe(custody: _HeldRouteCustody, event_name: str) -> None:
+    holder = custody.holder
+    if holder is None:  # pragma: no cover - defensive
+        return
+    await holder.observe(event_name)
 
 
 def _detached_get(captured: Any) -> Any:

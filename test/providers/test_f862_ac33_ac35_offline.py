@@ -507,3 +507,75 @@ def test_ac35_send_once_is_the_only_origin_post_in_the_runner() -> None:
         if "session.post(" in text:
             posting.append(path.name)
     assert posting == ["api_drive.py"], posting
+
+
+# =====================================================================
+# D11 — the build stop is reachable from production, not only from the arms
+# =====================================================================
+
+
+def test_d11_production_wires_the_disposition_oracle() -> None:
+    """``observe()`` must be reachable from the composed path.
+
+    ``HeldRoute`` decides `released_to_origin` from PUBLIC Playwright request
+    events. A composition that never fed them could not detect the one outcome
+    Amendment D exists to prevent, and every arm proving the oracle works would
+    be proving a property production does not have.
+    """
+    text = Path(production.__file__).read_text(encoding="utf-8")
+    assert "_wire_request_events(page, custody" in text
+    assert 'for name in ("requestfailed", "requestfinished", "response")' in text
+    assert "holder.observe(event_name)" in text
+
+
+def test_d11_released_to_origin_is_a_hard_stop_in_production() -> None:
+    """The build-stop branch refuses; it does not warn and continue."""
+    text = Path(production.__file__).read_text(encoding="utf-8")
+    assert "D11 build stop" in text
+    stop = text.index("D11 BUILD STOP")
+    # Between the detection and the next state transition there is a raise.
+    assert "raise RunnerError(" in text[stop : stop + 1500]
+
+
+def test_d11_the_oracle_distinguishes_a_release_from_a_local_fulfil() -> None:
+    """The distinction the build stop rests on, asserted directly.
+
+    A ``response`` observed while the route is still HELD is the browser's copy
+    reaching the origin. The same event during a local fulfil terminates as
+    FULFILLED. If these collapsed, D11 could never fire.
+    """
+    from cli_agent_orchestrator.chatgpt_web_runner.in_page_transport import (
+        HeldRoute,
+        RouteDisposition,
+        RouteGenerations,
+    )
+
+    gens = RouteGenerations(page=1, context=1, cdp_session=1)
+
+    class _Route:
+        async def fulfill(self, **kwargs):
+            return None
+
+    async def _live() -> None:
+        await asyncio.sleep(3600)
+
+    async def _run() -> tuple:
+        owner = asyncio.ensure_future(_live())
+        try:
+            released = HeldRoute(
+                _Route(), object(), attempt_id="a", generations=gens, owner_task=owner
+            )
+            first = await released.observe("response")
+
+            fulfilled = HeldRoute(
+                _Route(), object(), attempt_id="b", generations=gens, owner_task=owner
+            )
+            await fulfilled.fulfil(body=b"local")
+            second = await fulfilled.observe("response")
+            return first, second
+        finally:
+            owner.cancel()
+
+    released_disposition, fulfilled_disposition = asyncio.run(_run())
+    assert released_disposition is RouteDisposition.RELEASED_TO_ORIGIN
+    assert fulfilled_disposition is RouteDisposition.FULFILLED
