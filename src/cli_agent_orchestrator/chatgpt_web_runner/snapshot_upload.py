@@ -1,15 +1,20 @@
-"""Bundle framing, manifest, size bounds, and attachment identity (D8, D3).
+"""Digest helpers and same-origin read containment (D3/AC-11b).
 
-Pure logic: builds the pinned manifest, enforces the tested attachment envelope
-(AC-10), computes and verifies the attachment identity tuple (AC-9), and owns the
-same-origin read-containment predicates (AC-11b). No browser import.
+Amendment D deleted this module's original subject. The pushed review bundle is
+gone (D10): there is no upload, so there is no attachment envelope to bound
+(AC-10), no attachment identity tuple to compute or verify (AC-9) and no
+upload-chip readiness to calibrate. The model reads the reviewed source through
+the read-only connector instead (see ``source_pull``).
+
+What survives is what Amendment D retains: the two digest helpers and the
+same-origin read-containment predicates that keep the page from reading anything
+but its own conversation, plus the request-time platform-API denial. No browser
+import.
 """
 
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
-from typing import Optional
 from urllib.parse import urlparse
 
 from cli_agent_orchestrator.chatgpt_web_runner.errors import (
@@ -18,23 +23,8 @@ from cli_agent_orchestrator.chatgpt_web_runner.errors import (
     RunnerErrorCode,
 )
 
-#: The ONE tested attachment envelope (D8/AC-10). NOT a proven maximum — a larger
-#: pack is refused with a typed error; never split, truncated or summarized.
-MAX_BUNDLE_BYTES = 199_627
-MAX_BUNDLE_LINES = 4_335
-
 #: The only origin the runner may read from (D3/AC-11b).
 ALLOWED_ORIGIN = "chatgpt.com"
-
-#: The two calibrated attachment-readiness signals (D8, upload-probe.md). The
-#: chip's filename and its "Document" label, stable from ~2s. The composer
-#: attachment testid / spinner / percentage signals are NOT permitted until a
-#: fresh probe calibrates them (they timed out and sent nothing, exit 8).
-READINESS_SIGNAL_FILENAME = "filename_chip"
-READINESS_SIGNAL_DOCUMENT_LABEL = "document_label"
-CALIBRATED_READINESS_SIGNALS: frozenset[str] = frozenset(
-    {READINESS_SIGNAL_FILENAME, READINESS_SIGNAL_DOCUMENT_LABEL}
-)
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -43,127 +33,6 @@ def sha256_bytes(data: bytes) -> str:
 
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-@dataclass(frozen=True)
-class AttachmentIdentity:
-    """The D8 attachment identity tuple, recorded in the manifest before upload.
-
-    A run is accepted only when this recorded tuple matches the manifest AND
-    exactly one attachment is present on the submitted turn. The model's ability
-    to quote file content is a transport diagnostic and never establishes
-    identity (D8).
-    """
-
-    file_sha256: str
-    byte_length: int
-    line_count: int
-    submitted_filename: str
-    composer_attachment_ref: Optional[str] = None
-
-    def matches_manifest(self, manifest: "AttachmentIdentity") -> bool:
-        """Byte-level identity match against the pre-upload MANIFEST (D8/AC-9).
-
-        The manifest is recorded BEFORE upload and carries no composer-side
-        reference, so this compares only the four byte-level fields. The
-        composer-side reference is verified separately by
-        :func:`verify_attachment_on_turn` (non-empty on the submitted turn, and
-        equal to the attach-time reference when one is supplied).
-        """
-        return (
-            self.file_sha256 == manifest.file_sha256
-            and self.byte_length == manifest.byte_length
-            and self.line_count == manifest.line_count
-            and self.submitted_filename == manifest.submitted_filename
-        )
-
-
-def build_attachment_identity(data: bytes, submitted_filename: str) -> AttachmentIdentity:
-    """Compute the pre-upload identity of a bundle's bytes (D8)."""
-    text = data.decode("utf-8")  # raises on non-UTF-8: bundles are UTF-8 (D8)
-    line_count = text.count("\n") + (0 if text.endswith("\n") or not text else 1)
-    return AttachmentIdentity(
-        file_sha256=sha256_bytes(data),
-        byte_length=len(data),
-        line_count=line_count,
-        submitted_filename=submitted_filename,
-    )
-
-
-def enforce_bundle_bounds(data: bytes) -> None:
-    """Refuse an over-limit bundle with a typed error; no split/truncate (AC-10)."""
-    if len(data) > MAX_BUNDLE_BYTES:
-        raise RunnerError(
-            RunnerErrorCode.CONTEXT_TOO_LARGE,
-            f"bundle {len(data)} bytes exceeds tested envelope {MAX_BUNDLE_BYTES}",
-            delivery_state=DeliveryState.NOTHING_SENT,
-        )
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise RunnerError(
-            RunnerErrorCode.CONTEXT_TOO_LARGE,
-            f"bundle is not valid UTF-8: {exc.reason}",
-            delivery_state=DeliveryState.NOTHING_SENT,
-        ) from exc
-    lines = text.count("\n") + (0 if text.endswith("\n") or not text else 1)
-    if lines > MAX_BUNDLE_LINES:
-        raise RunnerError(
-            RunnerErrorCode.CONTEXT_TOO_LARGE,
-            f"bundle {lines} lines exceeds tested envelope {MAX_BUNDLE_LINES}",
-            delivery_state=DeliveryState.NOTHING_SENT,
-        )
-
-
-def verify_attachment_on_turn(
-    manifest: AttachmentIdentity,
-    observed: AttachmentIdentity,
-    attachment_count: int,
-    *,
-    expected_ref: "str | None" = None,
-) -> None:
-    """AC-9: reject a submitted turn whose attachment identity does not match the
-    manifest, carries no composer-side reference, or carries more/fewer than one
-    attachment.
-
-    ``manifest`` is the pre-upload byte record. ``observed`` is the identity read
-    from the submitted turn — it MUST carry a non-empty composer-side reference.
-    ``expected_ref`` (when given) is the reference recorded at attach time; the
-    observed reference must equal it (the r2 adversarial ref-A vs ref-B fixture).
-    """
-    if attachment_count != 1:
-        raise RunnerError(
-            RunnerErrorCode.ATTACHMENT_IDENTITY,
-            f"expected exactly one attachment, saw {attachment_count}",
-            delivery_state=DeliveryState.NOTHING_SENT,
-        )
-    if not observed.composer_attachment_ref:
-        raise RunnerError(
-            RunnerErrorCode.ATTACHMENT_IDENTITY,
-            "submitted turn carries no composer-side attachment reference",
-            delivery_state=DeliveryState.NOTHING_SENT,
-        )
-    if expected_ref is not None and observed.composer_attachment_ref != expected_ref:
-        raise RunnerError(
-            RunnerErrorCode.ATTACHMENT_IDENTITY,
-            "submitted composer-side reference differs from the attach-time reference",
-            delivery_state=DeliveryState.NOTHING_SENT,
-        )
-    if not observed.matches_manifest(manifest):
-        raise RunnerError(
-            RunnerErrorCode.ATTACHMENT_IDENTITY,
-            "submitted attachment identity does not match the manifest (byte fields)",
-            delivery_state=DeliveryState.NOTHING_SENT,
-        )
-
-
-def readiness_reached(present_signals: "frozenset[str] | set[str]") -> bool:
-    """AC-9: an attachment is ready only when BOTH calibrated signals are seen.
-
-    A decorative spinner or a percentage is NOT a permitted signal — if the two
-    calibrated signals are absent the caller returns ``upload_unconfirmed``
-    BEFORE pressing Enter (never after a spinner deadline elapsed)."""
-    return CALIBRATED_READINESS_SIGNALS.issubset(set(present_signals))
 
 
 # --- Same-origin read containment (D3 / AC-11b) ---------------------------------

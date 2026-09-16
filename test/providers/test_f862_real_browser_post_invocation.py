@@ -31,8 +31,10 @@ from test.fixtures.chatgpt_web_fake_origin import FakeOrigin
 from test.fixtures.chatgpt_web_real_browser import (
     HeldRouteSession,
     RealBrowserHarness,
+    browser_skip_condition,
     chromium_available,
     chromium_unavailable_reason,
+    enforce_browser_requirement,
 )
 from typing import Any, Optional
 
@@ -61,13 +63,26 @@ from cli_agent_orchestrator.chatgpt_web_runner.stream_relay import AttemptRelay
 pytestmark = [
     pytest.mark.e2e,
     pytest.mark.slow,
+    # The CI arm's selector: `-m browser_oracle` runs exactly these two modules
+    # without having to re-enable every e2e+slow test in the suite.
+    pytest.mark.browser_oracle,
     pytest.mark.asyncio,
     pytest.mark.xdist_group("f862-real-browser"),
+    # Skips only an EXPLORATORY run. Under CAO_F862_REQUIRE_BROWSER the
+    # condition goes False so the arms run and the autouse guard below
+    # fails them loudly (B1 review fix 2).
     pytest.mark.skipif(
-        not chromium_available(),
+        browser_skip_condition(),
         reason=f"real-browser oracle needs Chromium: {chromium_unavailable_reason()}",
     ),
 ]
+
+
+@pytest.fixture(autouse=True)
+def _browser_verdict_guard() -> None:
+    """A verdict run may not be satisfied by skips (B1 review fix 2)."""
+    enforce_browser_requirement()
+
 
 EVIDENCE_PATH = os.environ.get("CAO_F862_EVIDENCE")
 

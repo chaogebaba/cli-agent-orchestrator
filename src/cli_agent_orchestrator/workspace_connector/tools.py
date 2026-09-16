@@ -22,7 +22,7 @@ projection (tool, path/query, digest or refusal code, time — never bodies).
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from cli_agent_orchestrator.workspace_connector import budgets as budgets_mod
 from cli_agent_orchestrator.workspace_connector.audit import AttemptAudit
@@ -98,19 +98,26 @@ class WorkspaceTools:
         budget: budgets_mod.PullBudget,
         reviewed_commit: str | None = None,
         base_commit: str | None = None,
+        token_fingerprint: Callable[[], str] | None = None,
     ) -> None:
         self.workspace = workspace
         self.audit = audit
         self.budget = budget
         self.reviewed_commit = reviewed_commit
         self.base_commit = base_commit
+        # AC-33: resolves the CURRENT request's access-token fingerprint so the
+        # audit projection can prove that every accepted read rode one token.
+        # In-process callers (tests, stdio) have none and record an empty one.
+        self._token_fingerprint = token_fingerprint or (lambda: "")
 
     # ---- guards -----------------------------------------------------------
 
     def _budget_gate(self, tool: str, subject: str) -> ToolOutcome | None:
         refused = self.budget.check()
         if refused:
-            self.audit.refusal(tool=tool, subject=subject, code=refused)
+            self.audit.refusal(
+                tool=tool, subject=subject, code=refused, token_fingerprint=self._fingerprint()
+            )
             return _fail(refused, "The attempt's aggregate pull budget is exhausted.")
         return None
 
@@ -124,18 +131,34 @@ class WorkspaceTools:
         # ``None`` is reserved for trusted in-process callers.  HTTP wrappers
         # always pass the authenticated token's tuple, including an empty one.
         if scopes is not None and need not in scopes:
-            self.audit.refusal(tool=tool, subject=subject, code=INSUFFICIENT_SCOPE)
+            self.audit.refusal(
+                tool=tool,
+                subject=subject,
+                code=INSUFFICIENT_SCOPE,
+                token_fingerprint=self._fingerprint(),
+            )
             return _fail(INSUFFICIENT_SCOPE, f"This operation requires the '{need}' scope.")
         return None
+
+    def _fingerprint(self) -> str:
+        """The current request's access-token fingerprint, never the token."""
+        try:
+            return str(self._token_fingerprint() or "")
+        except Exception:  # pragma: no cover - a resolver must never break a read
+            return ""
 
     def _record(self, tool: str, subject: str, data: dict[str, Any]) -> ToolOutcome:
         digest = data.get("contentDigest")
         code = digest if isinstance(digest, str) else content_digest(canonical_result_bytes(data))
-        self.audit.record(tool=tool, subject=subject, digest_or_code=code)
+        self.audit.record(
+            tool=tool, subject=subject, digest_or_code=code, token_fingerprint=self._fingerprint()
+        )
         return _ok(data)
 
     def _map_error(self, tool: str, subject: str, exc: WorkspaceError) -> ToolOutcome:
-        self.audit.refusal(tool=tool, subject=subject, code=exc.code)
+        self.audit.refusal(
+            tool=tool, subject=subject, code=exc.code, token_fingerprint=self._fingerprint()
+        )
         return _fail(exc.code, exc.message)
 
     # ---- tools ------------------------------------------------------------

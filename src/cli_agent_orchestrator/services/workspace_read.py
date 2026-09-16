@@ -28,6 +28,7 @@ from cli_agent_orchestrator.workspace_connector.http_server import (
     DEFAULT_HOST,
     DEFAULT_PORT,
     ConnectorServer,
+    token_fingerprint,
 )
 from cli_agent_orchestrator.workspace_connector.oauth import OAuthService
 from cli_agent_orchestrator.workspace_connector.pairing import PairingManager
@@ -60,6 +61,9 @@ def bind_attempt(
         budget=budget,
         reviewed_commit=reviewed_commit,
         base_commit=base_commit,
+        # AC-33: every audit row names the access token that produced it, so the
+        # runner can prove the one-token/one-generation invariant.
+        token_fingerprint=token_fingerprint,
     )
     if state_dir is not None:
         store = AuthStore(

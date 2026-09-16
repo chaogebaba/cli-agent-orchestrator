@@ -3,13 +3,21 @@
 ``ChatGptWebProvider`` launches this in the worker's tmux pane
 (``python -m cli_agent_orchestrator.chatgpt_web_runner``). It prints
 ``[chatgpt_web] READY`` and then reads ONE task from stdin (the pasted dispatch
-body). The task's first line names the pinned artifact and, optionally, a bundle
-file to attach:
+body). The task's header names the pinned artifact and the attempt's PULL
+context — Amendment D deleted the pushed ``BUNDLE:`` attachment (D10), so the
+model reads the reviewed source through the read-only connector instead:
 
-    ARTIFACT: /abs/path/to/pinned-artifact.md
-    BUNDLE: /abs/path/to/bundle.txt        (optional — attach + design_findings)
+    ARTIFACT:  /abs/path/to/pinned-artifact.md
+    WORKTREE:  /abs/path/to/frozen-read-only-worktree   (optional)
+    COMMIT:    <reviewed commit>                        (optional)
+    BASE:      <base commit>                            (optional)
+    SOURCE:    relative/path/inside/the/worktree        (repeatable)
     <blank line>
     <the findings/plain prompt to send>
+
+Each ``SOURCE:`` line adds one path to the allowlisted manifest the attempt's
+access token is bound to; a read outside it is refused
+``PATH_NOT_IN_MANIFEST`` by the connector, not merely discouraged by the prompt.
 
 It runs the D2 anchor sequence via :func:`production.run_production_review` as the
 WORKER (env ``CAO_TERMINAL_ID`` / ``CAO_TERMINAL_TOKEN`` / ``CAO_ENDPOINT`` /
@@ -25,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -36,26 +45,58 @@ def _marker(text: str) -> None:
     sys.stdout.flush()
 
 
-def _parse_task(raw: str) -> tuple[str, Optional[str], str]:
-    """Return (artifact_path, bundle_path|None, prompt) from the task body."""
-    artifact = ""
-    bundle: Optional[str] = None
+@dataclass(frozen=True)
+class ParsedTask:
+    """The dispatch header: the pinned artifact plus the attempt's pull context."""
+
+    artifact_path: str
+    prompt: str
+    source_manifest: tuple[str, ...] = ()
+    frozen_worktree: Optional[str] = None
+    reviewed_commit: Optional[str] = None
+    base_commit: Optional[str] = None
+
+
+_HEADERS = {
+    "ARTIFACT": "artifact",
+    "WORKTREE": "worktree",
+    "COMMIT": "commit",
+    "BASE": "base",
+    "SOURCE": "source",
+}
+
+
+def _parse_task(raw: str) -> ParsedTask:
+    """Parse the dispatch header. ``BUNDLE:`` is gone with the upload path."""
+    fields: dict[str, str] = {}
+    sources: list[str] = []
     lines = raw.splitlines()
     body_start = 0
-    for i, line in enumerate(lines):
-        s = line.strip()
-        if s.upper().startswith("ARTIFACT:"):
-            artifact = s.split(":", 1)[1].strip()
-        elif s.upper().startswith("BUNDLE:"):
-            bundle = s.split(":", 1)[1].strip() or None
-        elif s == "":
-            body_start = i + 1
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        key = stripped.split(":", 1)[0].strip().upper() if ":" in stripped else ""
+        if key in _HEADERS:
+            value = stripped.split(":", 1)[1].strip()
+            if key == "SOURCE":
+                if value:
+                    sources.append(value)
+            elif value:
+                fields[_HEADERS[key]] = value
+            continue
+        if stripped == "":
+            body_start = index + 1
             break
-        else:
-            body_start = i
-            break
+        body_start = index
+        break
     prompt = "\n".join(lines[body_start:]).strip()
-    return artifact, bundle, prompt
+    return ParsedTask(
+        artifact_path=fields.get("artifact", ""),
+        prompt=prompt,
+        source_manifest=tuple(sources),
+        frozen_worktree=fields.get("worktree"),
+        reviewed_commit=fields.get("commit"),
+        base_commit=fields.get("base"),
+    )
 
 
 def main() -> int:
@@ -87,8 +128,8 @@ def main() -> int:
         _marker("ERROR no_task")
         return 1
 
-    artifact, bundle, prompt = _parse_task(raw)
-    if not artifact or not prompt:
+    task = _parse_task(raw)
+    if not task.artifact_path or not task.prompt:
         _marker("ERROR malformed_task")
         return 1
 
@@ -98,7 +139,12 @@ def main() -> int:
 
     try:
         outcome = run_production_review(
-            task_text=prompt, artifact_path=artifact, bundle_path=bundle
+            task_text=task.prompt,
+            artifact_path=task.artifact_path,
+            source_manifest=list(task.source_manifest),
+            frozen_worktree=task.frozen_worktree,
+            reviewed_commit=task.reviewed_commit,
+            base_commit=task.base_commit,
         )
     except RunnerError as exc:
         _marker(f"CONDITION {exc.code.value}")

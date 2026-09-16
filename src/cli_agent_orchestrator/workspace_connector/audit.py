@@ -3,7 +3,9 @@
 The connector records, per attempt: tool name, path or query, result content
 digest or refusal code, and time — never the returned file body.  The
 projection is the verifier input for D5's branch correlation (run id + result
-digest).
+digest) and for AC-33's one-token/one-generation invariant, which is why each
+row also carries a non-reversible fingerprint of the access token that produced
+it.  Never the token, never a body.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ class AttemptAudit:
         subject: str,
         digest_or_code: str,
         detail: dict[str, Any] | None = None,
+        token_fingerprint: str = "",
     ) -> dict[str, Any]:
         with self._lock:
             self._sequence += 1
@@ -38,6 +41,12 @@ class AttemptAudit:
                 "subject": subject,  # canonical path or query — never a body
                 "result_digest": digest_or_code if digest_or_code.startswith("sha256:") else None,
                 "refusal_code": None if digest_or_code.startswith("sha256:") else digest_or_code,
+                # AC-33: which authenticated caller produced this row, as a
+                # NON-REVERSIBLE fingerprint of the presented access token.
+                # The runner's source-correlation verifier needs to know that
+                # every accepted read rode ONE reusable token inside one
+                # generation; the token itself never enters the projection.
+                "token_fingerprint": token_fingerprint or None,
                 "recorded_at": time.time(),
             }
             if detail:
@@ -45,8 +54,15 @@ class AttemptAudit:
             self.entries.append(entry)
             return dict(entry)
 
-    def refusal(self, *, tool: str, subject: str, code: str) -> dict[str, Any]:
-        return self.record(tool=tool, subject=subject, digest_or_code=code)
+    def refusal(
+        self, *, tool: str, subject: str, code: str, token_fingerprint: str = ""
+    ) -> dict[str, Any]:
+        return self.record(
+            tool=tool,
+            subject=subject,
+            digest_or_code=code,
+            token_fingerprint=token_fingerprint,
+        )
 
     def projection(self) -> list[dict[str, Any]]:
         """The audit projection: entries without bodies, by construction."""

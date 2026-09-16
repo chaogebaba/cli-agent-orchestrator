@@ -310,7 +310,10 @@ class ConnectorServer:
                 )
                 await response(scope, receive, send)
                 return
-            scope.setdefault("state", {})["scopes"] = verdict.scopes
+            state = scope.setdefault("state", {})
+            state["scopes"] = verdict.scopes
+            # AC-33: carry WHICH token this call rode, as a fingerprint only.
+            state["token_fingerprint"] = fingerprint_token(verdict.token or "")
             await mcp_app(scope, receive, send)
 
         routes = [
@@ -379,6 +382,29 @@ class ToolRefusalError(Exception):
 
 def _refusal(outcome: Any) -> ToolRefusalError:
     return ToolRefusalError(outcome.error or "INTERNAL_ERROR", outcome.message)
+
+
+def token_fingerprint() -> str:
+    """Non-reversible fingerprint of the request's access token (AC-33).
+
+    Set by the bearer guard on the ASGI scope state.  Twelve hex characters of
+    SHA-256 is enough to distinguish the tokens one attempt could hold while
+    being useless as a credential.  In-process callers have none.
+    """
+    from fastmcp.server.dependencies import get_http_request
+
+    try:
+        request = get_http_request()
+    except RuntimeError:
+        return ""
+    return str(getattr(request.state, "token_fingerprint", "") or "")
+
+
+def fingerprint_token(token: str) -> str:
+    """The one place a raw access token becomes an audit-safe identifier."""
+    import hashlib
+
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:12] if token else ""
 
 
 def _scopes() -> tuple[str, ...]:
