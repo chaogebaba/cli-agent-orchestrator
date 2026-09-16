@@ -203,6 +203,13 @@ class TerminalModel(Base):
     # splitting agent_profile (then the raw name). ``provider`` already exists
     # above (line ~151); F786 adds exactly this one column (A1).
     position = Column(String, nullable=True)
+    # WP-ACP-PLANE D21/AC-S1.16: the effort a CALLER asked for on this one
+    # worker, persisted as the request rather than as the answer.
+    # ``reasoning_effort`` above is the RESOLVED value written post-initialize;
+    # this is the top precedence layer that produced it, and keeping the two
+    # apart is what lets `cao diag` say whether an effort came from the call or
+    # from providers.toml.
+    requested_effort = Column(String, nullable=True)
     __table_args__ = (
         CheckConstraint(
             "lifecycle IN ('ephemeral','sticky')",
@@ -2018,12 +2025,34 @@ def init_db() -> None:
     # mailbox where evidence is unique; idempotent and provenance-audited. Runs
     # AFTER conversation_identity exists; appended LAST.
     _migrate_f829_a2_owner_backfill()
+    # WP-ACP-PLANE D21/AC-S1.16: the caller-requested effort. A plain ADD COLUMN
+    # and registered BEFORE the D20 rebuild below, which reads the LIVE table
+    # DDL — a column added after it would be dropped by the rebuild's copy.
+    _migrate_acp_requested_effort()
     # WP-ACP-PLANE D20 (AC-S1.10): the terminal ``transport`` column and the two
     # nullable tmux coordinates.  Appended LAST on purpose — it REWRITES the live
     # ``terminals`` DDL rather than re-declaring a column list, so it has to see
     # the final shape every ADD COLUMN migration above has produced.
     _migrate_d20_acp_transport()
 
+
+
+def _migrate_acp_requested_effort() -> None:
+    """WP-ACP-PLANE AC-S1.16: ``terminals.requested_effort``.
+
+    Guarded by ``PRAGMA table_info`` like every other additive column here, for
+    the reason the queue migrator states: ``ADD COLUMN`` is not idempotent, and a
+    second boot raising "duplicate column name" would fail the whole migration
+    run on every start.
+    """
+    from sqlalchemy import text as _text
+
+    with engine.begin() as connection:
+        columns = connection.execute(_text("PRAGMA table_info(terminals)")).mappings().all()
+        if columns and not any(row["name"] == "requested_effort" for row in columns):
+            connection.execute(
+                _text("ALTER TABLE terminals ADD COLUMN requested_effort TEXT DEFAULT NULL")
+            )
 
 
 def _d20_database_file() -> Path:
@@ -6234,6 +6263,7 @@ def create_terminal(
     root_admission: Optional["RootAdmission"] = None,
     require_live_caller: bool = False,
     transport: str = "pane",
+    requested_effort: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record.
 
@@ -6274,6 +6304,7 @@ def create_terminal(
             metadata_json=_json.dumps(metadata) if metadata else None,
             worktree_info=_json.dumps(worktree_info) if worktree_info else None,
             resolved_model=resolved_model,
+            requested_effort=requested_effort,
             auth_token=auth_token,
         )
         db.add(terminal)
@@ -6381,6 +6412,7 @@ def create_terminal(
             "tmux_session": terminal.tmux_session,
             "tmux_window": terminal.tmux_window,
             "transport": terminal.transport,  # WP-ACP-PLANE D20
+            "requested_effort": terminal.requested_effort,  # WP-ACP-PLANE AC-S1.16
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
             "working_directory": terminal.working_directory,
@@ -6721,6 +6753,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "tmux_session": terminal.tmux_session,
             "tmux_window": terminal.tmux_window,
             "transport": terminal.transport,  # WP-ACP-PLANE D20
+            "requested_effort": terminal.requested_effort,  # WP-ACP-PLANE AC-S1.16
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
             "working_directory": terminal.working_directory,

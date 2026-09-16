@@ -40,6 +40,7 @@ from cli_agent_orchestrator.services.settings_service import (
     get_provider_profile_defaults,
     get_server_settings,
     resolve_provider_string_option,
+    requested_effort_for_terminal,
     resolve_reasoning_effort,
 )
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -318,7 +319,11 @@ class GrokCliProvider(BaseProvider):
             command_parts.extend(["--reasoning-effort", reasoning_effort])
         # F777 (#634): persist the EFFECTIVE effort (same precedence, one helper).
         self._resolved_reasoning_effort = resolve_reasoning_effort(
-            "grok_cli", profile_defaults, provider_defaults, profile
+            "grok_cli",
+            profile_defaults,
+            provider_defaults,
+            profile,
+            requested=requested_effort_for_terminal(self.terminal_id),
         )
 
         system_prompt = profile.system_prompt if profile and profile.system_prompt else ""

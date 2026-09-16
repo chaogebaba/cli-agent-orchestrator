@@ -54,6 +54,7 @@ from cli_agent_orchestrator.services.settings_service import (
     get_provider_profile_defaults,
     get_server_settings,
     resolve_provider_string_option,
+    requested_effort_for_terminal,
     resolve_reasoning_effort,
 )
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -478,7 +479,13 @@ class ClineCliProvider(BaseProvider):
         profile_name = getattr(profile, "name", None) or self._agent_profile
         profile_key = getattr(profile, "position", None) or profile_name
         profile_defaults = get_provider_profile_defaults(provider_defaults, profile_key)
-        return resolve_reasoning_effort("cline_cli", profile_defaults, provider_defaults, profile)
+        return resolve_reasoning_effort(
+            "cline_cli",
+            profile_defaults,
+            provider_defaults,
+            profile,
+            requested=requested_effort_for_terminal(self.terminal_id),
+        )
 
     def _data_dir(self) -> Path:
         """Return this worker's sandbox data directory path."""

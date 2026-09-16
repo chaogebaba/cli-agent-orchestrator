@@ -224,11 +224,42 @@ _REASONING_EFFORT_KNOBS: Dict[str, Tuple[str, str, Optional[str]]] = {
 }
 
 
+def requested_effort_for_terminal(terminal_id: Optional[str]) -> Optional[str]:
+    """The ``effort`` a caller passed to ``assign`` for this terminal, or ``None``.
+
+    Read from the terminal row rather than threaded through six provider
+    constructors, and that is a deliberate trade.  The six providers resolve
+    effort at six different points in their launch — two of them from module
+    functions with no ``self`` — so a constructor parameter would have six
+    shapes, and a shape per provider is how a pass-through argument comes to be
+    honoured by four of them.  One persisted request, read by the one shared
+    helper, has a single shape and is auditable afterwards.
+
+    Never raises.  A terminal that does not exist, a database that cannot be
+    read, or a build that predates the column all mean "the caller said
+    nothing", and the precedence chain below is untouched — which is exactly
+    AC-S1.16's control: omitting ``effort`` changes nothing.
+    """
+    if not terminal_id:
+        return None
+    try:
+        from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+        row = get_terminal_metadata(terminal_id)
+    except Exception:  # noqa: BLE001 — a diagnosability read may not fail a launch
+        return None
+    if not row:
+        return None
+    value = row.get("requested_effort")
+    return value if isinstance(value, str) else None
+
+
 def resolve_reasoning_effort(
     provider: str,
     profile_defaults: Dict[str, Any],
     provider_defaults: Dict[str, Any],
     profile: Any,
+    requested: Optional[str] = None,
 ) -> Optional[str]:
     """Resolve the effective reasoning effort for *provider* (F777 #634).
 
@@ -239,13 +270,27 @@ def resolve_reasoning_effort(
     (suppresses the flag), yielding ``None``, the same as
     :func:`resolve_provider_string_option`.
 
+    ``requested`` is WP-ACP-PLANE D21/AC-S1.16's new top layer: the ``effort``
+    a caller passed to ``assign`` for this one worker.  It sits ABOVE the toml
+    for the same reason ``model`` does — an argument naming a specific worker is
+    more specific than configuration naming a whole profile — and it follows the
+    same clear rule, so ``effort=""`` suppresses the flag exactly as an empty
+    toml value does.  ``None`` means the caller said nothing, and the chain below
+    is untouched: AC-S1.16's fails-if is a parameter "accepted and silently
+    dropped", and its control is that omitting it changes NOTHING.
+
     Returns the string effort, or ``None`` when the provider has no effort knob,
     the toml clears it, or nothing specifies one and the provider has no
     built-in default. ``None`` is what the fleet EFFORT column renders as ``-``.
     """
     knob = _REASONING_EFFORT_KNOBS.get(provider)
     if knob is None:
+        # A provider with no effort knob ignores the request rather than failing:
+        # the same assign may be routed to a different provider by the routing
+        # table, and a hard error would make the argument provider-specific.
         return None
+    if requested is not None:
+        return requested or None
     toml_key, profile_attr, builtin = knob
     # A present key at any layer (even "") is authoritative: honour the clear.
     for defaults in (profile_defaults, provider_defaults):

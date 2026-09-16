@@ -7,7 +7,9 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import (
     Annotated,
@@ -755,6 +757,7 @@ def _create_terminal(
     barrier_member_key: Optional[str] = None,
     park_warm: bool = False,
     model: Optional[str] = None,
+    effort: Optional[str] = None,
     lifecycle: Literal["ephemeral", "sticky"] | None = None,
     use_worktree: Optional[bool] = None,
     authority_files: Optional[List[Dict[str, str]]] = None,
@@ -866,6 +869,13 @@ def _create_terminal(
             params["engine"] = engine
         if model and model.strip():
             params["model"] = model
+        # WP-ACP-PLANE D21/AC-S1.16.  ``is not None`` rather than truthiness,
+        # because ``effort=""`` is a MEANINGFUL request — it clears the flag,
+        # exactly as an empty providers.toml value does — and a truthiness test
+        # would silently drop the one value a caller uses to say "no effort
+        # flag at all".
+        if effort is not None:
+            params["effort"] = effort
         if use_worktree is not None:
             params["use_worktree"] = "true" if use_worktree else "false"
 
@@ -2521,6 +2531,7 @@ def _assign_impl(
     provider: Optional[str] = None,
     target_host: Optional[str] = None,
     ready_wait_seconds: float = 0.0,
+    effort: Optional[str] = None,
     callback_url: Optional[str] = None,
     remote_session_name: Optional[str] = None,
     resume_from: Optional[str] = None,
@@ -3330,6 +3341,7 @@ def _assign_impl(
             fork_context=fork_context,
             refresh_base_name=refresh_base_name,
             model=model,
+            effort=effort,
             lifecycle=lifecycle,
             use_worktree=use_worktree,
             authority_files=authority_files,
@@ -3593,6 +3605,16 @@ async def assign(
         description="Deliver the task without expecting a callback",
     ),
     model: Optional[str] = Field(default=None, description=_model_field_desc),
+    effort: Optional[str] = Field(
+        default=None,
+        description=(
+            "Reasoning effort for this ONE worker (e.g. 'low', 'medium', 'high'). "
+            "Highest precedence: it overrides [<provider>.profiles.<name>], "
+            "[<provider>] and the profile field, exactly as `model` does. An "
+            "empty string clears the flag. Omit it and nothing changes. "
+            "Ignored by a provider with no effort knob."
+        ),
+    ),
     lifecycle: Literal["ephemeral", "sticky"] | None = Field(
         default=None,
         description="Worker lifecycle; profile default applies when omitted",
@@ -3647,6 +3669,7 @@ async def assign(
         park_warm,
         model,
         lifecycle,
+        effort=effort,
         engine=engine,
         use_worktree=use_worktree,
         authority_files=authority_files,
@@ -4493,6 +4516,54 @@ async def list_messages(
         original_receiver_id,
         audit_browse,
     )
+
+
+@mcp.tool(
+    name="list",
+    description=(
+        "What is outstanding for this seat: in-flight callback ids, and cuts an "
+        "interrupt left unresolved. The BARE surface's only read tool."
+    ),
+)
+async def list_outstanding(
+    limit: int = Field(default=25, ge=1, le=100, description="Maximum outstanding ids to return"),
+) -> Dict[str, Any]:
+    """A2.9(v) — outstanding ids and unresolved/recent cuts, for a BARE seat.
+
+    This is the tool a freshly launched REPLACEMENT seat calls first.  D6b's
+    no-resume ruling says plainly that when a seat's subprocess dies its
+    conversation is lost and a cold session restores nothing — but the JOURNAL is
+    the replacement's context, and this is how it reads it: the callback ids its
+    predecessor still owed, and the turns an interrupt cut without an explicit
+    ``supersedes`` link, which are the two things nobody else can reconstruct.
+
+    Deliberately NARROW.  A BARE seat gets five tools and this is the only one
+    that reads, so the temptation is to make it a general query surface.  It is
+    not: it answers "what is unfinished here", and everything else belongs to
+    the SKILL surface or to ``cao diag``.  Widening it is how BARE stops being
+    the mode that must always work.
+
+    An unresolved cut is derived from the INTERRUPT, never from the cut row: the
+    cut row's own delivery attempt stays ``DELIVERED`` and its presentation stays
+    immutable (A2.3/I3), so the warning lives on the interrupt that caused it.
+
+    The Python name is ``list_outstanding`` and the TOOL name is ``list``.  A
+    module-level ``def list`` would shadow the builtin for every other function
+    in this 6,000-line module, which is a defect waiting on the first
+    ``list(...)`` call below it.
+    """
+    terminal_id = os.environ.get("CAO_TERMINAL_ID")
+    if not terminal_id:
+        return {"error": "no_terminal", "how": "CAO_TERMINAL_ID must be set"}
+    response = cao_http.get(f"/terminals/{terminal_id}/outstanding", params={"limit": limit})
+    if response.status_code == 404:
+        # An older cao-server has no such route.  Degrade to the empty answer
+        # with a named reason rather than raising: a BARE seat with no doctrine
+        # has nothing to interpret a stack trace with, and "nothing outstanding"
+        # would be a LIE, so the reason is carried instead.
+        return {"outstanding": [], "unresolved_cuts": [], "unavailable": "route_absent"}
+    response.raise_for_status()
+    return response.json()
 
 
 @mcp.tool()
@@ -6608,6 +6679,97 @@ class _DeterministicToolOrder(_Middleware):
 
 
 mcp.add_middleware(_DeterministicToolOrder())
+
+
+# ---------------------------------------------------------------------------
+# WP-ACP-PLANE D21 — the tool surface is MODE-SCOPED PER PROCESS, fixed at launch.
+#
+# Two modes sit on top of one message plane, and BARE is the one that must
+# always work (D0).  A BARE supervisor is any CLI driving CAO with no doctrine
+# loaded, and it needs five tools: three to dispatch and route, one to see what
+# is outstanding, and one to pull a skill body as TEXT if it wants one.  SKILL
+# mode is the whole surface, for a seat that has loaded the orchestration
+# doctrine and works in its vocabulary.
+#
+# **Per PROCESS, not per call.**  The mode is read once, at import, from
+# ``CAO_MCP_MODE`` or a ``--mode`` argument, and a non-BARE tool is then not
+# merely refused in BARE — it is NOT REGISTERED, so it never appears in
+# ``tools/list`` and a client cannot form a call to it.  AC-S1.11 asserts this
+# against a SPAWNED PROCESS for exactly that reason: a test over the imported
+# module would pass against a per-call check while the import-time gate did
+# nothing, and the import-time gate is the one that makes the surface a
+# property of the process rather than of each request.
+#
+# Default BARE.  The plane is infrastructure first; a deployment that wants the
+# doctrine surface asks for it.
+# ---------------------------------------------------------------------------
+
+#: The five BARE tools (D21).  ``assign``, ``send_message`` and ``handoff`` are
+#: dispatch; ``list`` is A2.9(v)'s outstanding-ids and unresolved-cuts view, which
+#: is what lets a freshly launched replacement seat see what its predecessor left
+#: behind; ``load_skill`` returns doctrine TEXT, never tools — the U-K loader is
+#: explicitly not a way for BARE to grow a SKILL surface.
+BARE_MODE_TOOLS: frozenset[str] = frozenset(
+    {"assign", "send_message", "handoff", "list", "load_skill"}
+)
+
+_MODE_ENV_VAR = "CAO_MCP_MODE"
+
+
+def _resolve_surface_mode(argv: list[str], environ: Mapping[str, str]) -> str:
+    """``bare`` or ``skill``, resolved once at import.
+
+    Argv beats the environment, because ``cao launch --mode skill`` is the more
+    specific statement and an inherited ``CAO_MCP_MODE`` from a parent process is
+    the less specific one.  An unrecognised value resolves to ``bare`` rather
+    than raising: this runs at import in a server whose boot must not be
+    self-inflicted-failed by a configuration typo, and BARE is the safe
+    direction — a missing tool is visible, an unexpectedly exposed one is not.
+    """
+    for index, token in enumerate(argv):
+        if token == "--mode" and index + 1 < len(argv):
+            candidate = argv[index + 1].strip().lower()
+            return candidate if candidate in ("bare", "skill") else "bare"
+        if token.startswith("--mode="):
+            candidate = token.split("=", 1)[1].strip().lower()
+            return candidate if candidate in ("bare", "skill") else "bare"
+    candidate = (environ.get(_MODE_ENV_VAR) or "").strip().lower()
+    return candidate if candidate in ("bare", "skill") else "bare"
+
+
+SURFACE_MODE = _resolve_surface_mode(list(sys.argv[1:]), os.environ)
+
+
+def _apply_surface_mode(server: FastMCP, mode: str) -> tuple[str, ...]:
+    """Remove every non-BARE tool when the process is in BARE mode.
+
+    A prune after registration rather than a conditional decorator on 46 call
+    sites.  The effect is the same — the tool is absent from ``tools/list`` and
+    unreachable — and the cost of the alternative is 46 opportunities to forget,
+    which is the failure mode D21's own collision row names: "every new tool must
+    declare its mode; the AC-S1.11 count test fails an undeclared one".
+
+    Returns the names removed, so a caller can log the surface it built.
+    """
+    if mode != "bare":
+        return ()
+    from fastmcp.tools import Tool as _Tool
+
+    provider = server.local_provider
+    registered = sorted(
+        component.name
+        for component in provider._components.values()
+        if isinstance(component, _Tool)
+    )
+    removed: list[str] = []
+    for name in registered:
+        if name not in BARE_MODE_TOOLS:
+            provider.remove_tool(name)
+            removed.append(name)
+    return tuple(removed)
+
+
+_REMOVED_IN_BARE = _apply_surface_mode(mcp, SURFACE_MODE)
 
 
 def main():

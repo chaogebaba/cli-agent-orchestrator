@@ -222,6 +222,9 @@ CREATE TABLE IF NOT EXISTS delivery_msg (
   legacy_message_id  INTEGER,
   urgency            TEXT NOT NULL DEFAULT 'normal',
   urgency_rank       INTEGER NOT NULL DEFAULT 1,
+  busy_since         TEXT,
+  busy_accumulated_s REAL NOT NULL DEFAULT 0,
+  effective_dead_by  TEXT,
   created_at         TEXT NOT NULL,
   terminated_at      TEXT)
 """
@@ -538,6 +541,25 @@ ADDITIVE_COLUMNS: tuple[tuple[str, str, str], ...] = (
     # exactly the order it had.
     ("delivery_msg", "urgency", "TEXT NOT NULL DEFAULT 'normal'"),
     ("delivery_msg", "urgency_rank", "INTEGER NOT NULL DEFAULT 1"),
+    # WP-ACP-PLANE D7.3 — the busy-paused lifetime clock.
+    #
+    # ``busy_since`` is an OPEN episode's marker and ``busy_accumulated_s`` is the
+    # closed total.  The pair, not a single running number, because the property
+    # AC-S1.13 asserts is that closing an episode ADDS ITS ELAPSED INTERVAL —
+    # r2's bug discarded it — and a single column cannot say whether an episode
+    # is currently open.
+    #
+    # ``effective_dead_by`` is the LIFETIME_LAW's answer, MAINTAINED rather than
+    # computed in SQL.  Two reasons, both load-bearing: the law branches on
+    # whether the deadline is caller-set, which is an expression SQLite would
+    # have to repeat at every predicate site (and the two sites have already
+    # disagreed once — AC-S1.15 asserts both); and a maintained column is
+    # indexable, while ``dead_by + min(busy, cap)`` is not.  It is written by the
+    # ledger close ALONE, from ``core.interrupt.effective_deadline``, so there is
+    # still exactly one authority for the arithmetic.
+    ("delivery_msg", "busy_since", "TEXT"),
+    ("delivery_msg", "busy_accumulated_s", "REAL NOT NULL DEFAULT 0"),
+    ("delivery_msg", "effective_dead_by", "TEXT"),
     # A1: the wake ordinal.  Lease periods in which this epoch was woken — the
     # durable half of I3's enforcement, the transport's content window being the
     # half a server bounce clears.
