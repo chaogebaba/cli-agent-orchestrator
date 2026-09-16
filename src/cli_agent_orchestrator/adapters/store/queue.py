@@ -93,6 +93,13 @@ _MSG_COLUMNS = (
     "is_notice, legacy_message_id, created_at, terminated_at"
 )
 
+#: WP-ACP-PLANE D7.3: the effective deadline is stamped EQUAL to the raw one at
+#: enqueue, and moves only when a busy episode closes.  Written here rather than
+#: left NULL so that a fresh row and a migrated row read identically at the two
+#: predicate sites, which is what keeps ``COALESCE`` a compatibility shim rather
+#: than a second rule.
+_EFFECTIVE_DEADLINE_AT_ENQUEUE = "effective_dead_by"
+
 _TERMINAL_VALUES = tuple(sorted(state.value for state in TERMINAL_STATES))
 
 
@@ -137,8 +144,9 @@ class SqliteQueueStore:
         try:
             with immediate_transaction(conn):
                 conn.execute(
-                    f"INSERT INTO delivery_msg ({_MSG_COLUMNS}) VALUES "
-                    "(" + ", ".join(["?"] * 29) + ") "
+                    f"INSERT INTO delivery_msg ({_MSG_COLUMNS}, "
+                    f"{_EFFECTIVE_DEADLINE_AT_ENQUEUE}) VALUES "
+                    "(" + ", ".join(["?"] * 30) + ") "
                     "ON CONFLICT(idempotency_key) DO NOTHING",
                     (
                         new_ulid(),
@@ -176,6 +184,13 @@ class SqliteQueueStore:
                         draft.legacy_message_id,
                         render_timestamp(now),
                         None,
+                        render_timestamp(
+                            compute_dead_by(
+                                created_at=now,
+                                available_at=now,
+                                expire_after_s=draft.expire_after_s,
+                            )
+                        ),
                     ),
                 )
                 row = conn.execute(
@@ -247,7 +262,16 @@ class SqliteQueueStore:
         claimed: list[QueueMessage] = []
 
         with immediate_transaction(conn):
-            where = "state = 'ready' AND available_at <= ? AND mode = 'live' AND dead_by > ?"
+            # WP-ACP-PLANE D7.3 / AC-S1.15: the claim predicate reads the
+            # EFFECTIVE deadline, so a row paused behind a busy ACP agent is
+            # still claimable for as long as its capped credit allows.
+            # ``COALESCE`` rather than a back-fill UPDATE: a row written before
+            # the column existed has no credit, and its effective deadline IS
+            # its raw one, so the migration stays a pure ``ADD COLUMN``.
+            where = (
+                "state = 'ready' AND available_at <= ? AND mode = 'live' "
+                "AND COALESCE(effective_dead_by, dead_by) > ?"
+            )
             params: list[object] = [stamp, stamp]
             if receiver_id is not None:
                 where += " AND receiver_id = ?"
@@ -408,7 +432,12 @@ class SqliteQueueStore:
 
             exhausted = conn.execute(
                 f"SELECT {_MSG_COLUMNS} FROM delivery_msg "
-                "WHERE state = 'ready' AND (attempts >= max_attempts OR dead_by <= ?)",
+                # The SECOND predicate site.  AC-S1.15 asserts every arm at BOTH,
+                # because r3's bug extended the bound at one of them only — and a
+                # row that is claimable but already dead, or dead but still
+                # claimable, is worse than either consistent answer.
+                "WHERE state = 'ready' AND "
+                "(attempts >= max_attempts OR COALESCE(effective_dead_by, dead_by) <= ?)",
                 (stamp,),
             ).fetchall()
             for row in exhausted:

@@ -45,6 +45,7 @@ from cli_agent_orchestrator.services.settings_service import (
     get_provider_profile_defaults,
     get_server_settings,
     resolve_provider_string_option,
+    requested_effort_for_terminal,
     resolve_reasoning_effort,
 )
 from cli_agent_orchestrator.utils import provider_plane
@@ -1684,7 +1685,7 @@ def _toml_override(key: str, value: Any) -> str:
 
 
 def _resolved_codex_profile_config(
-    profile: Any, profile_name: str | None = None
+    profile: Any, profile_name: str | None = None, terminal_id: str | None = None
 ) -> tuple[str | None, dict[str, Any], str | None]:
     """Single model/config/effort resolver shared by interactive and seed launches.
 
@@ -1731,8 +1732,17 @@ def _resolved_codex_profile_config(
     # Was the effort EXPLICITLY set (to a value or to "" = clear) by one of the
     # three shared layers? Presence of the key at any of them is authoritative;
     # this mirrors resolve_provider_string_option's own empty-clear semantics.
-    shared_effort = resolve_reasoning_effort("codex", profile_defaults, defaults, profile)
-    shared_explicit = _codex_effort_explicit(profile_defaults, defaults, profile)
+    # WP-ACP-PLANE AC-S1.16: a caller-supplied ``effort`` is the top layer and is
+    # therefore EXPLICIT — it must win over ``codexConfig.model_reasoning_effort``
+    # exactly as the three toml/profile layers do, or codex alone would ignore the
+    # argument the other five providers honour.
+    requested = requested_effort_for_terminal(terminal_id)
+    shared_effort = resolve_reasoning_effort(
+        "codex", profile_defaults, defaults, profile, requested=requested
+    )
+    shared_explicit = requested is not None or _codex_effort_explicit(
+        profile_defaults, defaults, profile
+    )
 
     if shared_explicit:
         # A shared layer decided it (value or clear). shared_effort is the
@@ -2289,6 +2299,9 @@ class CodexProvider(BaseProvider):
         """Create and validate a native Codex rollout without CAO coordinates."""
         profile = load_agent_profile(agent_profile)
         argv = [resolve_provider_binary("codex"), "exec", "--skip-git-repo-check", "-C", cwd]
+        # No ``terminal_id``: a seed-resume launch creates a native rollout with
+        # no CAO terminal behind it, so there is no caller request to honour and
+        # the ordinary toml/profile chain is the whole answer.
         model, config, _effort = _resolved_codex_profile_config(profile, agent_profile)
         if isinstance(model, str) and model:
             argv.extend(["--model", model])
@@ -2490,7 +2503,9 @@ class CodexProvider(BaseProvider):
         if self._supports_hook_trust_bypass():
             command_parts.append("--dangerously-bypass-hook-trust")
 
-        model, codex_config, effort = _resolved_codex_profile_config(profile, self._agent_profile)
+        model, codex_config, effort = _resolved_codex_profile_config(
+            profile, self._agent_profile, terminal_id=self.terminal_id
+        )
         resolved_model = self._model if self._model is not None else model
         self._resolved_model = resolved_model if resolved_model else None
         if resolved_model:

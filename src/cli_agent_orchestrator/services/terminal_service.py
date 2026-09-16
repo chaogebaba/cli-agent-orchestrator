@@ -1890,6 +1890,7 @@ async def create_terminal(
     engine: Optional[KiroEngine | str] = None,
     kiro_capability_probe: Optional[Callable[[KiroEngine, set[str]], KiroCapabilities]] = None,
     model: Optional[str] = None,
+    effort: Optional[str] = None,
     lifecycle: str | None = None,
     resume_session_id: Optional[str] = None,
     use_worktree: Optional[bool] = None,
@@ -2754,6 +2755,14 @@ async def create_terminal(
                                 get_server_settings()["artifact_validate_deadline_s"]
                             ),
                         }
+                    # WP-ACP-PLANE D21/AC-S1.16: persist the caller's requested
+                    # effort AT CREATION, because the provider resolves its own
+                    # effort during initialize and must be able to read the
+                    # request by then.  Folded into ``init_fields`` so all four
+                    # ``db_create_terminal`` call sites below carry it without
+                    # four separate edits that could disagree.
+                    if effort is not None:
+                        init_fields["requested_effort"] = effort
                     # F127: for kiro_cli, resolved_model is known pre-init; persist at creation
                     if provider == "kiro_cli" and model:
                         init_fields["resolved_model"] = model

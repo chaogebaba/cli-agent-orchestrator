@@ -3750,6 +3750,11 @@ async def create_session(
     memory_manager: Optional[str] = None,
     engine: Optional[KiroEngine] = None,
     model: Optional[str] = None,
+    # WP-ACP-PLANE D21/AC-S1.16: the caller's per-worker reasoning effort, a
+    # query param beside ``model`` because it is the same kind of thing — a
+    # per-call override of the providers.toml chain — and shipping it in the
+    # body would put one of the pair in each place.
+    effort: Optional[str] = None,
     # Fork field kept as a QUERY param (upstream absorb 2026-07-27): env_vars
     # moved from Body(embed=True) into CreateSessionBody, and the two are
     # alternate bindings for one payload -- not stackable. The
@@ -3878,6 +3883,7 @@ async def create_session(
             initial_message=initial_message,
             initial_message_orchestration_type=initial_message_orchestration_type,
             model=model,
+            effort=effort,
             lifecycle=body.lifecycle if body else None,
             resume_session_id=resume_session_id,
             group=body.group if body else None,
@@ -4677,6 +4683,7 @@ async def create_terminal_in_session(
     caller_id: Optional[TerminalId] = None,
     defer_init: bool = False,
     model: Optional[str] = None,
+    effort: Optional[str] = None,  # WP-ACP-PLANE D21/AC-S1.16
     use_worktree: Optional[bool] = None,
     terminal_id: Optional[str] = None,
     is_box_hosted: bool = False,
@@ -4948,6 +4955,7 @@ async def create_terminal_in_session(
                 ),
                 engine=engine,
                 model=model,
+                effort=effort,
                 use_worktree=use_worktree,
                 authority_files=(
                     _f829_resume_overrides.get("authority_files")
