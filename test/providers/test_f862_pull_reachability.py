@@ -546,8 +546,10 @@ def _port_is_closed(port: int) -> bool:
 def _early_failure_turn(tmp_path, monkeypatch, workspace: Path, attempt_id: str, *, break_at):
     """Drive the composed turn to a failure BEFORE the mint, and report the state.
 
-    Returns (port, code_path). The pull plane is up and the raw code is on disk
-    by the time ``break_at`` fires, so both must be gone when the turn unwinds.
+    Returns (port, code_path, observed). ``observed`` is what the break site saw
+    at the moment it fired — whether the plane was really up, and every browser
+    context that was created — so the arms can assert on all three teardown
+    responsibilities rather than only the two that are easy to reach.
     """
     import cli_agent_orchestrator.chatgpt_web_runner.runtime as runtime
     from cli_agent_orchestrator.chatgpt_web_runner.source_pull import PAIRING_CODE_FILENAME
@@ -558,80 +560,100 @@ def _early_failure_turn(tmp_path, monkeypatch, workspace: Path, attempt_id: str,
     monkeypatch.setenv("CHATGPT_PULL_PUBLIC_BASE_URL", f"http://127.0.0.1:{port}")
     monkeypatch.setattr(runtime, "resolve_profile_dir", lambda: "/data/fake/profile", raising=False)
     monkeypatch.setattr(runtime, "pin_fingerprint_seed", lambda _p: "epoch", raising=False)
-    break_at(monkeypatch, runtime, tmp_path, attempt_id, port)
+
+    code_path = tmp_path / "attempts" / attempt_id / PAIRING_CODE_FILENAME
+    observed: dict[str, Any] = {"contexts": [], "plane_up": None}
+
+    def _plane_up() -> bool:
+        """The arm proves nothing unless the plane was really up when it broke."""
+        return code_path.exists() and not _port_is_closed(port)
+
+    break_at(monkeypatch, runtime, observed, _plane_up)
 
     log = _attempt(tmp_path, attempt_id)
     with pytest.raises(Exception):
         asyncio.run(_drive(log, attempt_id, workspace))
-    return port, tmp_path / "attempts" / attempt_id / PAIRING_CODE_FILENAME
+    return port, code_path, observed
 
 
-def _break_at_launch(monkeypatch, runtime, tmp_path, attempt_id, port) -> None:
-    """The browser (or the profile lock) refuses."""
-    from cli_agent_orchestrator.chatgpt_web_runner.source_pull import PAIRING_CODE_FILENAME
+class _StubContext:
+    """A browser context that records whether production closed it."""
+
+    def __init__(self) -> None:
+        self.pages = [_StubPage()]
+        self.closed = False
+
+    def on(self, _event, _handler):
+        return None
+
+    async def new_page(self):
+        return self.pages[0]
+
+    async def close(self):
+        self.closed = True
+
+
+class _StubPage:
+    def __init__(self) -> None:
+        self.keyboard = None
+
+    def locator(self, _selector):
+        return _StubLocator()
+
+    def on(self, _event, _handler):
+        return None
+
+    async def route(self, _pattern, _handler):
+        return None
+
+    async def goto(self, _url, **_kwargs):
+        return None
+
+
+class _StubLocator:
+    @property
+    def first(self):
+        return self
+
+    async def wait_for(self, **_kwargs):
+        raise TimeoutError("composer never became visible")
+
+
+def _break_at_launch(monkeypatch, runtime, observed, plane_up) -> None:
+    """The browser (or the profile lock) refuses: no context is ever created."""
 
     async def _launch(_options: object) -> object:
-        # The plane really is up at this point — otherwise the arm proves nothing.
-        assert (tmp_path / "attempts" / attempt_id / PAIRING_CODE_FILENAME).exists()
-        assert not _port_is_closed(port)
+        observed["plane_up"] = plane_up()
         raise RuntimeError("Chromium refused to start")
 
     monkeypatch.setattr(runtime, "launch", _launch, raising=False)
 
 
-def _break_at_composer_wait(monkeypatch, runtime, tmp_path, attempt_id, port) -> None:
-    """An expired ChatGPT login: the composer never becomes visible."""
+def _break_at_composer_wait(monkeypatch, runtime, observed, plane_up) -> None:
+    """An expired ChatGPT login: the composer never becomes visible.
 
-    class _Locator:
-        @property
-        def first(self):
-            return self
-
-        async def wait_for(self, **_kwargs):
-            raise TimeoutError("composer never became visible")
-
-    class _Page:
-        def __init__(self):
-            self.keyboard = None
-
-        def locator(self, _selector):
-            return _Locator()
-
-        def on(self, _event, _handler):
-            return None
-
-        async def route(self, _pattern, _handler):
-            return None
-
-        async def goto(self, _url, **_kwargs):
-            return None
-
-    class _Ctx:
-        def __init__(self):
-            self.pages = [_Page()]
-            self.closed = False
-
-        def on(self, _event, _handler):
-            return None
-
-        async def new_page(self):
-            return self.pages[0]
-
-        async def close(self):
-            self.closed = True
+    Unlike the launch site this one gets a real context first, which is what
+    makes it the arm that can see whether production closed it.
+    """
 
     async def _launch(_options: object) -> object:
-        return _Ctx()
+        observed["plane_up"] = plane_up()
+        context = _StubContext()
+        observed["contexts"].append(context)
+        return context
 
     monkeypatch.setattr(runtime, "launch", _launch, raising=False)
 
 
 @pytest.mark.parametrize(
-    ("label", "break_at"),
-    [("launch", _break_at_launch), ("composer-wait", _break_at_composer_wait)],
+    ("label", "break_at", "expect_context"),
+    [
+        ("launch", _break_at_launch, False),
+        ("composer-wait", _break_at_composer_wait, True),
+    ],
 )
 def test_an_early_failure_still_unlinks_the_code_and_stops_the_listener(
-    tmp_path, monkeypatch, workspace: Path, label, break_at
+    tmp_path, monkeypatch, workspace: Path, label, break_at, expect_context
 ) -> None:
     """The window the review found: the plane is up, the mint block is not reached.
 
@@ -640,12 +662,31 @@ def test_an_early_failure_still_unlinks_the_code_and_stops_the_listener(
     composer wait or the readback check left a live single-use credential on
     disk and the connector still listening — and the expiry watcher that would
     eventually have cleaned up died with the event loop.
+
+    All THREE teardown responsibilities are asserted. The context one matters:
+    with only the file and the port checked, disabling the ``context is not
+    None`` guard left both arms green (mutant MF3-NO-CONTEXT-SENTINEL).
     """
-    port, code_path = _early_failure_turn(
+    port, code_path, observed = _early_failure_turn(
         tmp_path, monkeypatch, workspace, f"early-{label}", break_at=break_at
     )
+
+    # The plane really was up when the failure hit — otherwise this proves nothing.
+    assert observed["plane_up"] is True, f"the pull plane was not up at the {label} break"
+
     assert not code_path.exists(), f"the raw pairing code survived a failure at {label}"
     assert _port_is_closed(port), f"the connector listener survived a failure at {label}"
+
+    contexts = observed["contexts"]
+    if expect_context:
+        assert len(contexts) == 1, f"expected one browser context, got {len(contexts)}"
+        assert contexts[0].closed is True, (
+            f"the browser context survived a failure at {label} — the teardown's "
+            "context guard is not reached"
+        )
+    else:
+        # launch() raised, so there is nothing to close and nothing to leak.
+        assert contexts == []
 
 
 # =====================================================================
