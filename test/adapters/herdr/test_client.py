@@ -1353,12 +1353,18 @@ async def test_the_state_read_and_the_submission_use_separate_connections(
     async with FakeHerdrServer(socket_path) as server:
         server.on_request = handler
         client = HerdrClient(socket_path)
-        result = await client.prompt_agent(target="%3", text="hello")
-        assert result.outcome is AttemptOutcome.DELIVERED
+        result = await asyncio.wait_for(client.prompt_agent(target="%3", text="hello"), timeout=10)
+        # The COUNT first, and a bound above the call.  Review r2 §10.3: written
+        # the other way round, a client that reuses one connection made this test
+        # kill its mutant by HANGING to pytest's own timeout rather than by
+        # asserting — a pass for the wrong reason, and a slow one.  Two
+        # connections is the property; their contents are the detail.
+        assert len(server.connections) == 2, f"one request per connection: {server.connections}"
         assert server.connections == [
             ["agent.get"],
             ["agent.prompt"],
         ], "one request per connection, in this order"
+        assert result.outcome is AttemptOutcome.DELIVERED
 
 
 async def test_a_failed_state_read_still_submits_and_reports_no_pre_state(

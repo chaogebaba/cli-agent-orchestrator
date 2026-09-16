@@ -44,8 +44,14 @@ def _herdr_certify(
     *,
     binary_sha: str = FAKE_BINARY_SHA,
     position_sha_override: str | None = None,
+    reduced_assurance: str | None = None,
 ) -> None:
-    """Append a ``herdr_certification`` row at the CURRENT sha pair."""
+    """Append a ``herdr_certification`` row at the CURRENT sha pair.
+
+    ``reduced_assurance`` defaults to ABSENT, which is what a row written before
+    amendment (7)'s field existed looks like — the shape the reader has to
+    tolerate.
+    """
     import frontmatter
 
     p_sha, o_sha = _shas(positions, position, provider)
@@ -65,6 +71,8 @@ def _herdr_certify(
             "evidence": "/data/cao-scratch/briefs/h1-live.md",
         }
     )
+    if reduced_assurance is not None:
+        rows[-1]["reduced_assurance"] = reduced_assurance
     parsed.metadata["herdr_certification"] = rows
     path.write_text(frontmatter.dumps(parsed) + "\n", encoding="utf-8")
 
@@ -283,3 +291,115 @@ def test_the_backend_check_runs_after_provider_certification(
     with pytest.raises(routing.RoutingError) as ei:
         routing.resolve_routing_binding("general", "kiro_cli", table=table, positions_dir=positions)
     assert ei.value.code == routing.E_PROVIDER_UNCERTIFIED
+
+
+# --------------------------------------------------------------------------
+# reduced_assurance — amendment (7)'s field, and its reader
+#
+# The amendment requires the pre-state-race residual to be RECORDED on the row.
+# Review r2 §9/§10.2 found the field did not exist and the tuple had no consumer
+# at all, so the amendment was not mechanically satisfiable: a residual could be
+# written into a row and nothing could read it back, which is a comment rather
+# than a field.  These pin both halves — that it round-trips, and that its
+# ABSENCE on an older row is an answer rather than an error.
+# --------------------------------------------------------------------------
+
+RESIDUAL = (
+    "pre-state race open: herdr 0.9.0 exposes no submission identity and serves "
+    "one request per API connection, so the window between the state read and "
+    "the submission is a connection lifetime"
+)
+
+
+def test_the_field_is_declared_but_is_not_part_of_the_match_key() -> None:
+    """A residual is a fact about the EVIDENCE, not about which cell is certified.
+
+    In the key, recording a residual would change the row's identity and so
+    invalidate the very row that records it — the same self-invalidation
+    ``position_sha`` avoids by excluding the certification blocks.
+    """
+    assert "reduced_assurance" in routing.HERDR_CERT_FIELDS
+    assert "reduced_assurance" not in routing.HERDR_CERT_REQUIRED_FIELDS
+    assert set(routing.HERDR_CERT_REQUIRED_FIELDS) <= set(routing.HERDR_CERT_FIELDS)
+
+
+def test_a_recorded_residual_reads_back(tmp_path: Path, installed_binary) -> None:
+    positions = _build_store(tmp_path)
+    _certify(positions, "general", "kiro_cli", "PASS")
+    _herdr_certify(positions, "general", "kiro_cli", "PASS", reduced_assurance=RESIDUAL)
+
+    assert routing.herdr_cell_certified("general", "kiro_cli", positions)[0] is True
+    assert routing.herdr_reduced_assurance("general", "kiro_cli", positions) == RESIDUAL
+
+
+def test_a_row_without_the_field_is_still_a_certification(tmp_path: Path, installed_binary) -> None:
+    """The compatibility half: an old row certifies exactly what it certified.
+
+    ``None`` means "no known residual was recorded", which is different from
+    "this row is malformed" — and only the first is true of a row written before
+    the field existed.
+    """
+    positions = _build_store(tmp_path)
+    _certify(positions, "general", "kiro_cli", "PASS")
+    _herdr_certify(positions, "general", "kiro_cli", "PASS")
+
+    assert routing.herdr_cell_certified("general", "kiro_cli", positions)[0] is True
+    assert routing.herdr_reduced_assurance("general", "kiro_cli", positions) is None
+
+
+def test_an_empty_residual_is_the_same_as_none(tmp_path: Path, installed_binary) -> None:
+    """A blank string is not a hazard; it is a row someone left half-filled."""
+    positions = _build_store(tmp_path)
+    _certify(positions, "general", "kiro_cli", "PASS")
+    _herdr_certify(positions, "general", "kiro_cli", "PASS", reduced_assurance="   ")
+
+    assert routing.herdr_reduced_assurance("general", "kiro_cli", positions) is None
+
+
+def test_a_residual_does_not_outlive_its_row(tmp_path: Path, installed_binary) -> None:
+    """Matched on the same key as the certification, so a stale row answers None.
+
+    Without this the residual would be read off a row that no longer certifies
+    anything — the reader would be MORE trusting than the certifier, which is the
+    wrong direction for a field whose whole content is "what we did not prove".
+    """
+    positions = _build_store(tmp_path)
+    _certify(positions, "general", "kiro_cli", "PASS")
+    _herdr_certify(
+        positions,
+        "general",
+        "kiro_cli",
+        "PASS",
+        position_sha_override="0" * 16,
+        reduced_assurance=RESIDUAL,
+    )
+
+    assert routing.herdr_cell_certified("general", "kiro_cli", positions)[0] is False
+    assert routing.herdr_reduced_assurance("general", "kiro_cli", positions) is None
+
+
+def test_an_uncertified_or_absent_cell_answers_none(tmp_path: Path, installed_binary) -> None:
+    """Never raises, for any of the ways a cell can fail to be a certification."""
+    positions = _build_store(tmp_path)
+    assert routing.herdr_reduced_assurance("general", "kiro_cli", positions) is None
+    assert routing.herdr_reduced_assurance("no_such_position", "kiro_cli", positions) is None
+
+
+def test_the_residual_is_readable_without_the_binary_pin(tmp_path: Path, installed_binary) -> None:
+    """Two different questions, asked separately.
+
+    "What did this certification say it did not cover" is a property of the ROW;
+    "does that row describe this machine" is the pin, and is
+    ``herdr_cell_certified``'s. An operator on a box with the wrong binary still
+    needs to be able to read what the row claimed.
+    """
+    positions = _build_store(tmp_path)
+    _certify(positions, "general", "kiro_cli", "PASS")
+    _herdr_certify(positions, "general", "kiro_cli", "PASS", reduced_assurance=RESIDUAL)
+
+    installed_binary("b" * 64)
+    assert routing.herdr_cell_certified("general", "kiro_cli", positions) == (
+        False,
+        "BINARY-MISMATCH",
+    )
+    assert routing.herdr_reduced_assurance("general", "kiro_cli", positions) == RESIDUAL
