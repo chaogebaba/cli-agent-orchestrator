@@ -3,8 +3,10 @@
 Upstream: XiaoDuoYa/codex-with-chatgpt at commit
 8fdd97c188c7678d0d9c43b3769b426940de568a (MIT).  Behavioural port only: the
 upstream uses the npm ``ignore`` package's gitignore semantics; this port uses
-``pathspec``'s GitWildCardPattern matching, which implements the same
-gitignore-style negation semantics.  The user-config file is renamed
+``pathspec``'s :class:`~pathspec.GitIgnoreSpec`, which implements the same
+gitignore-style negation semantics.  (The deprecated ``"gitwildmatch"`` factory
+is deliberately not used: it warns from pathspec 1.0 and the repository treats
+``DeprecationWarning`` as an error.)  The user-config file is renamed
 ``.c2cignore`` -> ``.caoignore`` (D5).
 """
 
@@ -103,8 +105,8 @@ class IgnoreRules:
 
     def __init__(self, workspace_root: str | Path) -> None:
         root = Path(workspace_root)
-        self._sensitive = pathspec.PathSpec.from_lines("gitwildmatch", SENSITIVE_PATTERNS)
-        self._noise = pathspec.PathSpec.from_lines("gitwildmatch", NOISE_PATTERNS)
+        self._sensitive = pathspec.GitIgnoreSpec.from_lines(SENSITIVE_PATTERNS)
+        self._noise = pathspec.GitIgnoreSpec.from_lines(NOISE_PATTERNS)
         custom_lines: list[str] = []
         try:
             caoignore = root / ".caoignore"
@@ -113,7 +115,7 @@ class IgnoreRules:
         except OSError:
             # unreadable .caoignore: fall back to defaults only (upstream parity)
             custom_lines = []
-        self._custom = pathspec.PathSpec.from_lines("gitwildmatch", custom_lines)
+        self._custom = pathspec.GitIgnoreSpec.from_lines(custom_lines)
 
     def is_sensitive(self, rel_path: str) -> bool:
         """True when the path must be denied with ``ACCESS_DENIED_SENSITIVE_FILE``."""
