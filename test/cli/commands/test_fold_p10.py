@@ -6,6 +6,7 @@ import pytest
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.main import cli
+from cli_agent_orchestrator.cli.orchestrator_main import cli as orchestrator_cli
 from cli_agent_orchestrator.services.fold_service import P10Report, check_file
 
 
@@ -443,7 +444,7 @@ def test_p10_corpus_invocation_and_exact_four_line_summary(
     (tmp_path / "GOLDEN-TIPS.md").write_text("# Tips\n", encoding="utf-8")
 
     monkeypatch.chdir(tmp_path)
-    result = CliRunner().invoke(cli, ["fold", "--check", "--corpus"])
+    result = CliRunner().invoke(orchestrator_cli, ["fold-corpus"])
     assert result.exit_code == 0, result.output
     lines = result.output.splitlines()
     summary = [line for line in lines if line.startswith("P10 ") and ":" in line]
@@ -473,7 +474,7 @@ def test_p10_corpus_prefers_orchestrator_blueprints(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """New layout: orchestrator/blueprints/ is preferred over root blueprints/."""
-    from cli_agent_orchestrator.services.fold_service import _p10_corpus_paths
+    from cli_agent_orchestrator.cli.orchestrator_commands.fold_corpus import corpus_paths
 
     orch_bp = tmp_path / "orchestrator" / "blueprints"
     orch_bp.mkdir(parents=True)
@@ -484,7 +485,7 @@ def test_p10_corpus_prefers_orchestrator_blueprints(
     legacy_bp.mkdir()
     (legacy_bp / "legacy.md").write_text(_document(), encoding="utf-8")
 
-    paths = _p10_corpus_paths(tmp_path)
+    paths = corpus_paths(tmp_path)
     path_strs = [str(p) for p in paths]
     # orchestrator/blueprints wins — new-layout.md present, legacy.md absent
     assert any("new-layout.md" in s for s in path_strs)
@@ -500,7 +501,7 @@ def test_p10_corpus_falls_back_to_legacy_layout(
     (tmp_path / "GOLDEN-TIPS.md").write_text("# Tips\n", encoding="utf-8")
 
     monkeypatch.chdir(tmp_path)
-    result = CliRunner().invoke(cli, ["fold", "--check", "--corpus"])
+    result = CliRunner().invoke(orchestrator_cli, ["fold-corpus"])
     assert result.exit_code == 0, result.output
     assert "P10 POPULATION: 1" in result.output
 
@@ -509,7 +510,7 @@ def test_p10_corpus_prefers_orchestrator_golden_tips(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """orchestrator/GOLDEN-TIPS.md is preferred over root GOLDEN-TIPS.md."""
-    from cli_agent_orchestrator.services.fold_service import _p10_corpus_paths
+    from cli_agent_orchestrator.cli.orchestrator_commands.fold_corpus import corpus_paths
 
     (tmp_path / "blueprints").mkdir()
     (tmp_path / "blueprints" / "doc.md").write_text(_document(), encoding="utf-8")
@@ -519,7 +520,7 @@ def test_p10_corpus_prefers_orchestrator_golden_tips(
     orch.mkdir()
     (orch / "GOLDEN-TIPS.md").write_text("# New tips\n", encoding="utf-8")
 
-    paths = _p10_corpus_paths(tmp_path)
+    paths = corpus_paths(tmp_path)
     path_strs = [str(p) for p in paths]
     # orchestrator/GOLDEN-TIPS.md chosen, NOT root GOLDEN-TIPS.md
     assert any("orchestrator/GOLDEN-TIPS.md" in s for s in path_strs)

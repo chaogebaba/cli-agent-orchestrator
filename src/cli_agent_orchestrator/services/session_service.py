@@ -74,12 +74,10 @@ def canonical_session_env(
             )
         artifact_root = Path(override).resolve()
     else:
-        base = Path(working_directory or os.getcwd()).resolve()
-        orch_sub = base / "orchestrator"
-        if orch_sub.is_dir():
-            artifact_root = orch_sub / "tmp" / "orch"
-        else:
-            artifact_root = base / "tmp" / "orch"
+        # No directory sniffing: presence of a skill-owned directory must not
+        # change where artifacts land (wp-arch-modular-core A.5 / AC-LITE-4).
+        # A project that wants a different root sets CAO_ARTIFACTS_DIR.
+        artifact_root = Path(working_directory or os.getcwd()).resolve() / "tmp" / "orch"
     result[ARTIFACTS_DIR_ENV] = str(artifact_root)
     return result
 

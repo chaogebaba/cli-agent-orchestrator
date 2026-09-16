@@ -126,6 +126,9 @@ chatgpt_web = [
 
 [project.scripts]
 "cao" = "cli_agent_orchestrator.cli.main:cli"
+# The optional orchestrator skill's CLI. Nothing on base imports it;
+# a project that never runs it loads none of its knowledge readers.
+"cao-orchestrator" = "cli_agent_orchestrator.cli.orchestrator_main:cli"
 "cao-server" = "cli_agent_orchestrator.api.main:main"
 "cao-mcp-server" = "cli_agent_orchestrator.mcp_server.server:main"
 "cao-ops-mcp-server" = "cli_agent_orchestrator.ops_mcp_server.server:main"
