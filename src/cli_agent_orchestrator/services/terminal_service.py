@@ -1862,6 +1862,22 @@ def _maybe_derive_cc_team_inbox_path(
     return metadata
 
 
+async def _finalize_acp_terminal(terminal_id: str) -> dict:
+    """The seat's own return value: the row, as every caller expects it.
+
+    An ACP terminal's create ends here rather than at the provider-init path's
+    return, and the difference is the whole of D2: there is no pane to wait for a
+    prompt on, no shell to be ready, and no TUI to read a status out of. The
+    subprocess answered ``initialize`` and opened a session, which is the seat
+    being up — so the row is read back and returned, and nothing waits for a
+    signal that will never come.
+    """
+    from cli_agent_orchestrator.clients.database import get_terminal_metadata as _row
+
+    row = _row(terminal_id) or {"id": terminal_id}
+    return dict(row)
+
+
 async def create_terminal(
     provider: str,
     agent_profile: str,
@@ -1891,6 +1907,7 @@ async def create_terminal(
     kiro_capability_probe: Optional[Callable[[KiroEngine, set[str]], KiroCapabilities]] = None,
     model: Optional[str] = None,
     effort: Optional[str] = None,
+    transport: str = "pane",
     lifecycle: str | None = None,
     resume_session_id: Optional[str] = None,
     use_worktree: Optional[bool] = None,
@@ -2763,6 +2780,13 @@ async def create_terminal(
                     # four separate edits that could disagree.
                     if effort is not None:
                         init_fields["requested_effort"] = effort
+                    # WP-ACP-PLANE D20. Folded into ``init_fields`` so all four
+                    # ``db_create_terminal`` call sites carry it without four
+                    # edits that could disagree. 'pane' is the column default, so
+                    # passing it explicitly only for 'acp' keeps every pre-ACP
+                    # call byte-identical.
+                    if transport != "pane":
+                        init_fields["transport"] = transport
                     # F127: for kiro_cli, resolved_model is known pre-init; persist at creation
                     if provider == "kiro_cli" and model:
                         init_fields["resolved_model"] = model
@@ -3094,38 +3118,53 @@ async def create_terminal(
         # whatever it built (under the lifecycle lock, dropping the row and every
         # terminal-owned artifact via db_delete_terminal) before the cancellation
         # continues.
-        create_worker = asyncio.ensure_future(asyncio.to_thread(_create_session_or_window_locked))
-        try:
-            window_name, session_created, window_created = await asyncio.shield(create_worker)
-        except asyncio.CancelledError:
-            if not create_worker.cancelled():
-                compensator = asyncio.ensure_future(
-                    _finish_and_roll_back_cancelled_create(create_worker, session_name, terminal_id)
-                )
-                try:
-                    await asyncio.shield(compensator)
-                except asyncio.CancelledError:
-                    # F439 (#294) round 8: a repeat cancellation detached the
-                    # compensator while it (and its shielded create_worker) still
-                    # run in the background. The outer ``finally`` must NOT release
-                    # the cap token — the backend may still exist. Transfer
-                    # ownership of the reservation to the compensator: clear
-                    # ``_cap_reserved`` so the outer finally is a no-op, then fire
-                    # a NEW compensator that carries the release parameters and
-                    # will call ``_release_worker_slot`` exactly once after the
-                    # backend is destroyed. The original (now-detached) compensator
-                    # does NOT hold cap_release (it was spawned without it), so it
-                    # cannot double-release; only this replacement owns the token.
-                    _cap_reserved = False
-                    asyncio.ensure_future(
-                        _finish_and_roll_back_cancelled_create(
-                            create_worker,
-                            session_name,
-                            terminal_id,
-                            cap_release=(session_name, terminal_id, _cap_token),  # type: ignore[arg-type]
-                        )
+        # WP-ACP-PLANE D2/D20: a `transport='acp'` seat is a HEADLESS SUBPROCESS,
+        # so it takes none of the pane path below — no backend window, no FIFO,
+        # no pipe-pane, no shell nudge. Branching here rather than inside
+        # `_create_session_or_window_locked` is deliberate: that closure's whole
+        # job is to create a backend resource under the lifecycle lock, and an
+        # ACP seat has no backend resource to create. A branch inside it would be
+        # a closure that sometimes creates nothing, which is how the rollback
+        # path comes to have a case nobody tested.
+        #
+        # The coordinates stay NULL (D20) and every consumer reads `transport`.
+        if transport == "acp":
+            window_name, session_created, window_created = ("", False, False)
+        else:
+            create_worker = asyncio.ensure_future(
+                asyncio.to_thread(_create_session_or_window_locked)
+            )
+            try:
+                window_name, session_created, window_created = await asyncio.shield(create_worker)
+            except asyncio.CancelledError:
+                if not create_worker.cancelled():
+                    compensator = asyncio.ensure_future(
+                        _finish_and_roll_back_cancelled_create(create_worker, session_name, terminal_id)
                     )
-            raise
+                    try:
+                        await asyncio.shield(compensator)
+                    except asyncio.CancelledError:
+                        # F439 (#294) round 8: a repeat cancellation detached the
+                        # compensator while it (and its shielded create_worker) still
+                        # run in the background. The outer ``finally`` must NOT release
+                        # the cap token — the backend may still exist. Transfer
+                        # ownership of the reservation to the compensator: clear
+                        # ``_cap_reserved`` so the outer finally is a no-op, then fire
+                        # a NEW compensator that carries the release parameters and
+                        # will call ``_release_worker_slot`` exactly once after the
+                        # backend is destroyed. The original (now-detached) compensator
+                        # does NOT hold cap_release (it was spawned without it), so it
+                        # cannot double-release; only this replacement owns the token.
+                        _cap_reserved = False
+                        asyncio.ensure_future(
+                            _finish_and_roll_back_cancelled_create(
+                                create_worker,
+                                session_name,
+                                terminal_id,
+                                cap_release=(session_name, terminal_id, _cap_token),  # type: ignore[arg-type]
+                            )
+                        )
+                raise
 
         # The registry row now exists (published inside the locked closure). Drop
         # the session lifecycle lease for the first-time (non-resume) path, exactly
@@ -3179,7 +3218,10 @@ async def create_terminal(
         # rely on the herdr inbox registration below. Runs AFTER the locked
         # closure: the FIFO needs no lock and #498 keeps the lock section down to
         # the tmux + registry writes that must be atomic.
-        if not get_backend().supports_event_inbox():
+        # WP-ACP-PLANE D2: an ACP seat has no pane, so it has no FIFO, no
+        # pipe-pane and no shell to nudge. The condition reads ``transport``
+        # (D20/AC-S1.10) and never a NULL coordinate.
+        if transport != "acp" and not get_backend().supports_event_inbox():
             fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
 
             # Reader must exist BEFORE pipe-pane starts so it captures from the start.
@@ -3262,6 +3304,29 @@ async def create_terminal(
                         if skill_prompt
                         else SESSION_BRIEF_MARKER
                     )
+
+        # WP-ACP-PLANE D2: the seat spawn REPLACES step 6 for an ACP terminal.
+        # A provider object drives a pane — it sends keys, reads a TUI and waits
+        # for a prompt to redraw — and a headless ACP seat has none of that. The
+        # subprocess IS the agent, and binding it into the registry is what makes
+        # the carrier able to find it again (the review's B1.1/B1.5).
+        if transport == "acp":
+            from cli_agent_orchestrator.adapters.acp.spawn import SeatSpawnFailed, spawn_acp_seat
+
+            try:
+                await asyncio.to_thread(
+                    spawn_acp_seat,
+                    terminal_id=terminal_id,
+                    provider=provider,
+                    cwd=resolved_working_directory or os.getcwd(),
+                    auth_token=terminal_token,
+                )
+            except SeatSpawnFailed:
+                # No pane and no provider means there is no half-seat worth
+                # keeping: unwind exactly as a failed provider init would.
+                logger.exception("acp seat spawn failed for %s", terminal_id)
+                raise
+            return await _finalize_acp_terminal(terminal_id)
 
         # Step 6: Create and initialize the CLI provider
         # This starts the agent (e.g., runs "kiro-cli chat --agent developer").

@@ -30,6 +30,8 @@ phase means is the aggregate's. This is the thing that waits.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from concurrent.futures import Executor
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -438,10 +440,41 @@ class ReceiverTaskRegistry:
     root and is out of this module's scope.
     """
 
-    def __init__(self, tasks: dict[str, ReceiverDeliveryTask] | None = None) -> None:
+    def __init__(
+        self,
+        tasks: dict[str, ReceiverDeliveryTask] | None = None,
+        *,
+        executor: "Executor | None" = None,
+        builder: "Callable[[str], ReceiverDeliveryTask | None] | None" = None,
+        source: "Callable[[], tuple[str, ...]] | None" = None,
+    ) -> None:
         self._tasks: dict[str, ReceiverDeliveryTask] = dict(tasks or {})
         self._running: set[str] = set()
         self.reports: list[TaskReport] = []
+        # THE EXECUTOR. With one, ``signal`` submits and returns immediately, so
+        # the scheduler never waits on a receiver's wire work — which is what
+        # carries a task past its first await and what AC-S1.29's barriers are
+        # about. Without one it runs inline, which is what a test wants when it
+        # needs the report back synchronously.
+        self._executor = executor
+        # Tasks are built LAZILY from a receiver id. The composition root cannot
+        # enumerate ACP receivers at boot — seats are spawned later — so a
+        # registry that only held a fixed dict would always be empty in
+        # production, which is the shape that made this class test-only.
+        self._builder = builder
+        #: Where the LIVE receiver set comes from — the session registry in
+        #: production. Separate from ``builder`` because "which terminals have a
+        #: seat" and "how a task for one is built" are different questions, and
+        #: only the first has to be asked every tick.
+        self._source = source
+
+    def _task_for(self, receiver_id: str) -> ReceiverDeliveryTask | None:
+        task = self._tasks.get(receiver_id)
+        if task is None and self._builder is not None:
+            task = self._builder(receiver_id)
+            if task is not None:
+                self._tasks[receiver_id] = task
+        return task
 
     def register(self, receiver_id: str, task: ReceiverDeliveryTask) -> None:
         """Bind a receiver to its ONE task.  A second bind replaces, never adds."""
@@ -457,7 +490,14 @@ class ReceiverTaskRegistry:
         Sorted so a tick's behaviour does not depend on dict insertion order,
         which is the kind of hidden input that makes an isolation arm pass on one
         machine and fail on another.
+
+        With a source wired, this is the LIVE set — the terminals that currently
+        have an ACP session — not the tasks built so far. A registry that
+        enumerated only what it had already built would never notice a seat
+        spawned after boot, which in production is every seat.
         """
+        if self._source is not None:
+            return tuple(sorted(self._source()))
         return tuple(sorted(self._tasks))
 
     def signal(self, receiver_id: str) -> TaskReport | None:
@@ -467,16 +507,26 @@ class ReceiverTaskRegistry:
         whose task is mid-await is NOT started again, and the scheduler is told
         so by a ``None`` rather than by being made to wait.
         """
-        task = self._tasks.get(receiver_id)
+        task = self._task_for(receiver_id)
         if task is None or receiver_id in self._running:
             return None
         self._running.add(receiver_id)
-        try:
-            report = task.run_once()
-        finally:
-            self._running.discard(receiver_id)
-        self.reports.append(report)
-        return report
+
+        def _run() -> TaskReport:
+            try:
+                report = task.run_once()
+            finally:
+                self._running.discard(receiver_id)
+            self.reports.append(report)
+            return report
+
+        if self._executor is not None:
+            # Submit and RETURN. The scheduler's next receiver is served while
+            # this one is still on the wire; the re-entrancy guard above is what
+            # stops the next tick starting a second task for it.
+            self._executor.submit(_run)
+            return None
+        return _run()
 
     def is_running(self, receiver_id: str) -> bool:
         return receiver_id in self._running

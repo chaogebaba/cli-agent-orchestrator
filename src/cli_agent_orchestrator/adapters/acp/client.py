@@ -201,6 +201,17 @@ class AcpClient:
         self._updates: list[dict[str, Any]] = []
         self._busy_leaks: list[dict[str, Any]] = []
         self._stderr_handle: Any = None
+        # D22: bumped by a respawn, so a handle minted against the old subprocess
+        # cannot authorize a cancel against the new one. Carried here because the
+        # actor is the only thing that knows a subprocess was replaced.
+        self._lifecycle_generation = 0
+        #: The callback id of the turn now in flight, set by the caller that
+        #: wrote it. The wire has no field for it, so it is CAO's own bookkeeping
+        #: and it is what lets a cut be named without reading the frame log.
+        self._open_callback_id: str | None = None
+        #: Tool calls the agent has opened and not closed in THIS turn, in the
+        #: order they arrived. A cancel names them so D6b's cost is auditable.
+        self._open_tool_calls: list[str] = []
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -227,6 +238,50 @@ class AcpClient:
     @property
     def pid(self) -> int | None:
         return self._proc.pid if self._proc is not None else None
+
+    @property
+    def lifecycle_generation(self) -> int:
+        """D22's generation.  A respawn bumps it; a handle from before does not match."""
+        return self._lifecycle_generation
+
+    @property
+    def open_callback_id(self) -> str | None:
+        return self._open_callback_id
+
+    def open_tool_call_ids(self) -> tuple[str, ...]:
+        """The tool calls still open in this turn, in arrival order.
+
+        Rendered HONESTLY as zero, one or many: AC-S1.23's fails-if includes "a
+        multi-tool cancel is rendered as one", so the caller gets the list and
+        not a count or a first element.
+        """
+        return tuple(self._open_tool_calls)
+
+    def is_alive(self) -> bool:
+        """Is the subprocess still running?
+
+        The only locally observable evidence a write receipt can rest on. It
+        detects a DEAD peer and says nothing about a wedged live one — the
+        asymmetry ``ACP_WRITE_SETTLE_S`` was measured against.
+        """
+        return self._proc is not None and self._proc.poll() is None
+
+    def bump_lifecycle_generation(self) -> int:
+        """Record that this terminal's subprocess was replaced (D22)."""
+        self._lifecycle_generation += 1
+        return self._lifecycle_generation
+
+    def close_session(self) -> bool:
+        """``session/close`` where the agent advertises it.
+
+        ``False`` for an adapter that does not — D14 names kiro and cline — which
+        is not a failure but the fact that routes recovery to terminate-and-
+        respawn instead of to a clean close.
+        """
+        if self._session_id is None:
+            return False
+        reply = self.request("session/close", {"sessionId": self._session_id}, timeout=15.0)
+        return "result" in reply
 
     def session_state(self) -> SessionSnapshot:
         """This client's own answer, from its own stream.  No wire touch."""
@@ -290,7 +345,7 @@ class AcpClient:
             self._session_id = str(session_id)
         return reply
 
-    def prompt(self, text: str) -> int:
+    def prompt(self, text: str, *, callback_id: str | None = None) -> int:
         """Write ONE prompt and return its request id.  Refuses while a turn is open.
 
         The refusal is the client-side busy model in one line.  AC-S1.19's
@@ -313,6 +368,11 @@ class AcpClient:
         self._turn_open = True
         self._open_request_id = request_id
         self._last_stop_reason = None
+        self._open_callback_id = callback_id
+        # A new turn starts with no open tool calls. Cleared here rather than on
+        # settle so a cancel that never settles still reports the calls THIS turn
+        # opened rather than the previous turn's.
+        self._open_tool_calls = []
         return request_id
 
     def steer(self, text: str) -> None:
@@ -415,7 +475,19 @@ class AcpClient:
         if frame.get("method") == "session/update":
             self._updates.append(frame)
             update = (frame.get("params") or {}).get("update") or {}
-            if update.get("sessionUpdate") == "stop":
+            kind = update.get("sessionUpdate")
+            tool_call_id = update.get("toolCallId")
+            if kind == "tool_call" and tool_call_id:
+                self._open_tool_calls.append(str(tool_call_id))
+            elif kind == "tool_call_update" and tool_call_id:
+                # Anything but an in-flight status closes it. A cancelled call
+                # stays OPEN in this list on purpose: it is one of the calls the
+                # cancel killed, and naming it is the point.
+                if str(update.get("status", "")) in ("completed", "failed"):
+                    self._open_tool_calls = [
+                        call for call in self._open_tool_calls if call != str(tool_call_id)
+                    ]
+            if kind == "stop":
                 self._settle_turn(str(update.get("stopReason") or "stop"))
 
     def _settle_reply(self, frame: dict[str, Any]) -> None:

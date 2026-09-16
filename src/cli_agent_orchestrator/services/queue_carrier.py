@@ -814,11 +814,19 @@ class AcpTransport:
     def __init__(self, sessions: Callable[[str], Any] | None = None) -> None:
         """``sessions`` resolves a terminal id to its live ACP client.
 
-        Injected rather than looked up, so this class holds no registry of its
-        own and a test can hand it a mock agent's client.  The composition root
-        supplies the real resolver, which is the one place that knows how seats
-        are spawned.
+        **The default is the real registry, not ``None``.** It was ``None``, and
+        the composition root passed the bare class as a factory, so every wake
+        over the plane returned ``acp_session_unbound`` and nothing could ever be
+        delivered — the S1 review's B1.1. A default that cannot work is not a
+        neutral default; it is a plane that is wired up and switched off.
+
+        Still injectable, because a test must be able to hand this a mock agent's
+        client without touching a process-wide registry.
         """
+        if sessions is None:
+            from cli_agent_orchestrator.adapters.acp.registry import acp_sessions
+
+            sessions = acp_sessions.get
         self._sessions = sessions
 
     def emit(
@@ -831,7 +839,7 @@ class AcpTransport:
         msg_id: str,
     ) -> WakeEmission:
         """Write ONE prompt, or report a typed reason.  Never a second prompt."""
-        del sender_key, sender_name, msg_id  # the ACP envelope carries its own id
+        del sender_key, sender_name  # the ACP envelope carries its own identity
         client = self._sessions(terminal_id) if self._sessions is not None else None
         if client is None:
             return WakeEmission(reason=self.UNBOUND_REASON)
@@ -847,7 +855,10 @@ class AcpTransport:
             return WakeEmission(reason=self.BUSY_REASON, detail="turn_open")
 
         try:
-            client.prompt(line)
+            # The callback id rides with the prompt so the actor can NAME the turn
+            # it is running. Without it a cut is unattributable: the wire has no
+            # field for it, so this is CAO's own bookkeeping or it is nothing.
+            client.prompt(line, callback_id=msg_id)
         except Exception as exc:  # noqa: BLE001 — a transport fault is a typed reason
             # A refused prompt is this client's own busy guard firing on a race
             # between the check above and the write; everything else is the

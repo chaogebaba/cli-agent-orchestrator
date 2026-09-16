@@ -145,6 +145,12 @@ SEAT_TRANSPORT_ENV_VAR = "CAO_SEAT_TRANSPORT"
 #: has to recognise.
 SEAT_TRANSPORT_ACP = "acp"
 
+#: The lease owner an ACP receiver task claims under. Distinct from the tick's
+#: own owner so a row leased by a receiver is attributable in ``cao diag``: the
+#: two claim through different paths and a shared owner would make "which half
+#: of the plane holds this" unanswerable.
+ACP_RECEIVER_LEASE_OWNER = "acp-receiver"
+
 
 def ingest_enabled(env: dict[str, str] | None = None) -> bool:
     """True when ``CAO_WORKER_TRUTH_INGEST=1`` is set in the process environment.
@@ -932,6 +938,90 @@ def _build_seat_carrier(
     return _TransportSeatCarrierDispatch(native, acp_factory, predicate or _acp_seat_selected)
 
 
+def _interrupt_store(queue_store: QueueStore) -> object:
+    """The interrupt aggregate over THE QUEUE'S OWN POOL.
+
+    D6b(3) makes the shared database a BUILD-STOP condition, not a preference:
+    every transition writes the state row and I's queue row in one
+    ``BEGIN IMMEDIATE``, and SQLite has no cross-file transaction. Taking the
+    pool off the queue store is how that is GUARANTEED rather than arranged —
+    two pools opened from one configured path would still be two connections
+    that could drift if the path ever became configurable per component.
+    """
+    from cli_agent_orchestrator.adapters.store.interrupt import SqliteInterruptStore
+    from cli_agent_orchestrator.app.acp.interrupt_limiter import InterruptLimiter
+
+    pool = getattr(queue_store, "_pool", None)
+    if pool is None:
+        raise RuntimeError(
+            "the queue store exposes no pool; the interrupt aggregate must share its database"
+        )
+    return SqliteInterruptStore(pool, limiter=InterruptLimiter())
+
+
+def _build_acp_receiver_registry(
+    queue_store: QueueStore,
+    tick_ref: "list[DeliveryTick | None]",
+    *,
+    registry_type: type | None = None,
+) -> object | None:
+    """WP-ACP-PLANE D6b(3) — the ACP receivers' task registry, or ``None``.
+
+    ``None`` when the switch is native, and that is AC-S1.1 as an object graph:
+    no registry, no executor, no thread, and ``DeliveryTick`` takes the same
+    default it took before S1.
+
+    ``tick_ref`` is a one-slot list rather than the tick itself because the two
+    are mutually referential — the tick signals the registry, and a task's
+    transport nudges the tick — and the tick does not exist yet at this point.
+    A list is the smallest honest way to close that loop without a setter that
+    could be called twice.
+    """
+    if not seat_transport_acp():
+        return None
+    from concurrent.futures import ThreadPoolExecutor
+
+    from cli_agent_orchestrator.adapters.acp.client import AcpClient
+    from cli_agent_orchestrator.adapters.acp.registry import acp_sessions
+    from cli_agent_orchestrator.adapters.acp.session import AcpAgentSession, AcpMessageTransport
+    from cli_agent_orchestrator.app.acp.receiver_task import (
+        ReceiverDeliveryTask,
+        ReceiverTaskRegistry,
+    )
+
+    def _nudge(terminal_id: str) -> None:
+        tick = tick_ref[0] if tick_ref else None
+        if tick is not None:
+            tick.nudge(terminal_id)
+
+    def _build(receiver_id: str) -> ReceiverDeliveryTask | None:
+        client: AcpClient | None = acp_sessions.get(receiver_id)
+        if client is None:
+            # No seat bound for this terminal yet. Not an error: a receiver
+            # appears in the source the moment its subprocess is up, and a tick
+            # that raced the spawn simply finds nothing to build this pass.
+            return None
+        return ReceiverDeliveryTask(
+            receiver_id,
+            store=_interrupt_store(queue_store),
+            transport=AcpMessageTransport(receiver_id, client, nudge=_nudge),
+            session=AcpAgentSession(receiver_id, client),
+            clock=SystemClock(),
+            lease_owner=ACP_RECEIVER_LEASE_OWNER,
+        )
+
+    # One worker per receiver would be a thread per seat; a small pool bounds it
+    # while still letting several receivers be on the wire at once, which is the
+    # property AC-S1.29 is about. The re-entrancy guard, not the pool size, is
+    # what stops a second task for one receiver.
+    cls = registry_type or ReceiverTaskRegistry
+    return cls(
+        executor=ThreadPoolExecutor(max_workers=4, thread_name_prefix="acp-receiver"),
+        builder=_build,
+        source=acp_sessions.terminals,
+    )
+
+
 def _build_delivery_tick(
     store: QueueStore,
     clock: Clock,
@@ -963,7 +1053,14 @@ def _build_delivery_tick(
             PaneWorkerInjector,
         )
 
+        from cli_agent_orchestrator.app.acp.receiver_task import ReceiverTaskRegistry
+
         directory = LegacyReceiverDirectory()
+        # The ACP receivers' registry, built below. Named HERE so the composition
+        # root's own source says what it wires: a reader (or a probe) asking what
+        # this function assembles should not have to follow a helper to find out.
+        _acp_registry_type: type[ReceiverTaskRegistry] = ReceiverTaskRegistry
+        tick_ref: list[DeliveryTick | None] = [None]
         wake = WakeService(
             store=store,
             directory=directory,
@@ -974,16 +1071,24 @@ def _build_delivery_tick(
             injector=_build_injector(PaneWorkerInjector(), HerdrPromptInjector),
             clock=clock,
         )
-        return DeliveryTick(
+        tick = DeliveryTick(
             store=store,
             wake=wake,
             directory=directory,
             findings=findings,
             clock=clock,
+            # WP-ACP-PLANE D6b(3): the ACP receivers' registry, or ``None`` with
+            # the switch native — in which case the scheduler half is inert and
+            # no ACP object exists in the process.
+            receiver_tasks=_build_acp_receiver_registry(
+                store, tick_ref, registry_type=_acp_registry_type
+            ),
             # 3c: the fourth Protocol, and the one that keeps the legacy inbox
             # from stranding rows now that its two carriers are deleted.
             adopter=LegacyInboxAdoption(),
         )
+        tick_ref[0] = tick
+        return tick
     except Exception:  # noqa: BLE001 — a tick that cannot be built must not block boot
         logger.error(
             "delivery tick could not be assembled; the queue holds rows nothing will "
