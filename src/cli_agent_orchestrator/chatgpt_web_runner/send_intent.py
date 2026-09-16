@@ -185,12 +185,19 @@ class SendIntentRecord:
     supersedes_unresolved: Optional[str] = None
     relay_status: Optional[str] = None
     #: D5/D7: how the MODEL reaches this attempt's pull plane. The public base
-    #: URL is the operator's tunnel front door; the pairing code is SINGLE-USE
-    #: and short-lived, and is recorded only because the operator needs it after
-    #: the pane has scrolled. The record file is created by mkstemp (0600) and
-    #: os.replace preserves that mode, so it is owner-only on disk.
+    #: URL is the operator's tunnel front door.
+    #:
+    #: The pairing code itself is NOT here. The durable ledger deliberately
+    #: refuses raw secrets — ``create_locked_attempt`` will not even accept the
+    #: relay token — and a single-use code is no exception just because it is
+    #: short-lived. What the record keeps is enough to AUDIT the pairing without
+    #: holding it: when the code was issued, when it expires, and a SHA-256 of
+    #: the code, so a later reader can prove which code was used by hashing the
+    #: one they have. The raw code lives on the pane and in an ephemeral 0600
+    #: file that is unlinked on consumption or expiry.
     connector_public_base_url: Optional[str] = None
-    connector_pairing_code: Optional[str] = None
+    connector_pairing_code_sha256: Optional[str] = None
+    connector_pairing_issued_at: Optional[float] = None
     connector_pairing_expires_at: Optional[float] = None
     verified_node_id: Optional[str] = None
     conversation_digest: Optional[str] = None

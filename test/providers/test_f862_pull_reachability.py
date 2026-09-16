@@ -326,7 +326,8 @@ def test_a_reachable_plane_records_the_url_and_pairing_code(
         record = SendIntentLog(tmp_path / "attempts" / "reach-ok-order").load()
         reached["state"] = record.attempt_state
         reached["url"] = record.connector_public_base_url
-        reached["code"] = record.connector_pairing_code
+        reached["digest"] = record.connector_pairing_code_sha256
+        reached["issued"] = record.connector_pairing_issued_at
         reached["expires"] = record.connector_pairing_expires_at
         raise RuntimeError("stop the turn here")
 
@@ -338,11 +339,13 @@ def test_a_reachable_plane_records_the_url_and_pairing_code(
     with pytest.raises(RuntimeError, match="stop the turn here"):
         asyncio.run(_drive(log, "reach-ok-order", workspace))
 
-    # CONNECTOR_READY is written with all three values, before any composer step.
+    # CONNECTOR_READY is written before any composer step, with the public URL
+    # and the pairing AUDIT fields — never the raw code (see the ruling arms).
     assert reached["state"] == AttemptState.CONNECTOR_READY.value
     assert reached["url"] == f"http://127.0.0.1:{port}"
-    assert reached["code"], "the operator needs the pairing code"
-    assert float(reached["expires"]) > 0
+    assert reached["digest"], "the ledger needs a digest to identify the code later"
+    assert float(reached["issued"]) > 0
+    assert float(reached["expires"]) > float(reached["issued"])
 
 
 def test_production_passes_the_public_url_through_to_bind_attempt(
@@ -388,3 +391,140 @@ def test_production_passes_the_public_url_through_to_bind_attempt(
         "production must pass the configured public URL, or the connector "
         "advertises a loopback issuer ChatGPT cannot reach"
     )
+
+
+# =====================================================================
+# The pairing code stays OUT of the durable ledger (supervisor ruling)
+# =====================================================================
+
+
+def test_the_raw_pairing_code_is_absent_from_the_ledger_and_present_in_the_file(
+    tmp_path, monkeypatch, workspace: Path
+) -> None:
+    """The ruling, asserted on the bytes rather than on the field names.
+
+    The durable record refuses raw secrets — `create_locked_attempt` will not
+    even accept the relay token — so a single-use code is no exception just
+    because it is short-lived. What the record keeps is a digest and two
+    timestamps, enough to prove later WHICH code was used without holding it.
+    The operator's copy lives in one 0600 file next to the attempt.
+    """
+    import hashlib
+    import stat
+
+    import cli_agent_orchestrator.chatgpt_web_runner.runtime as runtime
+    from cli_agent_orchestrator.chatgpt_web_runner.send_intent import SendIntentLog
+    from cli_agent_orchestrator.chatgpt_web_runner.source_pull import PAIRING_CODE_FILENAME
+
+    port = _free_port()
+    monkeypatch.setenv("CAO_ARTIFACTS_DIR", str(tmp_path))
+    monkeypatch.setenv("CHATGPT_PULL_BIND_PORT", str(port))
+    monkeypatch.setenv("CHATGPT_PULL_PUBLIC_BASE_URL", f"http://127.0.0.1:{port}")
+
+    captured: dict[str, object] = {}
+
+    async def _launch(_options: object) -> object:
+        attempt_dir = tmp_path / "attempts" / "pairing-ruling"
+        captured["raw_json"] = (attempt_dir / "send_intent.json").read_text(encoding="utf-8")
+        code_path = attempt_dir / PAIRING_CODE_FILENAME
+        captured["code"] = code_path.read_text(encoding="utf-8").strip()
+        captured["mode"] = stat.S_IMODE(code_path.stat().st_mode)
+        raise RuntimeError("stop after the plane is up")
+
+    monkeypatch.setattr(runtime, "launch", _launch, raising=False)
+    monkeypatch.setattr(runtime, "resolve_profile_dir", lambda: "/data/fake/profile", raising=False)
+    monkeypatch.setattr(runtime, "pin_fingerprint_seed", lambda _p: "epoch", raising=False)
+
+    log = _attempt(tmp_path, "pairing-ruling")
+    with pytest.raises(RuntimeError, match="stop after the plane is up"):
+        asyncio.run(_drive(log, "pairing-ruling", workspace))
+
+    code = str(captured["code"])
+    assert code, "the operator's copy must exist while the code is live"
+    # Owner-only, at creation, with no wider window (O_CREAT with mode 0600).
+    assert captured["mode"] == 0o600, oct(int(captured["mode"]))
+
+    # The RAW code appears nowhere in the durable record's bytes.
+    raw_json = str(captured["raw_json"])
+    assert code not in raw_json, "the raw pairing code leaked into send_intent.json"
+    # Not even with the formatting stripped, in case a future format changes it.
+    assert code.replace("-", "") not in raw_json.replace("-", "")
+
+    # What the record DOES carry proves which code it was.
+    record = SendIntentLog(tmp_path / "attempts" / "pairing-ruling").load()
+    assert record is not None
+    assert record.connector_pairing_code_sha256 == hashlib.sha256(code.encode()).hexdigest()
+    assert record.connector_pairing_issued_at is not None
+    assert record.connector_pairing_expires_at is not None
+
+
+def test_the_code_file_is_removed_once_the_pairing_is_consumed(tmp_path, workspace: Path) -> None:
+    """A consumed code left on disk is a credential nobody is watching."""
+    from cli_agent_orchestrator.chatgpt_web_runner.source_pull import PairingCodeFile
+
+    server = bind_attempt(
+        attempt_id="pairing-consume",
+        frozen_worktree=workspace,
+        manifest=["alpha.py"],
+        state_dir=workspace / ".s-consume",
+        public_base_url="http://127.0.0.1:1",
+    )
+    created = server.pairing.create()
+    code = str(created["code"])
+    handle = PairingCodeFile(tmp_path / "attempt", server.pairing)
+    digest = handle.write(code)
+    assert handle.path.exists() and digest
+
+    async def _run() -> bool:
+        handle.start_watch(interval=0.02)
+        await asyncio.sleep(0.05)
+        assert handle.path.exists(), "still live, so the operator can still read it"
+        # A client pairs: the session is consumed.
+        assert server.pairing.verify(code)["ok"] is True
+        for _ in range(100):
+            if not handle.path.exists():
+                return True
+            await asyncio.sleep(0.02)
+        return False
+
+    assert asyncio.run(_run()) is True, "the code file outlived its pairing session"
+
+
+def test_the_code_file_is_removed_once_the_pairing_expires(tmp_path, workspace: Path) -> None:
+    """Expiry is the other way a code stops being useful."""
+    from cli_agent_orchestrator.chatgpt_web_runner.source_pull import PairingCodeFile
+    from cli_agent_orchestrator.workspace_connector.pairing import PairingManager
+
+    # The real manager, with the TTL its constructor already exposes.
+    pairing = PairingManager(workspace_id="expiry", ttl_s=0.05)
+    code = str(pairing.create()["code"])
+    handle = PairingCodeFile(tmp_path / "attempt", pairing)
+    handle.write(code)
+    assert handle.path.exists()
+
+    async def _run() -> bool:
+        handle.start_watch(interval=0.02)
+        for _ in range(100):
+            if not handle.path.exists():
+                return True
+            await asyncio.sleep(0.02)
+        return False
+
+    assert asyncio.run(_run()) is True, "an expired code file was left behind"
+
+
+def test_revoke_is_idempotent_and_safe_in_teardown(tmp_path, workspace: Path) -> None:
+    from cli_agent_orchestrator.chatgpt_web_runner.source_pull import PairingCodeFile
+
+    server = bind_attempt(
+        attempt_id="pairing-revoke",
+        frozen_worktree=workspace,
+        manifest=["alpha.py"],
+        state_dir=workspace / ".s-revoke",
+        public_base_url="http://127.0.0.1:1",
+    )
+    handle = PairingCodeFile(tmp_path / "attempt", server.pairing)
+    handle.write("ABCD-EFGH")
+    handle.revoke()
+    handle.revoke()  # must not raise
+    assert not handle.path.exists()

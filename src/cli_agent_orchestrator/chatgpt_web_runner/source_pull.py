@@ -29,11 +29,13 @@ exercises the same code path the arms do.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import socket
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from cli_agent_orchestrator.chatgpt_web_runner.errors import (
@@ -320,3 +322,78 @@ def call_tool(
         return dict(json.loads(text))
     except json.JSONDecodeError:
         return {"error": {"message": "connector returned a non-JSON body"}}
+
+
+#: The ephemeral pairing-code file's name inside the attempt directory.
+PAIRING_CODE_FILENAME = "pairing.code"
+
+
+class PairingCodeFile:
+    """The raw pairing code's only on-disk home: 0600, and short-lived.
+
+    The durable ledger refuses raw secrets, so the operator's copy lives here
+    instead — next to the attempt, owner-only, and removed as soon as it stops
+    being useful. "Stops being useful" is not a timer: the file is unlinked when
+    the pairing session is no longer active, which is either because a client
+    consumed the code or because it expired. A consumed code left on disk is a
+    credential nobody is watching any more.
+
+    ``revoke()`` is idempotent and never raises, so teardown can always call it.
+    """
+
+    def __init__(self, attempt_dir: Path, pairing: Any) -> None:
+        self.path = Path(attempt_dir) / PAIRING_CODE_FILENAME
+        self._pairing = pairing
+        self._watcher: "Optional[asyncio.Task[None]]" = None
+
+    def write(self, code: str) -> str:
+        """Write the code 0600 and return its SHA-256, which the ledger keeps."""
+        import hashlib
+        import os
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # O_EXCL: never adopt a file someone else left here; 0o600 at creation,
+        # so there is no window in which it exists with a wider mode.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        fd = os.open(str(self.path), flags, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(code + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(str(self.path), 0o600)
+        return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+    def revoke(self) -> None:
+        """Remove the file. Idempotent; safe in a finally."""
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:  # pragma: no cover - teardown must not mask a run
+            pass
+
+    def start_watch(self, *, interval: float = 1.0) -> "asyncio.Task[None]":
+        """Unlink the file as soon as the pairing stops being active."""
+
+        async def _watch() -> None:
+            try:
+                while True:
+                    if not self._pairing.has_active_session():
+                        self.revoke()
+                        return
+                    await asyncio.sleep(interval)
+            except asyncio.CancelledError:  # pragma: no cover - teardown path
+                raise
+
+        self._watcher = asyncio.ensure_future(_watch())
+        return self._watcher
+
+    async def stop_watch(self) -> None:
+        """Cancel the watcher and remove the file unconditionally."""
+        watcher = self._watcher
+        self._watcher = None
+        if watcher is not None and not watcher.done():
+            watcher.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await watcher
+        self.revoke()

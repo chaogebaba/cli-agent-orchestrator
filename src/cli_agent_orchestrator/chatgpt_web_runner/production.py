@@ -532,6 +532,7 @@ async def _drive_composed_turn(
     from cli_agent_orchestrator.chatgpt_web_runner.snapshot_upload import enforce_no_api_egress
     from cli_agent_orchestrator.chatgpt_web_runner.source_pull import (
         ConnectorListener,
+        PairingCodeFile,
         collect_pull_evidence,
         verify_source_correlation,
     )
@@ -545,6 +546,7 @@ async def _drive_composed_turn(
     # no report. Everything that can refuse now refuses first.
     connector_listener: Optional[ConnectorListener] = None
     connector_server: Any = None
+    pairing_file: Optional[PairingCodeFile] = None
     if manifest and frozen_worktree:
         from cli_agent_orchestrator.services.workspace_read import bind_attempt
 
@@ -573,6 +575,18 @@ async def _drive_composed_turn(
         pairing = connector_server.pairing.create()
         pairing_code = str(pairing["code"])
         pairing_expires_at = float(pairing["expires_at"])
+        pairing_issued_at = time.time()
+
+        # The raw code goes to the pane and to ONE ephemeral 0600 file; the
+        # durable ledger gets only its digest and its timestamps. A later reader
+        # can still prove WHICH code was used by hashing the one they hold,
+        # without the record ever having held it (supervisor ruling, and the
+        # same policy that keeps the relay token out of create_locked_attempt).
+        pairing_file = PairingCodeFile(
+            _artifacts_dir() / "attempts" / attempt_id, connector_server.pairing
+        )
+        pairing_digest = pairing_file.write(pairing_code)
+        pairing_file.start_watch()
 
         # Reachability is PROVED, not assumed, and proved to be THIS attempt.
         await asyncio.to_thread(check_pull_plane_reachable, public_base_url, attempt_id)
@@ -580,11 +594,13 @@ async def _drive_composed_turn(
         intent_log.transition(
             AttemptState.CONNECTOR_READY,
             connector_public_base_url=public_base_url,
-            connector_pairing_code=pairing_code,
+            connector_pairing_code_sha256=pairing_digest,
+            connector_pairing_issued_at=pairing_issued_at,
             connector_pairing_expires_at=pairing_expires_at,
         )
         _marker(f"PULL-PLANE {public_base_url} attempt={attempt_id}")
         _marker(f"PULL-PAIRING-CODE {pairing_code} (single use, expires in ~5 min)")
+        _marker(f"PULL-PAIRING-FILE {pairing_file.path} (0600, removed once used or expired)")
         logger.info("chatgpt_web pull plane reachable at %s for %s", public_base_url, attempt_id)
     else:
         intent_log.transition(AttemptState.CONNECTOR_READY)
@@ -883,6 +899,9 @@ async def _drive_composed_turn(
         if custody.entered.is_set():
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(custody.finished.wait(), 10)
+        # The raw code never outlives the attempt, whatever ended it.
+        if pairing_file is not None:
+            await pairing_file.stop_watch()
         if connector_listener is not None:
             await connector_listener.stop()
         with contextlib.suppress(Exception):
