@@ -346,3 +346,112 @@ async def test_gate_refuses_an_answer_on_a_sibling_branch():
     }
     with pytest.raises(RunnerError, match="does not descend"):
         evaluate_gate(conv, submitted_user_msg_id="our-user", run_id="run", bundle_sha="sha")
+
+
+# ---------------------------------------------------------------------
+# AC-25-M8 — the holder-death terminal, in the OFFLINE tier
+#
+# B1 review fix 1. Before this test the only killer for the done-callback was
+# ``test_f862_real_browser_oracle.py::test_arm_worker_cancellation_before_invocation``,
+# which is ``e2e`` + ``slow`` — deselected by the merge gate's own selection and
+# silently skipped wherever Chromium is absent. Deleting the callback left the
+# entire 25-test unit scope green (review section 6). These three assertions are
+# the unit scope's own killer.
+# ---------------------------------------------------------------------
+
+
+async def test_cancelled_holder_writes_the_lost_terminal_itself():
+    """A cancelled owner never calls on_teardown(); it must still settle `lost`."""
+
+    async def _live() -> None:
+        await asyncio.sleep(3600)
+
+    owner = asyncio.ensure_future(_live())
+    holder = HeldRoute(_FakeRoute(), object(), attempt_id="a", generations=GENS, owner_task=owner)
+    assert holder.disposition is RouteDisposition.HELD
+    assert holder.owner_death_settled is False
+
+    owner.cancel()
+    # One loop tick: add_done_callback fires through call_soon.
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert holder.owner_death_settled is True
+    # Conservative direction: a hold whose owner died is never provably
+    # un-sent, so it is LOST and never ABORTED (D1 r3 table). `lost` terminates
+    # as ACK_UNKNOWN and authorises no fresh same-turn mint.
+    assert holder.disposition is RouteDisposition.LOST
+    assert holder.terminal_written_at is not None
+
+
+async def test_owner_death_never_overwrites_a_terminal_already_written():
+    """A proved holder-owned abort survives the owner dying afterwards."""
+
+    async def _live() -> None:
+        await asyncio.sleep(3600)
+
+    owner = asyncio.ensure_future(_live())
+    route = _FakeRoute()
+    holder = HeldRoute(route, object(), attempt_id="a", generations=GENS, owner_task=owner)
+    assert await holder.abort() is RouteDisposition.ABORTED
+    written_at = holder.terminal_written_at
+
+    owner.cancel()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    # ABORTED is the one disposition that authorises ABANDONED_PRE_INVOKE and a
+    # fresh same-turn mint; a done-callback that downgraded it to LOST would
+    # silently spend an attempt that was proved un-sent.
+    assert holder.disposition is RouteDisposition.ABORTED
+    assert holder.terminal_written_at == written_at
+    assert holder.owner_death_settled is True
+
+
+async def test_forbid_while_held_refuses_before_the_death_terminal_and_permits_after():
+    """Cleanup is locked out while the hold is live and unlocked once it settles."""
+
+    async def _live() -> None:
+        await asyncio.sleep(3600)
+
+    owner = asyncio.ensure_future(_live())
+    holder = HeldRoute(_FakeRoute(), object(), attempt_id="a", generations=GENS, owner_task=owner)
+
+    # Fail-closed while a live holder owns a genuinely held route.
+    with pytest.raises(RouteCustodyError, match="forbidden while route disposition is held"):
+        await holder.forbid_while_held("page.close")
+
+    owner.cancel()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    # Once the terminal exists the attempt can clean up after itself; without
+    # the done-callback the disposition would stay HELD and this would deadlock
+    # the attempt against its own teardown.
+    await holder.forbid_while_held("page.close")
+
+
+async def test_a_normally_returning_owner_also_writes_lost():
+    """B3 composition constraint: normal return is an owner exit like any other.
+
+    ``capture_held_route`` binds the owner to ``asyncio.current_task()``, so a
+    composition whose route handler captures and then RETURNS classifies its own
+    live route `lost` and unlocks ``forbid_while_held`` on a request Playwright
+    is still holding paused. Production must park the handler task for the whole
+    custody window (see ``capture_held_route``'s docstring). This test pins the
+    behaviour so the constraint cannot be quietly broken.
+    """
+    started = asyncio.Event()
+
+    async def _returns_normally() -> None:
+        started.set()
+        return None
+
+    owner = asyncio.ensure_future(_returns_normally())
+    holder = HeldRoute(_FakeRoute(), object(), attempt_id="a", generations=GENS, owner_task=owner)
+    await owner
+    await asyncio.sleep(0)
+
+    assert holder.disposition is RouteDisposition.LOST
+    with pytest.raises(RouteCustodyError, match="not live"):
+        await holder.guard_for_python(GENS)

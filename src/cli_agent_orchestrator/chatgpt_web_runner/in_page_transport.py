@@ -134,15 +134,27 @@ class HeldRoute:
         self._python_invoked = False
         self._terminal_written_at: Optional[float] = None
         self._owner_death_settled = False
-        # D1: "any holder-task exit for another reason ... before invocation it
-        # is ABANDONED_PRE_INVOKE with route disposition `lost`". A cancelled
-        # worker never gets to call on_teardown(), so without this callback the
-        # disposition stays HELD forever: the send guard still refuses (it
-        # checks the live task), but the attempt can never record a terminal
-        # and forbid_while_held() locks out its own cleanup. The holder writing
-        # its own terminal as it dies keeps the one-writer rule intact, and
-        # _set_terminal is idempotent, so a real terminal already written by
-        # fulfil/abort/observe always wins.
+        # D1 (r3 table): a holder task that stops existing without calling
+        # abort()/fulfil()/on_teardown() leaves a route nobody can prove was
+        # un-sent, so its disposition is `lost` — never `aborted`. A `lost`
+        # route terminates the attempt as ACK_UNKNOWN; ABANDONED_PRE_INVOKE is
+        # legal ONLY from a holder-owned abort that succeeded while the route
+        # was still HELD, which is why record_abandoned_pre_invoke() refuses
+        # any other disposition (send_intent.py) and why only `aborted`
+        # authorises a fresh same-turn mint.
+        #
+        # Without this callback the disposition would stay HELD forever: the
+        # send guard still refuses (it checks the live task), but the attempt
+        # could never record a terminal and forbid_while_held() would lock out
+        # its own cleanup. The holder writing its own terminal as it dies keeps
+        # the one-writer rule intact, and _set_terminal is first-terminal-wins,
+        # so a real terminal already written by fulfil/abort/observe wins.
+        #
+        # B3 composition constraint (B1 review, probe 4): this fires on ANY
+        # owner-task completion, including a NORMAL return. See
+        # capture_held_route's docstring — the owner must stay alive for the
+        # whole custody window, or custody must be handed over explicitly via
+        # owner_task=.
         if self._owner_task is not None:
             self._owner_task.add_done_callback(self._on_owner_done)
 
@@ -345,6 +357,24 @@ async def capture_held_route(
     This callback is intentionally tiny: it performs no ``continue_`` or
     network action. The caller persists ``REQUEST_HELD`` using the returned
     digest/name metadata before the one-shot sender is admitted.
+
+    **Holder-task lifetime contract (D1; B1 review probe 4).** The returned
+    :class:`HeldRoute` binds its owner to ``asyncio.current_task()`` — i.e. to
+    the Playwright route-handler task that called this function. That task MUST
+    stay alive for the whole custody window, from capture through
+    ``fulfil()``/``abort()``. ``HeldRoute`` writes the fail-closed ``lost``
+    terminal when its owner task completes **for any reason, including a normal
+    return**, so a handler that captures the route and then returns classifies
+    its own live route ``lost``, refuses the Python POST, and unlocks
+    ``forbid_while_held`` on a request Playwright is still holding paused.
+
+    Compositions therefore either park the handler task (await an event that
+    the custody window's end sets — what ``RealBrowserHarness`` and
+    :mod:`~cli_agent_orchestrator.chatgpt_web_runner.production` both do), or
+    hand custody over explicitly by constructing the :class:`HeldRoute` with
+    ``owner_task=`` naming the task that will outlive the window. There is no
+    third option: an implicitly-owned route whose handler returns is always
+    ``lost``.
     """
     request = route.request
     method = str(getattr(request, "method", "POST"))

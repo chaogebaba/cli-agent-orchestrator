@@ -98,6 +98,47 @@ def chromium_unavailable_reason() -> str:
     return _UNAVAILABLE_REASON or ""
 
 
+#: Set by whatever runs a CLOSURE round (a round whose rc is read as a verdict).
+#: An honest skip reason is a legibility improvement; it is not a closure
+#: property. With this set, a run that cannot execute the oracle FAILS instead
+#: of exiting 0 with every arm skipped (B1 review fix 2).
+REQUIRE_BROWSER_ENV = "CAO_F862_REQUIRE_BROWSER"
+
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def browser_required() -> bool:
+    """True when this run is being asked for a verdict, not an exploration."""
+    return os.environ.get(REQUIRE_BROWSER_ENV, "").strip().lower() in _TRUTHY
+
+
+def browser_skip_condition() -> bool:
+    """The ``skipif`` condition: never skip when a verdict was demanded.
+
+    When the browser is absent AND a verdict was demanded the arms are allowed
+    to run, so that :func:`enforce_browser_requirement` can fail them loudly.
+    """
+    return not chromium_available() and not browser_required()
+
+
+def enforce_browser_requirement() -> None:
+    """Fail — never skip — when a verdict run cannot reach the real browser.
+
+    Autouse in each real-browser module, so ``17 skipped, rc=0`` can never be
+    mistaken for ``17 passed`` by a merge gate or a closure round.
+    """
+    import pytest
+
+    if browser_required() and not chromium_available():
+        pytest.fail(
+            f"{REQUIRE_BROWSER_ENV} is set, so this run is a verdict and may not be "
+            f"satisfied by skips, but Chromium is unavailable: "
+            f"{chromium_unavailable_reason() or 'unknown reason'} "
+            f"(run `uv run playwright install chromium`)",
+            pytrace=False,
+        )
+
+
 def _pids_with(token: str) -> list[int]:
     """Every live PID whose cmdline contains ``token`` (Linux /proc scan)."""
     found: list[int] = []
