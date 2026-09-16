@@ -528,3 +528,199 @@ def test_revoke_is_idempotent_and_safe_in_teardown(tmp_path, workspace: Path) ->
     handle.revoke()
     handle.revoke()  # must not raise
     assert not handle.path.exists()
+
+
+# =====================================================================
+# Teardown on an EARLY failure (B3 fixes-2 review, finding 1)
+# =====================================================================
+
+
+def _port_is_closed(port: int) -> bool:
+    import socket as _socket
+
+    with _socket.socket() as probe:
+        probe.settimeout(2)
+        return probe.connect_ex(("127.0.0.1", port)) != 0
+
+
+def _early_failure_turn(tmp_path, monkeypatch, workspace: Path, attempt_id: str, *, break_at):
+    """Drive the composed turn to a failure BEFORE the mint, and report the state.
+
+    Returns (port, code_path). The pull plane is up and the raw code is on disk
+    by the time ``break_at`` fires, so both must be gone when the turn unwinds.
+    """
+    import cli_agent_orchestrator.chatgpt_web_runner.runtime as runtime
+    from cli_agent_orchestrator.chatgpt_web_runner.source_pull import PAIRING_CODE_FILENAME
+
+    port = _free_port()
+    monkeypatch.setenv("CAO_ARTIFACTS_DIR", str(tmp_path))
+    monkeypatch.setenv("CHATGPT_PULL_BIND_PORT", str(port))
+    monkeypatch.setenv("CHATGPT_PULL_PUBLIC_BASE_URL", f"http://127.0.0.1:{port}")
+    monkeypatch.setattr(runtime, "resolve_profile_dir", lambda: "/data/fake/profile", raising=False)
+    monkeypatch.setattr(runtime, "pin_fingerprint_seed", lambda _p: "epoch", raising=False)
+    break_at(monkeypatch, runtime, tmp_path, attempt_id, port)
+
+    log = _attempt(tmp_path, attempt_id)
+    with pytest.raises(Exception):
+        asyncio.run(_drive(log, attempt_id, workspace))
+    return port, tmp_path / "attempts" / attempt_id / PAIRING_CODE_FILENAME
+
+
+def _break_at_launch(monkeypatch, runtime, tmp_path, attempt_id, port) -> None:
+    """The browser (or the profile lock) refuses."""
+    from cli_agent_orchestrator.chatgpt_web_runner.source_pull import PAIRING_CODE_FILENAME
+
+    async def _launch(_options: object) -> object:
+        # The plane really is up at this point — otherwise the arm proves nothing.
+        assert (tmp_path / "attempts" / attempt_id / PAIRING_CODE_FILENAME).exists()
+        assert not _port_is_closed(port)
+        raise RuntimeError("Chromium refused to start")
+
+    monkeypatch.setattr(runtime, "launch", _launch, raising=False)
+
+
+def _break_at_composer_wait(monkeypatch, runtime, tmp_path, attempt_id, port) -> None:
+    """An expired ChatGPT login: the composer never becomes visible."""
+
+    class _Locator:
+        @property
+        def first(self):
+            return self
+
+        async def wait_for(self, **_kwargs):
+            raise TimeoutError("composer never became visible")
+
+    class _Page:
+        def __init__(self):
+            self.keyboard = None
+
+        def locator(self, _selector):
+            return _Locator()
+
+        def on(self, _event, _handler):
+            return None
+
+        async def route(self, _pattern, _handler):
+            return None
+
+        async def goto(self, _url, **_kwargs):
+            return None
+
+    class _Ctx:
+        def __init__(self):
+            self.pages = [_Page()]
+            self.closed = False
+
+        def on(self, _event, _handler):
+            return None
+
+        async def new_page(self):
+            return self.pages[0]
+
+        async def close(self):
+            self.closed = True
+
+    async def _launch(_options: object) -> object:
+        return _Ctx()
+
+    monkeypatch.setattr(runtime, "launch", _launch, raising=False)
+
+
+@pytest.mark.parametrize(
+    ("label", "break_at"),
+    [("launch", _break_at_launch), ("composer-wait", _break_at_composer_wait)],
+)
+def test_an_early_failure_still_unlinks_the_code_and_stops_the_listener(
+    tmp_path, monkeypatch, workspace: Path, label, break_at
+) -> None:
+    """The window the review found: the plane is up, the mint block is not reached.
+
+    Before this the protecting `try` did not open until the mint block, so a
+    failure at profile resolution, the launch, the navigation, the 20-second
+    composer wait or the readback check left a live single-use credential on
+    disk and the connector still listening — and the expiry watcher that would
+    eventually have cleaned up died with the event loop.
+    """
+    port, code_path = _early_failure_turn(
+        tmp_path, monkeypatch, workspace, f"early-{label}", break_at=break_at
+    )
+    assert not code_path.exists(), f"the raw pairing code survived a failure at {label}"
+    assert _port_is_closed(port), f"the connector listener survived a failure at {label}"
+
+
+# =====================================================================
+# O_EXCL (B3 fixes-2 review, finding 2)
+# =====================================================================
+
+
+def test_a_pre_existing_code_file_refuses_the_attempt(
+    tmp_path, monkeypatch, workspace: Path
+) -> None:
+    """Adopt-and-truncate is refused, not repaired after the fact.
+
+    Without O_EXCL the file was adopted and the code written into whatever mode
+    it already had — world-readable until a following chmod. Now the attempt
+    refuses instead of writing a secret into a file it does not own.
+    """
+    import cli_agent_orchestrator.chatgpt_web_runner.runtime as runtime
+    from cli_agent_orchestrator.chatgpt_web_runner.source_pull import PAIRING_CODE_FILENAME
+
+    port = _free_port()
+    monkeypatch.setenv("CAO_ARTIFACTS_DIR", str(tmp_path))
+    monkeypatch.setenv("CHATGPT_PULL_BIND_PORT", str(port))
+    monkeypatch.setenv("CHATGPT_PULL_PUBLIC_BASE_URL", f"http://127.0.0.1:{port}")
+    monkeypatch.setattr(runtime, "resolve_profile_dir", lambda: "/data/fake/profile", raising=False)
+    monkeypatch.setattr(runtime, "pin_fingerprint_seed", lambda _p: "epoch", raising=False)
+
+    launches: list[object] = []
+
+    async def _launch(options: object) -> object:
+        launches.append(options)
+        raise AssertionError("the turn must refuse before the browser")
+
+    monkeypatch.setattr(runtime, "launch", _launch, raising=False)
+
+    log = _attempt(tmp_path, "oexcl")
+    squatter = tmp_path / "attempts" / "oexcl" / PAIRING_CODE_FILENAME
+    squatter.parent.mkdir(parents=True, exist_ok=True)
+    squatter.write_text("not-ours\n", encoding="utf-8")
+    squatter.chmod(0o666)
+
+    with pytest.raises(RunnerError) as excinfo:
+        asyncio.run(_drive(log, "oexcl", workspace))
+
+    assert excinfo.value.code is RunnerErrorCode.ACCESS_DENIED
+    assert "already exists" in str(excinfo.value.hint)
+    assert launches == [], "the browser opened despite the refusal"
+    # The squatter's CONTENT is untouched: we neither truncated nor wrote to it.
+    assert squatter.read_text(encoding="utf-8") == "not-ours\n"
+
+
+def test_the_code_file_is_0600_at_creation_with_no_chmod_window(tmp_path, workspace: Path) -> None:
+    """Mode comes from the open() call, not from a repair afterwards."""
+    import inspect
+    import stat
+
+    from cli_agent_orchestrator.chatgpt_web_runner import source_pull
+    from cli_agent_orchestrator.chatgpt_web_runner.source_pull import PairingCodeFile
+    from cli_agent_orchestrator.workspace_connector.pairing import PairingManager
+
+    handle = PairingCodeFile(tmp_path / "attempt", PairingManager(workspace_id="w"))
+    handle.write("ABCD-EFGH")
+    assert stat.S_IMODE(handle.path.stat().st_mode) == 0o600
+
+    # Structural, because a chmod repair would make the mode assertion above
+    # pass while leaving exactly the window this is about. Parsed rather than
+    # grepped, so the docstring explaining the old chmod does not match.
+    import ast
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(PairingCodeFile.write)))
+    names = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+    assert "O_EXCL" in names, "O_EXCL is the whole point of this write"
+    calls = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert "chmod" not in calls, "a chmod repair means there was a window to repair"

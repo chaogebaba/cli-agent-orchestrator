@@ -347,20 +347,50 @@ class PairingCodeFile:
         self._watcher: "Optional[asyncio.Task[None]]" = None
 
     def write(self, code: str) -> str:
-        """Write the code 0600 and return its SHA-256, which the ledger keeps."""
+        """Create the code file 0600 and return its SHA-256 for the ledger.
+
+        ``O_EXCL`` is the point, not decoration. Without it a pre-existing file
+        is ADOPTED and truncated, and since a mode argument applies only at
+        creation, the code is written into whatever mode that file already had —
+        world-readable, until a following ``chmod`` repairs it. The previous
+        revision said O_EXCL in a comment and did not pass it (B3 fixes-2
+        review, finding 2). With it there is no window at any mode but 0600, and
+        no file we did not create.
+
+        There is deliberately no ``revoke()`` before the open. Unlinking first
+        would make ``O_EXCL`` unobservable — every pre-existing file would be
+        silently replaced, which is the behaviour this is meant to refuse. The
+        path is per-attempt (``attempts/<attempt-id>/``) and ``write`` is called
+        once per attempt, so a file already there was not put there by us.
+        """
+        import errno
         import hashlib
         import os
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        # O_EXCL: never adopt a file someone else left here; 0o600 at creation,
-        # so there is no window in which it exists with a wider mode.
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        fd = os.open(str(self.path), flags, 0o600)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        try:
+            fd = os.open(str(self.path), flags, 0o600)
+        except FileExistsError as exc:
+            raise RunnerError(
+                RunnerErrorCode.ACCESS_DENIED,
+                f"refusing to write the pairing code: {self.path} already exists and is not "
+                "ours to replace — the attempt is refused rather than adopting a file whose "
+                "mode and owner we did not choose",
+                delivery_state=DeliveryState.NOTHING_SENT,
+            ) from exc
+        except OSError as exc:
+            if exc.errno == errno.EEXIST:  # pragma: no cover - platform variance
+                raise RunnerError(
+                    RunnerErrorCode.ACCESS_DENIED,
+                    f"refusing to write the pairing code: {self.path} already exists",
+                    delivery_state=DeliveryState.NOTHING_SENT,
+                ) from exc
+            raise
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(code + "\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(str(self.path), 0o600)
         return hashlib.sha256(code.encode("utf-8")).hexdigest()
 
     def revoke(self) -> None:

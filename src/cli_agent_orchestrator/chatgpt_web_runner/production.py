@@ -605,307 +605,323 @@ async def _drive_composed_turn(
     else:
         intent_log.transition(AttemptState.CONNECTOR_READY)
 
-    profile = resolve_profile_dir()
-    profile_epoch = pin_fingerprint_seed(profile)
-    context = await launch(build_launch_options(profile, profile_epoch))
-    page = context.pages[0] if context.pages else await context.new_page()
-    generations = LiveGenerations(page, context)
-    intent_log.transition(AttemptState.OWNED_BROWSER_READY)
+    # Everything from here on runs under ONE teardown. The pull plane is
+    # already up and the raw pairing code is already on disk, so every failure
+    # between here and the mint — profile resolution, the browser launch, the
+    # navigation, the 20s composer wait, the readback check — must still unlink
+    # the code and stop the listener. Before this the protecting `try` did not
+    # open until the mint block, so those five sites leaked a live single-use
+    # credential and a running listener, and the expiry watcher that would have
+    # cleaned up died with the event loop (B3 fixes-2 review, finding 1).
+    context: Any = None
+    try:
+        profile = resolve_profile_dir()
+        profile_epoch = pin_fingerprint_seed(profile)
+        context = await launch(build_launch_options(profile, profile_epoch))
+        page = context.pages[0] if context.pages else await context.new_page()
+        generations = LiveGenerations(page, context)
+        intent_log.transition(AttemptState.OWNED_BROWSER_READY)
 
-    custody = _HeldRouteCustody(
-        attempt_id=attempt_id, mint_id=attempt_id, profile_epoch=profile_epoch
-    )
+        custody = _HeldRouteCustody(
+            attempt_id=attempt_id, mint_id=attempt_id, profile_epoch=profile_epoch
+        )
 
-    async def _dispatcher(route: Any) -> None:
-        """The ONE route dispatcher, installed before any composer action.
+        async def _dispatcher(route: Any) -> None:
+            """The ONE route dispatcher, installed before any composer action.
 
-        Non-conversation traffic keeps its normal page behaviour unless the D3
-        egress guard denies its host. The conversation POST is HELD and NEVER
-        continued: there is no ``continue_()`` success branch for it, which is
-        the deletion D10 asks for.
-        """
-        request = route.request
-        try:
-            method = str(getattr(request, "method", "GET"))
-            url = str(getattr(request, "url", ""))
-        except Exception:  # pragma: no cover - defensive
-            # ABORT, never continue. This branch runs when the request will not
-            # tell us its own method or url, so it is exactly the case where we
-            # cannot rule out that it IS the conversation POST. Continuing would
-            # be the one `continue_()` in this dispatcher that could release the
-            # send to the origin; aborting costs a page asset at worst
-            # (B3 review §8 item 4).
-            await route.abort()
-            return
-        if not is_conversation_post(method, url):
+            Non-conversation traffic keeps its normal page behaviour unless the D3
+            egress guard denies its host. The conversation POST is HELD and NEVER
+            continued: there is no ``continue_()`` success branch for it, which is
+            the deletion D10 asks for.
+            """
+            request = route.request
             try:
-                enforce_no_api_egress(url)
-            except RunnerError:
+                method = str(getattr(request, "method", "GET"))
+                url = str(getattr(request, "url", ""))
+            except Exception:  # pragma: no cover - defensive
+                # ABORT, never continue. This branch runs when the request will not
+                # tell us its own method or url, so it is exactly the case where we
+                # cannot rule out that it IS the conversation POST. Continuing would
+                # be the one `continue_()` in this dispatcher that could release the
+                # send to the origin; aborting costs a page asset at worst
+                # (B3 review §8 item 4).
                 await route.abort()
                 return
-            await route.continue_()
-            return
-        # A SECOND conversation POST is not this attempt's mint. One mint per
-        # turn is the whole invariant, and the composer side is already guarded
-        # by the durable record — but a page-initiated retry would otherwise
-        # park a second handler forever, or quietly replace the captured route.
-        # Aborting it is safe and conservative: that copy provably never reached
-        # the origin, and the attempt's own held route is untouched.
-        if custody.entered.is_set():
-            custody.refused = "a second conversation POST was refused; one mint per turn"
-            logger.warning("chatgpt_web refused a second conversation POST for %s", attempt_id)
-            await route.abort()
-            return
-        # The conversation POST: capture, hold, and PARK so the owner task
-        # outlives the custody window (capture_held_route's contract).
-        try:
-            captured = await capture_held_route(
-                route,
-                attempt_id=attempt_id,
-                mint_id=attempt_id,
-                profile_epoch=profile_epoch,
-                generations=generations.current,
-            )
-        except RouteCustodyError as exc:
-            custody.refused = str(exc)
-            custody.finished.set()
-            return
-        custody.captured = captured
-        custody.holder = captured.route_holder
-        _wire_request_events(page, custody, captured.route_holder.request)
-        custody.entered.set()
-        try:
-            await custody.release.wait()
-        finally:
-            custody.finished.set()
-
-    await page.route("**/*", _dispatcher)
-    await page.goto(CHATGPT_URL, wait_until="domcontentloaded")
-    await page.locator(SEL_COMPOSER).first.wait_for(state="visible", timeout=20000)
-    intent_log.transition(AttemptState.INPUT_READY)
-
-    transport = Transport(page, intent_log=intent_log)
-    await transport.type_prompt(task_text)
-    # The dispatcher was installed before navigation, i.e. EARLIER than D6's
-    # INTERCEPT_ARMED position requires. The row is written here, at the last
-    # moment before the mint, so it records "still armed with the prompt in the
-    # composer" rather than merely "was armed at some earlier point".
-    intent_log.transition(AttemptState.INTERCEPT_ARMED)
-
-    attempt_nonce = new_run_id()
-    intent_log.record_send_intent(
-        conversation_id=None,
-        current_node=None,
-        attempt_nonce=attempt_nonce,
-    )
-
-    # ── the relay binding window closes HERE, before the mint (D3/D6) ─────
-    # The runner does NOT bind: the relay has exactly one subscriber and it is
-    # whoever presented the token on the public CAO route. ``bind()`` mints the
-    # subscriber id and writes RELAY_BOUND_OR_SKIPPED itself, so a runner that
-    # called it would consume the single binding and lock the real subscriber
-    # out. All the runner owes is the EXPLICIT close: if nobody has bound by the
-    # time the mint is about to be reserved, the attempt records a skip, so the
-    # durable row always says which of the two happened.
-    relay = get_relay_hub().get(attempt_id)
-    if not relay.is_bound:
-        await relay.mark_skipped()
-
-    answer: Optional[AcceptedAnswer] = None
-    try:
-        # ── the mint: EXACTLY ONE composer Enter ──────────────────────────
-        intent_log.transition(AttemptState.COMPOSER_MINT_TRIGGERED)
-        await transport.trigger_composer_mint()
-        try:
-            await asyncio.wait_for(custody.entered.wait(), _HOLD_TIMEOUT_S)
-        except asyncio.TimeoutError:
-            raise RunnerError(
-                RunnerErrorCode.SUBMIT_UNKNOWN,
-                "the composer trigger produced no held conversation POST "
-                f"within {_HOLD_TIMEOUT_S:.0f}s (intercept unproven)",
-                delivery_state=DeliveryState.NOTHING_SENT,
-            )
-        captured = custody.captured
-        holder = custody.holder
-        assert captured is not None and holder is not None
-
-        gens = captured.route_holder.generations
-        intent_log.record_request_held(
-            body_sha256=captured.body_sha256,
-            header_names=captured.header_names,
-            page_generation=gens.page,
-            context_generation=gens.context,
-            cdp_session_generation=gens.cdp_session,
-        )
-        transport._observe_send()
-
-        # ── the ONE Python POST ───────────────────────────────────────────
-        user_message_id = new_run_id()
-        body, posted_user_message = rewrite_first_use_body(
-            captured.raw_body,
-            prompt_text=task_text,
-            user_message_id=user_message_id,
-        )
-        origin = await send_once(
-            captured,
-            body=body,
-            live_generations=generations.current,
-            intent_log=intent_log,
-            relay=relay,
-        )
-
-        conversation_id = origin.conversation_id
-        if not conversation_id:
-            raise RunnerError(
-                RunnerErrorCode.SUBMIT_UNKNOWN,
-                "the origin stream carried no conversation id; the attempt is ack-unknown",
-                delivery_state=DeliveryState.ACK_UNKNOWN,
-            )
-
-        # ── the DETACHED authoritative GET ────────────────────────────────
-        # Not the browser's: D10 removed the in-page conversation fetch as
-        # publication transport.
-        intent_log.transition(AttemptState.GET_VERIFY)
-        answer, branch_digest = await poll_authoritative_get(
-            conversation_id=conversation_id,
-            submitted_user_msg_id=user_message_id,
-            run_id=run_id,
-            bundle_sha=prompt_sha,
-            deadline=time.monotonic() + _GET_TIMEOUT_S,
-            get_conversation=_detached_get(captured),
-        )
-        # The GET chose the node and the branch; record both. Before this they
-        # were declared on the record and never assigned, so the two fields the
-        # live-turn ledger tells the supervisor to read came back null
-        # (B3 review §7(b)).
-        intent_log.transition(
-            AttemptState.GET_VERIFY,
-            verified_node_id=answer.assistant_node_id,
-            conversation_digest=branch_digest,
-        )
-
-        # ── the LOCAL synthetic fulfil ────────────────────────────────────
-        # Built from the exact object Python posted, so the page renders the
-        # answer it would have rendered — without a second origin request.
-        #
-        # D11 BUILD STOP, ORDERING A. The release may ALREADY be recorded by the
-        # time we get here: a `response` observed while the route was still HELD
-        # terminates `released_to_origin` (D1). ``fulfil()`` refuses from any
-        # non-HELD disposition, so calling it first would raise
-        # RouteCustodyError — a RuntimeError, which ``run_review`` does not
-        # catch — and the whole detector below would be skipped, taking the
-        # callback and the ledger row with it. So the disposition is read BEFORE
-        # the fulfil, not after it. (B3 review finding 4.)
-        await custody.settle()
-        if holder.disposition is RouteDisposition.RELEASED_TO_ORIGIN:
-            raise _d11_build_stop(intent_log, "before the local fulfil was attempted")
-
-        try:
-            disposition = await holder.fulfil(
-                body=synthetic_v1_stream(
-                    posted_user_message=posted_user_message,
-                    conversation_id=conversation_id,
-                    assistant_id=answer.assistant_node_id,
-                    final_text=answer.text,
+            if not is_conversation_post(method, url):
+                try:
+                    enforce_no_api_egress(url)
+                except RunnerError:
+                    await route.abort()
+                    return
+                await route.continue_()
+                return
+            # A SECOND conversation POST is not this attempt's mint. One mint per
+            # turn is the whole invariant, and the composer side is already guarded
+            # by the durable record — but a page-initiated retry would otherwise
+            # park a second handler forever, or quietly replace the captured route.
+            # Aborting it is safe and conservative: that copy provably never reached
+            # the origin, and the attempt's own held route is untouched.
+            if custody.entered.is_set():
+                custody.refused = "a second conversation POST was refused; one mint per turn"
+                logger.warning("chatgpt_web refused a second conversation POST for %s", attempt_id)
+                await route.abort()
+                return
+            # The conversation POST: capture, hold, and PARK so the owner task
+            # outlives the custody window (capture_held_route's contract).
+            try:
+                captured = await capture_held_route(
+                    route,
+                    attempt_id=attempt_id,
+                    mint_id=attempt_id,
+                    profile_epoch=profile_epoch,
+                    generations=generations.current,
                 )
-            )
-        except RouteCustodyError as exc:
-            raise classify_refused_fulfil(intent_log, holder, exc) from exc
+            except RouteCustodyError as exc:
+                custody.refused = str(exc)
+                custody.finished.set()
+                return
+            custody.captured = captured
+            custody.holder = captured.route_holder
+            _wire_request_events(page, custody, captured.route_holder.request)
+            custody.entered.set()
+            try:
+                await custody.release.wait()
+            finally:
+                custody.finished.set()
 
-        await custody.settle()
-        # D11, ORDERING B. An event landing at or after the HELD -> FULFILLING
-        # CAS is, by D1(iii), indistinguishable from the local fulfil's own
-        # completion and terminates `fulfilled`. That classification is correct
-        # and is NOT reinterpreted here.
-        #
-        # There is deliberately NO post-fulfil `released_to_origin` check. It
-        # would be unreachable: `fulfil()` returns only after a terminal is
-        # written, and `_set_terminal` is first-terminal-wins, so the
-        # disposition here is `fulfilled` or `lost` and can never later become
-        # `released_to_origin` (pinned by
-        # test_a_terminal_disposition_can_never_become_a_release). A check that
-        # cannot fire is exactly what the B3 review found; adding a second one
-        # would repeat the defect. What ordering B owes is a RECORD, below, so
-        # `route_disposition` separates the outcomes instead of being absent on
-        # the happy path and absent on a stop alike.
-        if disposition is RouteDisposition.FULFILLED:
+        await page.route("**/*", _dispatcher)
+        await page.goto(CHATGPT_URL, wait_until="domcontentloaded")
+        await page.locator(SEL_COMPOSER).first.wait_for(state="visible", timeout=20000)
+        intent_log.transition(AttemptState.INPUT_READY)
+
+        transport = Transport(page, intent_log=intent_log)
+        await transport.type_prompt(task_text)
+        # The dispatcher was installed before navigation, i.e. EARLIER than D6's
+        # INTERCEPT_ARMED position requires. The row is written here, at the last
+        # moment before the mint, so it records "still armed with the prompt in the
+        # composer" rather than merely "was armed at some earlier point".
+        intent_log.transition(AttemptState.INTERCEPT_ARMED)
+
+        attempt_nonce = new_run_id()
+        intent_log.record_send_intent(
+            conversation_id=None,
+            current_node=None,
+            attempt_nonce=attempt_nonce,
+        )
+
+        # ── the relay binding window closes HERE, before the mint (D3/D6) ─────
+        # The runner does NOT bind: the relay has exactly one subscriber and it is
+        # whoever presented the token on the public CAO route. ``bind()`` mints the
+        # subscriber id and writes RELAY_BOUND_OR_SKIPPED itself, so a runner that
+        # called it would consume the single binding and lock the real subscriber
+        # out. All the runner owes is the EXPLICIT close: if nobody has bound by the
+        # time the mint is about to be reserved, the attempt records a skip, so the
+        # durable row always says which of the two happened.
+        relay = get_relay_hub().get(attempt_id)
+        if not relay.is_bound:
+            await relay.mark_skipped()
+
+        answer: Optional[AcceptedAnswer] = None
+        try:
+            # ── the mint: EXACTLY ONE composer Enter ──────────────────────────
+            intent_log.transition(AttemptState.COMPOSER_MINT_TRIGGERED)
+            await transport.trigger_composer_mint()
+            try:
+                await asyncio.wait_for(custody.entered.wait(), _HOLD_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                raise RunnerError(
+                    RunnerErrorCode.SUBMIT_UNKNOWN,
+                    "the composer trigger produced no held conversation POST "
+                    f"within {_HOLD_TIMEOUT_S:.0f}s (intercept unproven)",
+                    delivery_state=DeliveryState.NOTHING_SENT,
+                )
+            captured = custody.captured
+            holder = custody.holder
+            assert captured is not None and holder is not None
+
+            gens = captured.route_holder.generations
+            intent_log.record_request_held(
+                body_sha256=captured.body_sha256,
+                header_names=captured.header_names,
+                page_generation=gens.page,
+                context_generation=gens.context,
+                cdp_session_generation=gens.cdp_session,
+            )
+            transport._observe_send()
+
+            # ── the ONE Python POST ───────────────────────────────────────────
+            user_message_id = new_run_id()
+            body, posted_user_message = rewrite_first_use_body(
+                captured.raw_body,
+                prompt_text=task_text,
+                user_message_id=user_message_id,
+            )
+            origin = await send_once(
+                captured,
+                body=body,
+                live_generations=generations.current,
+                intent_log=intent_log,
+                relay=relay,
+            )
+
+            conversation_id = origin.conversation_id
+            if not conversation_id:
+                raise RunnerError(
+                    RunnerErrorCode.SUBMIT_UNKNOWN,
+                    "the origin stream carried no conversation id; the attempt is ack-unknown",
+                    delivery_state=DeliveryState.ACK_UNKNOWN,
+                )
+
+            # ── the DETACHED authoritative GET ────────────────────────────────
+            # Not the browser's: D10 removed the in-page conversation fetch as
+            # publication transport.
+            intent_log.transition(AttemptState.GET_VERIFY)
+            answer, branch_digest = await poll_authoritative_get(
+                conversation_id=conversation_id,
+                submitted_user_msg_id=user_message_id,
+                run_id=run_id,
+                bundle_sha=prompt_sha,
+                deadline=time.monotonic() + _GET_TIMEOUT_S,
+                get_conversation=_detached_get(captured),
+            )
+            # The GET chose the node and the branch; record both. Before this they
+            # were declared on the record and never assigned, so the two fields the
+            # live-turn ledger tells the supervisor to read came back null
+            # (B3 review §7(b)).
             intent_log.transition(
-                AttemptState.BROWSER_FULFIL,
-                route_disposition=RouteDisposition.FULFILLED.value,
-                fulfilled_at=time.time(),
-            )
-        else:
-            intent_log.record_ack_unknown(
-                route_disposition=disposition.value, page_disposition=_PAGE_DISPOSITION_ON_FAILURE
+                AttemptState.GET_VERIFY,
+                verified_node_id=answer.assistant_node_id,
+                conversation_digest=branch_digest,
             )
 
-        # ── AC-33 source correlation, BEFORE publication ──────────────────
-        if connector_server is not None:
-            from cli_agent_orchestrator.api.routes_chatgpt_web_connector import (
-                connector_audit_projection,
-            )
+            # ── the LOCAL synthetic fulfil ────────────────────────────────────
+            # Built from the exact object Python posted, so the page renders the
+            # answer it would have rendered — without a second origin request.
+            #
+            # D11 BUILD STOP, ORDERING A. The release may ALREADY be recorded by the
+            # time we get here: a `response` observed while the route was still HELD
+            # terminates `released_to_origin` (D1). ``fulfil()`` refuses from any
+            # non-HELD disposition, so calling it first would raise
+            # RouteCustodyError — a RuntimeError, which ``run_review`` does not
+            # catch — and the whole detector below would be skipped, taking the
+            # callback and the ledger row with it. So the disposition is read BEFORE
+            # the fulfil, not after it. (B3 review finding 4.)
+            await custody.settle()
+            if holder.disposition is RouteDisposition.RELEASED_TO_ORIGIN:
+                raise _d11_build_stop(intent_log, "before the local fulfil was attempted")
 
-            evidence = collect_pull_evidence(connector_audit_projection(connector_server))
-            # The two digests must come from DIFFERENT observations or the check
-            # is vacuous (B3 review §8 item 4). `branch_digest` is what
-            # poll_authoritative_get accepted; `recorded` is what the ledger
-            # stored on the GET_VERIFY row. They agree only if nothing rewrote
-            # the branch between acceptance and this point.
-            recorded = str(intent_log.record.conversation_digest or "")
-            correlated = verify_source_correlation(
-                evidence,
-                answer_text=answer.text,
-                observed_branch_digest=recorded,
-                accepted_branch_digest=branch_digest,
-            )
-            pull_evidence["sources"] = [
-                {"path": source.path, "digest": source.digest} for source in correlated
-            ]
-            pull_evidence["branch_digest"] = branch_digest
+            try:
+                disposition = await holder.fulfil(
+                    body=synthetic_v1_stream(
+                        posted_user_message=posted_user_message,
+                        conversation_id=conversation_id,
+                        assistant_id=answer.assistant_node_id,
+                        final_text=answer.text,
+                    )
+                )
+            except RouteCustodyError as exc:
+                raise classify_refused_fulfil(intent_log, holder, exc) from exc
 
-        # ── AC-20 counters gate acceptance ────────────────────────────────
-        failure = intent_log.acceptance_failure()
-        if failure:
+            await custody.settle()
+            # D11, ORDERING B. An event landing at or after the HELD -> FULFILLING
+            # CAS is, by D1(iii), indistinguishable from the local fulfil's own
+            # completion and terminates `fulfilled`. That classification is correct
+            # and is NOT reinterpreted here.
+            #
+            # There is deliberately NO post-fulfil `released_to_origin` check. It
+            # would be unreachable: `fulfil()` returns only after a terminal is
+            # written, and `_set_terminal` is first-terminal-wins, so the
+            # disposition here is `fulfilled` or `lost` and can never later become
+            # `released_to_origin` (pinned by
+            # test_a_terminal_disposition_can_never_become_a_release). A check that
+            # cannot fire is exactly what the B3 review found; adding a second one
+            # would repeat the defect. What ordering B owes is a RECORD, below, so
+            # `route_disposition` separates the outcomes instead of being absent on
+            # the happy path and absent on a stop alike.
+            if disposition is RouteDisposition.FULFILLED:
+                intent_log.transition(
+                    AttemptState.BROWSER_FULFIL,
+                    route_disposition=RouteDisposition.FULFILLED.value,
+                    fulfilled_at=time.time(),
+                )
+            else:
+                intent_log.record_ack_unknown(
+                    route_disposition=disposition.value,
+                    page_disposition=_PAGE_DISPOSITION_ON_FAILURE,
+                )
+
+            # ── AC-33 source correlation, BEFORE publication ──────────────────
+            if connector_server is not None:
+                from cli_agent_orchestrator.api.routes_chatgpt_web_connector import (
+                    connector_audit_projection,
+                )
+
+                evidence = collect_pull_evidence(connector_audit_projection(connector_server))
+                # The two digests must come from DIFFERENT observations or the check
+                # is vacuous (B3 review §8 item 4). `branch_digest` is what
+                # poll_authoritative_get accepted; `recorded` is what the ledger
+                # stored on the GET_VERIFY row. They agree only if nothing rewrote
+                # the branch between acceptance and this point.
+                recorded = str(intent_log.record.conversation_digest or "")
+                correlated = verify_source_correlation(
+                    evidence,
+                    answer_text=answer.text,
+                    observed_branch_digest=recorded,
+                    accepted_branch_digest=branch_digest,
+                )
+                pull_evidence["sources"] = [
+                    {"path": source.path, "digest": source.digest} for source in correlated
+                ]
+                pull_evidence["branch_digest"] = branch_digest
+
+            # ── AC-20 counters gate acceptance ────────────────────────────────
+            failure = intent_log.acceptance_failure()
+            if failure:
+                raise RunnerError(
+                    RunnerErrorCode.SUBMIT_UNKNOWN,
+                    failure,
+                    delivery_state=DeliveryState.ACK_UNKNOWN,
+                )
+            return answer
+        except RouteCustodyError as exc:
+            # BACKSTOP. Custody errors are RuntimeErrors, and ``run_review`` catches
+            # only RunnerError — so any RouteCustodyError that escapes this function
+            # escapes the whole runner, and the worker sends NO callback: neither
+            # FINDINGS-READY nor FINDINGS-FAILED. That is exactly how the D11 stop
+            # became unobservable (B3 review finding 4). The sites above classify
+            # the ones they can name; this converts anything else (``send_once``'s
+            # ``guard_for_python`` and ``mark_python_invoked`` both raise it) so the
+            # failure is always typed, always recorded, and always called back.
+            held = custody.holder
+            observed = held.disposition.value if held is not None else "unknown"
+            with contextlib.suppress(Exception):
+                intent_log.record_ack_unknown(
+                    route_disposition=observed, page_disposition=_PAGE_DISPOSITION_ON_FAILURE
+                )
             raise RunnerError(
-                RunnerErrorCode.SUBMIT_UNKNOWN, failure, delivery_state=DeliveryState.ACK_UNKNOWN
-            )
-        return answer
-    except RouteCustodyError as exc:
-        # BACKSTOP. Custody errors are RuntimeErrors, and ``run_review`` catches
-        # only RunnerError — so any RouteCustodyError that escapes this function
-        # escapes the whole runner, and the worker sends NO callback: neither
-        # FINDINGS-READY nor FINDINGS-FAILED. That is exactly how the D11 stop
-        # became unobservable (B3 review finding 4). The sites above classify
-        # the ones they can name; this converts anything else (``send_once``'s
-        # ``guard_for_python`` and ``mark_python_invoked`` both raise it) so the
-        # failure is always typed, always recorded, and always called back.
-        held = custody.holder
-        observed = held.disposition.value if held is not None else "unknown"
-        with contextlib.suppress(Exception):
-            intent_log.record_ack_unknown(
-                route_disposition=observed, page_disposition=_PAGE_DISPOSITION_ON_FAILURE
-            )
-        raise RunnerError(
-            RunnerErrorCode.SUBMIT_UNKNOWN,
-            f"route custody was lost during the composed turn ({observed}): {exc}",
-            delivery_state=DeliveryState.ACK_UNKNOWN,
-        ) from exc
+                RunnerErrorCode.SUBMIT_UNKNOWN,
+                f"route custody was lost during the composed turn ({observed}): {exc}",
+                delivery_state=DeliveryState.ACK_UNKNOWN,
+            ) from exc
+        finally:
+            # Release the parked holder FIRST so the owner task can end without
+            # racing the teardown, then take the pull plane and the browser down.
+            custody.release.set()
+            # Only a handler that actually entered can finish; waiting on a route
+            # that was never captured would burn the whole timeout for nothing.
+            if custody.entered.is_set():
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(custody.finished.wait(), 10)
     finally:
-        # Release the parked holder FIRST so the owner task can end without
-        # racing the teardown, then take the pull plane and the browser down.
-        custody.release.set()
-        # Only a handler that actually entered can finish; waiting on a route
-        # that was never captured would burn the whole timeout for nothing.
-        if custody.entered.is_set():
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(custody.finished.wait(), 10)
-        # The raw code never outlives the attempt, whatever ended it.
+        # Unconditional, and in dependency order: the code first (it is the
+        # secret), then the listener it authorises, then the browser.
         if pairing_file is not None:
             await pairing_file.stop_watch()
         if connector_listener is not None:
             await connector_listener.stop()
-        with contextlib.suppress(Exception):
-            await context.close()
+        if context is not None:
+            with contextlib.suppress(Exception):
+                await context.close()
 
 
 def classify_refused_fulfil(intent_log: Any, holder: Any, exc: Exception) -> RunnerError:
