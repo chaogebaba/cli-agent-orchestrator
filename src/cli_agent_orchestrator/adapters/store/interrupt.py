@@ -561,6 +561,36 @@ class SqliteInterruptStore:
             )
             return cursor.rowcount > 0
 
+    def begin_prompt(self, fence: InterruptFence) -> bool:
+        """CAS ``pending -> prompting`` for the IDLE branch (D6b(3)).
+
+        The idle path's durable dispatch INTENT, and the reason it exists as its
+        own operation rather than being folded into ``complete_prompt``: A2.3
+        puts the intent immediately before the one adapter write, so a crash
+        between the two leaves a ``prompting`` row that the restart oracle
+        resolves ``SUBMISSION_UNCERTAIN`` — which is the honest answer, because
+        the bytes may have left. Folding them would make that window invisible
+        and every ambiguous write would look like one that never happened.
+
+        No cancel is involved, so no deadline is set: ACP defines
+        ``session/cancel`` for an ongoing turn only, and the idle branch has no
+        turn to cut.
+        """
+        conn = self._pool.connection()
+        with immediate_transaction(conn):
+            cursor = conn.execute(
+                "UPDATE interrupt_state SET phase = ?, generation = generation + 1, "
+                "deadline = NULL "
+                "WHERE terminal_id = ? AND phase = ? AND generation = ?",
+                (
+                    InterruptPhase.PROMPTING.value,
+                    fence.terminal_id,
+                    InterruptPhase.PENDING.value,
+                    fence.generation,
+                ),
+            )
+            return cursor.rowcount > 0
+
     def complete_prompt(self, fence: InterruptFence, receipt: SubmitReceipt) -> bool:
         """CAS ``prompting -> none`` and close I's attempt, in ONE transaction.
 
