@@ -243,6 +243,63 @@ class HeldRoute:
         return proposal
 
 
+class LiveGenerations:
+    """Derive the three D1 generations from public Playwright lifecycle events.
+
+    ``HeldRoute.guard_for_python`` compares the generations recorded at
+    ``REQUEST_HELD`` against the live ones; something has to produce the live
+    triple from real objects. This tracker is that seam: it subscribes to the
+    public ``close``/``crash``/``disconnected`` events and bumps the matching
+    counter, so a page/context/browser that died between the hold and the
+    socket call is observable without reading any private Playwright state.
+
+    It is deliberately monotonic and never decrements: a bumped generation can
+    only make the guard refuse, never admit.
+    """
+
+    def __init__(
+        self,
+        page: Any,
+        context: Any = None,
+        cdp_session: Any = None,
+    ) -> None:
+        self._page_gen = 1
+        self._context_gen = 1
+        self._cdp_gen = 1
+        self._page = page
+        self._context = context
+        self._cdp_session = cdp_session
+        if page is not None:
+            page.on("close", lambda *_a: self.bump_page())
+            page.on("crash", lambda *_a: self.bump_page())
+        if context is not None:
+            context.on("close", lambda *_a: self.bump_context())
+        if cdp_session is not None:
+            # A detached CDP session invalidates every command issued on it.
+            on = getattr(cdp_session, "on", None)
+            if callable(on):
+                on("detached", lambda *_a: self.bump_cdp_session())
+
+    def bump_page(self) -> None:
+        self._page_gen += 1
+
+    def bump_context(self) -> None:
+        self._context_gen += 1
+        # A dead context takes its pages with it.
+        self._page_gen += 1
+
+    def bump_cdp_session(self) -> None:
+        self._cdp_gen += 1
+
+    @property
+    def current(self) -> RouteGenerations:
+        return RouteGenerations(
+            page=self._page_gen,
+            context=self._context_gen,
+            cdp_session=self._cdp_gen,
+        )
+
+
 def is_conversation_post(method: str, url: str) -> bool:
     """Match only the real conversation POST, never a ``/prepare`` request."""
     return (
