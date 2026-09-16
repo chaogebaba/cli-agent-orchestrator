@@ -376,6 +376,11 @@ class TestCreateSession:
             initial_message=None,
             initial_message_orchestration_type=None,
             model=None,
+            # WP-ACP-PLANE D21/AC-S1.16: the per-worker reasoning effort, a query
+            # param beside `model` because it is the same kind of thing. `None`
+            # is "the caller said nothing", which leaves the providers.toml
+            # precedence chain untouched.
+            effort=None,
             lifecycle=None,
             resume_session_id=None,
             group=None,

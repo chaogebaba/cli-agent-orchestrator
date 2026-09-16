@@ -13,7 +13,7 @@ from typing import Any
 from cli_agent_orchestrator.adapters.truth import legacy_egress as _wt_legacy_egress
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import list_terminals_by_session
-from cli_agent_orchestrator.core.transport import is_pane_terminal
+from cli_agent_orchestrator.core.transport import is_acp_terminal, is_pane_terminal
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.utils.provider_plane import provider_home
@@ -642,3 +642,34 @@ def get_wake_exhaustion_alarms() -> list[dict[str, Any]]:
                 }
             )
     return alarms
+
+
+def backend_for_terminal(row: Any) -> Any:
+    """The terminal backend that owns this row's pane, or ``None`` for an ACP row.
+
+    WP-ACP-PLANE D20/AC-S1.10.  ``get_backend()`` answers "what backend is this
+    installation configured with", which every caller has always been able to
+    ask.  This answers the different question D20 introduces — "does this
+    TERMINAL have a pane backend at all" — and it is a separate function because
+    the two have different failure modes: the installation always has a backend,
+    and an ACP terminal never has a pane.
+
+    It lives HERE rather than beside ``get_backend`` in ``backends/registry.py``,
+    where it started.  ``registry.py`` is a legacy module and the AC11 hook-point
+    contract is an EQUALITY over which legacy files may reach the new tree —
+    adding ``registry.py`` to that set would claim it is a phase-1 hook point,
+    which it is not.  This module is already on that list, and it is also where
+    the transport question is actually asked, so the branch and its one consumer
+    stay together.
+
+    Returning ``None`` rather than raising is deliberate: a caller with no
+    ACP-shaped branch yet gets an ordinary absent-resource answer, not an
+    exception from a lookup that used to be infallible.
+
+    The branch is on ``transport``.  It is NEVER on the coordinate columns being
+    NULL — those are nullable for ACP rows, and reading their absence as a signal
+    is the exact confusion AC-S1.10's grep fails.
+    """
+    if is_acp_terminal(row):
+        return None
+    return get_backend()

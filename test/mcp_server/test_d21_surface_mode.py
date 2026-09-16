@@ -135,15 +135,28 @@ def test_the_mode_can_be_given_as_argv_too() -> None:
     assert _spawned_tool_names("bare", via_argv=True) == sorted(BARE_MODE_TOOLS)
 
 
-def test_bare_is_the_default() -> None:
-    """D0: the plane is infrastructure first, and BARE is the mode that must
-    always work.  A deployment that wants the doctrine surface asks for it."""
-    assert _resolve_surface_mode([], {}) == "bare"
+def test_an_absent_mode_is_the_compatibility_position() -> None:
+    """DEVIATION FROM D21's WORDING, deliberate and recorded.
+
+    D21 says the ``cao launch --mode bare|skill`` FLAG defaults to ``bare``.
+    That flag does not exist yet, so a process that names no mode is a pre-D21
+    process rather than a caller asking for BARE — and answering BARE would take
+    47 tools away from every deployment that has never heard of this switch.
+    The absent position is therefore ``skill``, and it goes away when
+    ``cao launch --mode`` starts passing the flag.
+    """
+    assert _resolve_surface_mode([], {}) == "skill"
 
 
-@pytest.mark.parametrize("value", ["", "  ", "SKILLED", "doctrine", "1", "true"])
-def test_an_unrecognised_mode_resolves_to_bare(value: str) -> None:
-    """Fails toward the SMALLER surface.
+@pytest.mark.parametrize("value", ["", "  "])
+def test_a_cleared_variable_is_the_same_as_an_unset_one(value: str) -> None:
+    """An operator who blanked the variable did not ask for BARE."""
+    assert _resolve_surface_mode([], {"CAO_MCP_MODE": value}) == "skill"
+
+
+@pytest.mark.parametrize("value", ["SKILLED", "doctrine", "1", "true"])
+def test_an_explicit_unparseable_mode_resolves_to_bare(value: str) -> None:
+    """Fails toward the SMALLER surface, but only when something was ASKED FOR.
 
     This runs at import in a server whose boot must not be failed by a
     configuration typo, and the directions are not symmetric: a missing tool is

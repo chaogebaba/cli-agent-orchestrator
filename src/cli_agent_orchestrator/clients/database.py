@@ -2142,14 +2142,19 @@ def _migrate_d20_acp_transport() -> None:
                 "SELECT sql FROM sqlite_master WHERE type='trigger' AND tbl_name='terminals'"
             )
         ]
+        conn.execute("BEGIN IMMEDIATE")
+        if "transport" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN transport TEXT NOT NULL DEFAULT 'pane'")
+        # Read the DDL AFTER the ``ADD COLUMN``, never before.  SQLite rewrites
+        # the stored statement for us, so the text now carries ``transport`` in
+        # the right place — inside the column list, ahead of the table-level
+        # CHECK constraints.  Appending a column to the END of a CREATE TABLE
+        # that ends in CHECKs is not valid SQL, and that is exactly what an
+        # earlier draft did.
         table_sql_row = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='terminals'"
         ).fetchone()
         table_sql = table_sql_row[0] if table_sql_row else ""
-
-        conn.execute("BEGIN IMMEDIATE")
-        if "transport" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN transport TEXT NOT NULL DEFAULT 'pane'")
         # The rebuild runs for EITHER reason — a NOT NULL coordinate, or a schema
         # that predates D20's two CHECKs — so a database migrated by a build that
         # only added the column still converges on the same DDL a fresh
@@ -2161,20 +2166,23 @@ def _migrate_d20_acp_transport() -> None:
                 r"\1",
                 table_sql,
             )
-            if "transport" not in columns:
-                # The ADD COLUMN above is not reflected in the DDL text captured
-                # before it ran, so carry it into the rebuilt table explicitly
-                # rather than re-reading a statement this transaction has already
-                # superseded.
-                rewritten = rewritten.rstrip().rstrip(")")
-                rewritten += ", transport TEXT NOT NULL DEFAULT 'pane')"
             if "ck_terminals_transport" not in rewritten:
-                rewritten = rewritten.rstrip().rstrip(")")
-                rewritten += (
-                    ", CONSTRAINT ck_terminals_transport CHECK (transport IN ('pane','acp'))"
-                    ", CONSTRAINT ck_terminals_pane_has_coordinates CHECK ("
+                # Insert the two table-level CHECKs BEFORE the statement's final
+                # ``)``, located by ``rindex`` — never by stripping trailing
+                # parens.  The live DDL ends ``...)))`` because its last column
+                # constraint is itself a CHECK, and ``rstrip(")")`` would eat all
+                # three, leaving a statement that fails with a syntax error at
+                # the next token.  That is the defect the production-upgrade test
+                # caught, and it is why the fixture below now mirrors the real
+                # shape instead of a one-column toy.
+                closing = rewritten.rindex(")")
+                rewritten = (
+                    rewritten[:closing]
+                    + ", CONSTRAINT ck_terminals_transport CHECK (transport IN ('pane','acp'))"
+                    + ", CONSTRAINT ck_terminals_pane_has_coordinates CHECK ("
                     "transport != 'pane' OR "
-                    "(tmux_session IS NOT NULL AND tmux_window IS NOT NULL)))"
+                    "(tmux_session IS NOT NULL AND tmux_window IS NOT NULL))"
+                    + rewritten[closing:]
                 )
             conn.execute("ALTER TABLE terminals RENAME TO terminals_d20_legacy")
             conn.execute(rewritten)
@@ -7216,6 +7224,32 @@ def set_terminal_worktree_info(terminal_id: str, info: Dict[str, str]) -> None:
             raise ValueError(
                 f"worktree_info for terminal '{terminal_id}' is already set to a different value"
             )
+
+
+def get_terminal_requested_effort(terminal_id: str) -> Optional[str]:
+    """WP-ACP-PLANE AC-S1.16: one column, and no log line when the row is absent.
+
+    Deliberately NOT ``get_terminal_metadata``.  That accessor warns when a
+    terminal is missing, which is right for a caller that expected one — and
+    wrong here, because this runs on EVERY provider launch including the unit
+    tests that construct a provider with no terminal row at all.  A launch-path
+    read that logs a warning for a normal condition is a warning nobody reads,
+    and it broke a provider test that asserts its own launch emits none.
+
+    One column rather than the whole metadata dict for the second reason: this
+    is on the launch path, and parsing three JSON blobs to read a short string
+    is work nobody asked for.
+    """
+    with SessionLocal() as db:
+        row = (
+            db.query(TerminalModel.requested_effort)
+            .filter(TerminalModel.id == terminal_id)
+            .first()
+        )
+    if row is None:
+        return None
+    value = row[0]
+    return value if isinstance(value, str) else None
 
 
 def get_terminal_worktree_info(terminal_id: str) -> Optional[Dict[str, str]]:

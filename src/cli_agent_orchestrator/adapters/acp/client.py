@@ -474,6 +474,8 @@ class AcpClient:
         import signal
         import time
 
+        from cli_agent_orchestrator.core.timing import ACP_TEARDOWN_POLL_S
+
         if self._proc is None:
             return True
         pgid = os.getpgid(self._proc.pid)
@@ -485,7 +487,7 @@ class AcpClient:
         while time.monotonic() < deadline:
             if self._proc.poll() is not None:
                 break
-            time.sleep(0.05)
+            time.sleep(ACP_TEARDOWN_POLL_S)
         if self._proc.poll() is None:
             try:
                 os.killpg(pgid, signal.SIGKILL)

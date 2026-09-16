@@ -6705,8 +6705,16 @@ mcp.add_middleware(_DeterministicToolOrder())
 # nothing, and the import-time gate is the one that makes the surface a
 # property of the process rather than of each request.
 #
-# Default BARE.  The plane is infrastructure first; a deployment that wants the
-# doctrine surface asks for it.
+# **The ABSENT position is not the same as the default.**  D21 fixes the mode at
+# launch and says the ``cao launch --mode bare|skill`` FLAG defaults to ``bare``.
+# That flag does not exist yet, so an MCP process that names no mode is a
+# pre-D21 process, not a caller asking for BARE — and resolving it to BARE would
+# silently shrink the surface of every deployment that has never heard of this
+# switch.  So: absent resolves to ``skill``, the compatibility position, and it
+# is marked for removal the moment ``cao launch --mode`` lands and starts passing
+# the flag explicitly.  An explicitly-set value that cannot be parsed still
+# resolves to ``bare``: the operator ASKED for something, and the conservative
+# answer to an unparseable request is the smaller surface.
 # ---------------------------------------------------------------------------
 
 #: The five BARE tools (D21).  ``assign``, ``send_message`` and ``handoff`` are
@@ -6726,10 +6734,20 @@ def _resolve_surface_mode(argv: list[str], environ: Mapping[str, str]) -> str:
 
     Argv beats the environment, because ``cao launch --mode skill`` is the more
     specific statement and an inherited ``CAO_MCP_MODE`` from a parent process is
-    the less specific one.  An unrecognised value resolves to ``bare`` rather
-    than raising: this runs at import in a server whose boot must not be
-    self-inflicted-failed by a configuration typo, and BARE is the safe
-    direction — a missing tool is visible, an unexpectedly exposed one is not.
+    the less specific one.
+
+    Three positions, not two:
+
+    * a recognised value, anywhere — that mode;
+    * an explicitly-set value that cannot be parsed — ``bare``.  It never raises:
+      this runs at import in a server whose boot must not be
+      self-inflicted-failed by a configuration typo, and BARE is the safe
+      direction for a request nobody can read, because a missing tool is visible
+      the moment something reaches for it and an unexpectedly exposed one is not;
+    * nothing set at all — ``skill``, the COMPATIBILITY position.  Every existing
+      deployment is here, and none of them has asked for anything; answering
+      BARE would take 47 tools away from a caller that never opted in.  This
+      position goes away with ``cao launch --mode``, which will pass the flag.
     """
     for index, token in enumerate(argv):
         if token == "--mode" and index + 1 < len(argv):
@@ -6738,8 +6756,17 @@ def _resolve_surface_mode(argv: list[str], environ: Mapping[str, str]) -> str:
         if token.startswith("--mode="):
             candidate = token.split("=", 1)[1].strip().lower()
             return candidate if candidate in ("bare", "skill") else "bare"
-    candidate = (environ.get(_MODE_ENV_VAR) or "").strip().lower()
-    return candidate if candidate in ("bare", "skill") else "bare"
+    raw = environ.get(_MODE_ENV_VAR)
+    if raw is None:
+        return "skill"
+    candidate = raw.strip().lower()
+    if candidate in ("bare", "skill"):
+        return candidate
+    if candidate == "":
+        # Set-but-empty is indistinguishable from unset for an operator who
+        # cleared the variable, so it takes the compatibility position too.
+        return "skill"
+    return "bare"
 
 
 SURFACE_MODE = _resolve_surface_mode(list(sys.argv[1:]), os.environ)
