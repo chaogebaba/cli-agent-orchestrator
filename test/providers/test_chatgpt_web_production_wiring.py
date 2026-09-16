@@ -584,3 +584,34 @@ def test_a_second_conversation_post_is_refused_not_held(tmp_path, monkeypatch) -
     assert first.continued is False and first.aborted is False
     assert second.aborted is True, "a second conversation POST must not be held"
     assert second.continued is False, "and must never be released to the origin"
+
+
+def test_the_defensive_branch_aborts_rather_than_continuing(tmp_path, monkeypatch) -> None:
+    """A request that will not name its method or url must NOT be released.
+
+    This branch runs precisely when we cannot rule out that the request IS the
+    conversation POST, so `continue_()` here is the one call in the dispatcher
+    that could release the send to the origin. Aborting costs a page asset at
+    worst (B3 review §8 item 4).
+    """
+    import asyncio
+
+    monkeypatch.setenv("CAO_ARTIFACTS_DIR", str(tmp_path))
+    page, _ = _composed_turn_with_fakes(monkeypatch, tmp_path, attempt_id="defensive")
+    dispatcher = page.routed[0][1]
+
+    class _OpaqueRoute(_Route):
+        def __init__(self) -> None:
+            super().__init__("https://chatgpt.com/whatever")
+
+            class _Opaque:
+                def __getattr__(self, _name):
+                    raise RuntimeError("this request will not describe itself")
+
+            self.request = _Opaque()
+
+    opaque = _OpaqueRoute()
+    asyncio.run(dispatcher(opaque))
+
+    assert opaque.aborted is True, "an undescribable request must be aborted"
+    assert opaque.continued is False, "it must never be released to the origin"
