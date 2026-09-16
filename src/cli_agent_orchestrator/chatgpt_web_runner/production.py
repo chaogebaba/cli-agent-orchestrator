@@ -607,14 +607,21 @@ async def _drive_composed_turn(
             raise classify_refused_fulfil(intent_log, holder, exc) from exc
 
         await custody.settle()
-        # D11 BUILD STOP, ORDERING B. An event landing at or after the
-        # HELD -> FULFILLING CAS is, by D1(iii), indistinguishable from the local
-        # fulfil's own completion and terminates `fulfilled`. That classification
-        # is correct and is NOT reinterpreted here. What the detector owes is to
-        # RECORD what it saw, so `route_disposition` separates the outcomes
-        # instead of being absent on the happy path and absent on a stop alike.
-        if RouteDisposition.RELEASED_TO_ORIGIN in (disposition, holder.disposition):
-            raise _d11_build_stop(intent_log, "after the local fulfil completed")
+        # D11, ORDERING B. An event landing at or after the HELD -> FULFILLING
+        # CAS is, by D1(iii), indistinguishable from the local fulfil's own
+        # completion and terminates `fulfilled`. That classification is correct
+        # and is NOT reinterpreted here.
+        #
+        # There is deliberately NO post-fulfil `released_to_origin` check. It
+        # would be unreachable: `fulfil()` returns only after a terminal is
+        # written, and `_set_terminal` is first-terminal-wins, so the
+        # disposition here is `fulfilled` or `lost` and can never later become
+        # `released_to_origin` (pinned by
+        # test_a_terminal_disposition_can_never_become_a_release). A check that
+        # cannot fire is exactly what the B3 review found; adding a second one
+        # would repeat the defect. What ordering B owes is a RECORD, below, so
+        # `route_disposition` separates the outcomes instead of being absent on
+        # the happy path and absent on a stop alike.
         if disposition is RouteDisposition.FULFILLED:
             intent_log.transition(
                 AttemptState.BROWSER_FULFIL,

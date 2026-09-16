@@ -445,3 +445,57 @@ def test_a_custody_error_from_the_sender_is_typed_not_escaped(tmp_path, monkeypa
     assert record is not None
     assert record.attempt_state == AttemptState.ACK_UNKNOWN.value
     assert record.route_disposition is not None
+
+
+def test_a_terminal_disposition_can_never_become_a_release() -> None:
+    """Why production has no post-fulfil `released_to_origin` check.
+
+    ``fulfil()`` returns only after a terminal is written, and ``_set_terminal``
+    is first-terminal-wins, so the disposition after it is ``fulfilled`` or
+    ``lost`` and no later event can turn it into ``released_to_origin``. A check
+    there would be unreachable — the exact defect the B3 review found — so this
+    pins the reason instead of the dead branch.
+    """
+    from cli_agent_orchestrator.chatgpt_web_runner.in_page_transport import (
+        HeldRoute,
+        RouteDisposition,
+        RouteGenerations,
+    )
+
+    gens = RouteGenerations(page=1, context=1, cdp_session=1)
+
+    class _Route:
+        def __init__(self, fails: bool) -> None:
+            self.fails = fails
+
+        async def fulfill(self, **_kwargs: object) -> None:
+            if self.fails:
+                raise RuntimeError("the page went away mid-fulfil")
+
+        async def abort(self) -> None:
+            return None
+
+    async def _live() -> None:
+        await asyncio.sleep(3600)
+
+    async def _run() -> list[tuple[str, str, str]]:
+        owner = asyncio.ensure_future(_live())
+        seen = []
+        try:
+            for fails in (False, True):
+                holder = HeldRoute(
+                    _Route(fails), object(), attempt_id="a", generations=gens, owner_task=owner
+                )
+                returned = await holder.fulfil(body=b"local")
+                later = await holder.observe("response")
+                seen.append((returned.value, holder.disposition.value, later.value))
+        finally:
+            owner.cancel()
+        return seen
+
+    outcomes = asyncio.run(_run())
+    assert outcomes == [
+        ("fulfilled", "fulfilled", "fulfilled"),
+        ("lost", "lost", "lost"),
+    ]
+    assert all(RouteDisposition.RELEASED_TO_ORIGIN.value not in row for row in outcomes)
