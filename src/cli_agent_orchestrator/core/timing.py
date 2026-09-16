@@ -30,6 +30,13 @@ strips ``assert`` and these orderings must hold in an optimised interpreter too.
 from __future__ import annotations
 
 __all__ = [
+    "ACP_CANCEL_SETTLE_S",
+    "ACP_KILL_GRACE_S",
+    "ACP_WRITE_SETTLE_S",
+    "BUSY_CREDIT_CAP_S",
+    "BUSY_CREDIT_MARGIN_S",
+    "CANCEL_HOLD_MARGIN_S",
+    "CUT_HISTORY_N",
     "DELIVERY_BACKOFF_S",
     "DELIVERY_DEDUP_WINDOW_S",
     "DELIVERY_INJECT_BUDGET_S",
@@ -43,6 +50,11 @@ __all__ = [
     "HERDR_PROMPT_WAIT_MS",
     "HERDR_SUBMISSION_GATE_MS",
     "IDLE_STALL_AGE_S",
+    "INTERRUPT_BUDGET_N",
+    "INTERRUPT_BUDGET_WINDOW_S",
+    "INTERRUPT_MAX_LATENCY_S",
+    "INTERRUPT_MIN_GAP_S",
+    "RECOVERY_DEADLINE_S",
     "WAKE_MAX_RECORD_AGE_S",
     "NO_SIGNAL_S",
     "PANE_HEARTBEAT_S",
@@ -303,6 +315,143 @@ IDLE_STALL_AGE_S = 1800
 WAKE_MAX_RECORD_AGE_S = 900
 
 
+# ---------------------------------------------------------------------------
+# WP-ACP-PLANE S1 — the interrupt plane (D6b, D7.3) and the ACP transport.
+#
+# The nine literals below were FROZEN by the supervisor on 2026-09-16 under
+# AC-S1.24 (signature delegated by the user via AskUserQuestion), against the
+# S0 round-2 measurements in ``supervisor-protocol/s0-round2.md``
+# §"AC-S1.24 freeze proposal".  AC-S1.24's fails-if is "a constant is changed
+# after the AC that uses it was signed", so each carries its measurement or
+# derivation BESIDE it rather than in a design document free to drift from the
+# number.  AC-S1.22, AC-S0.10, AC-S1.27 and AC-S1.29 are signed only against
+# these values.
+#
+# They live here for §4c's reason and no other: no module may hold a literal
+# duration, and the orderings between them have to be raisable at import.
+# ---------------------------------------------------------------------------
+
+#: The SAFETY bound after which an unsettled ``session/cancel`` is quarantined
+#: (D6b(2)); also D6 rule 4's steer-cancel floor.
+#:
+#: FROZEN 2026-09-16 at **20**.  S0 round 2 took 90 cancel samples across six
+#: adapters (6 x 3 arms x 5); every cancel that settled at all landed within
+#: 0.273 s, p95 0.076 s, so this bound is never binding in the measured fleet —
+#: it exists for the adapter that hangs, not for the ones that answer.  It is
+#: deliberately far above the measurement and still below ``DELIVERY_LEASE_S``
+#: (60), because I's cancelling reservation is ``ACP_CANCEL_SETTLE_S +
+#: CANCEL_HOLD_MARGIN_S`` and that sum has to fit inside one lease.
+ACP_CANCEL_SETTLE_S = 20
+
+#: The PRODUCT definition of "seen immediately" (D6b(2)): elapsed time from
+#: admission of an interrupt to the urgent prompt being accepted as the next
+#: model-visible input.
+#:
+#: FROZEN 2026-09-16 at **10** — the human Ctrl+C experience, set by the user
+#: BEFORE AC-S0.10 ran and never derived from the samples it judges.  The
+#: measured post-cancel first chunk was median 3.458 s (n=86), so 10 s passes
+#: the fleet's healthy adapters; keeping it at 10 rather than widening it is
+#: what makes grok (11/15 samples 16-78 s) and codex's queued cell REFUSE
+#: ``urgency:"interrupt"`` with a typed reason instead of promising a latency
+#: the adapter does not deliver.  Separate from ``ACP_CANCEL_SETTLE_S`` on
+#: purpose: a safety bound doubling as a product limit hides the product
+#: question (review r8 B1).
+INTERRUPT_MAX_LATENCY_S = 10
+
+#: How long a flushed ACP prompt write must survive before the local write
+#: receipt counts as "accepted" (D5, D6b(3)).
+#:
+#: FROZEN 2026-09-16 at **1**.  Fault injection, n=45: the first write after
+#: peer death fails between 0.000 s and 0.011 s.  The honest scope, recorded
+#: with the number because it bounds what the constant can MEAN: this detects a
+#: DEAD peer only.  A wedged LIVE peer produces no local failure at any horizon,
+#: so no larger value would buy detection — which is why the row is 1 and not,
+#: say, 5.
+ACP_WRITE_SETTLE_S = 1
+
+#: How long idempotent process-group teardown waits after ``SIGTERM`` before
+#: escalating to ``SIGKILL`` (D6b(3) recovery).
+#:
+#: FROZEN 2026-09-16 at **3**.  Measured SIGTERM-to-group-exit worst case
+#: 0.552 s.  The escalation is MANDATORY rather than defensive: cline never
+#: exits on ``SIGTERM`` at all, so a teardown with no ``SIGKILL`` leg would
+#: leave a live process group behind the "absence proven" precondition that
+#: ``expire_recovery`` requires.
+ACP_KILL_GRACE_S = 3
+
+#: The terminal bound on interrupt recovery (close/respawn plus rebind), after
+#: which the terminal is retired ``exited{interrupt_recovery_failed}``.
+#:
+#: FROZEN 2026-09-16 at **120**.  Warm close + respawn + bind measured at most
+#: 3.072 s, so 120 s is ~40x the warm path.  It is deliberately NOT stretched to
+#: cover a cold ``npx`` resolution: a broken npx cache made ``initialize``
+#: exceed 120 s outright, and that is a typed ``exited`` condition plus the
+#: AC-S0.7 prefetch fix, not a reason to widen a recovery promise.
+RECOVERY_DEADLINE_S = 120
+
+#: The margin between I's persisted cancel-settle deadline and I's own lease
+#: expiry, so a cancel settling at the last legal instant is still owned by the
+#: claim that issued it (D6b(3): ``lease_until = deadline + this``).
+#:
+#: FROZEN 2026-09-16 at **15**.  DERIVED: one tick (10) + worst measured settle
+#: (0.273) + kill grace (3) = 13.3, rounded up to 15.  The ordering it has to
+#: satisfy is ``ACP_CANCEL_SETTLE_S + CANCEL_HOLD_MARGIN_S < DELIVERY_LEASE_S``
+#: — 20 + 15 = 35 < 60 — and it is checked below rather than trusted.
+CANCEL_HOLD_MARGIN_S = 15
+
+#: The per-TERMINAL gap between two admitted interrupts (D6b(6)).
+#:
+#: FROZEN 2026-09-16 at **30**.  DERIVED as ``ACP_CANCEL_SETTLE_S +
+#: INTERRUPT_MAX_LATENCY_S`` (20 + 10): the previous interrupt's whole worst-case
+#: window must close before another may be admitted against the same terminal.
+#: Cross-checked against measurement — 30 s is >= 2x the non-grok p95 first
+#: chunk of 13.9 s — so a healthy adapter is never rate-limited by it.
+INTERRUPT_MIN_GAP_S = 30
+
+#: The per-PRINCIPAL interrupt budget inside ``INTERRUPT_BUDGET_WINDOW_S``
+#: (D6b(6)).
+#:
+#: FROZEN 2026-09-16 at **5**.  Priced, not guessed: a cancelled turn discards a
+#: median 33.4k tokens on claude-acp and 18.6k on codex-acp, so five per window
+#: caps the waste at roughly 170k tokens per principal per window.  D6b's own
+#: counter-argument is that a button which kills work will get pressed; this is
+#: the number that bounds the frequency, and it is small on purpose.
+INTERRUPT_BUDGET_N = 5
+
+#: The rolling window the per-principal budget is measured over (D6b(6)).
+#:
+#: FROZEN 2026-09-16 at **600**.  Chosen so N BINDS: at the 30 s terminal gap,
+#: 20 gap-spaced interrupts fit inside 600 s, so the budget (5) is the bound
+#: that refuses, not the gap.  A window short enough for the gap to dominate
+#: would make ``INTERRUPT_BUDGET_N`` decorative.
+INTERRUPT_BUDGET_WINDOW_S = 600
+
+#: D7.3's stage-1 cap: the most busy time a row may ever accumulate as lifetime
+#: credit, whatever the agent does.
+#:
+#: NOT one of AC-S1.24's nine.  It is FIXED by I4's equality below rather than
+#: chosen: ``DELIVERY_MAX_LIFETIME_S + BUSY_CREDIT_CAP_S + BUSY_CREDIT_MARGIN_S
+#: == IDLE_STALL_AGE_S`` and the two outer terms are already fixed (1700, 1800),
+#: leaving 100 s to split.  The split is 90/10 — the margin is one
+#: ``DELIVERY_TICK_S``, the smallest unit in which the tick can observe a death,
+#: and everything else is credit.  A cap is mandatory rather than tidy: an
+#: uncapped accumulator lets one ledger error extend a row indefinitely
+#: (AC-S1.13's fails-if), and an extension past the cap would push a row's
+#: wall-clock age beyond the legacy stall age, which is the #568 non-overlap
+#: property I4 exists to hold.
+BUSY_CREDIT_CAP_S = 90
+
+#: The slack between the capped busy credit and the legacy stall age, so a row
+#: that used its whole credit still dies STRICTLY before the legacy notice could
+#: speak about it.  One ``DELIVERY_TICK_S``: the tick has to get one scan in.
+BUSY_CREDIT_MARGIN_S = 10
+
+#: How many journal-derived cuts per terminal the bounded ``recent_cuts`` view
+#: retains (D6b(4)).  A COUNT, not a duration, and bounded so a replacement seat
+#: reading its predecessor's cuts reads a page rather than a history.
+CUT_HISTORY_N = 20
+
+
 def check_delivery_orderings() -> None:
     """Raise ``ValueError`` if any §5c ordering invariant is violated.
 
@@ -399,6 +548,101 @@ def check_delivery_orderings() -> None:
         raise ValueError(
             f"T1: WAKE_MAX_RECORD_AGE_S ({WAKE_MAX_RECORD_AGE_S}) must be < "
             f"DELIVERY_MAX_LIFETIME_S ({DELIVERY_MAX_LIFETIME_S})"
+        )
+
+    # -----------------------------------------------------------------------
+    # WP-ACP-PLANE — the interrupt orderings (AC-S1.24) and I4's extension
+    # (AC-S1.17).  A SEPARATE label space from §3's I1-I5 and §A1.4's T1, for
+    # the reason those two are separate from each other: three sets of
+    # invariants over one constant table collide the moment they share names.
+    # -----------------------------------------------------------------------
+
+    # AC-S1.17 clause (2) — SIGN, checked FIRST so each clause has a mutant
+    # that names it: a zero margin violates the equality below as well, and
+    # whichever check runs first is the one a mutant can be attributed to.  A
+    # zero margin lets a fully-credited row die at the same instant the legacy
+    # notice speaks about it, which is a tie, not a non-overlap.
+    if BUSY_CREDIT_MARGIN_S <= 0:
+        raise ValueError(f"I4-margin: BUSY_CREDIT_MARGIN_S ({BUSY_CREDIT_MARGIN_S}) must be > 0")
+    if BUSY_CREDIT_CAP_S <= 0:
+        raise ValueError(f"I4-cap: BUSY_CREDIT_CAP_S ({BUSY_CREDIT_CAP_S}) must be > 0")
+    # AC-S1.17 clause (1) — DRIFT.  Stated as an EQUALITY over LITERALS, which
+    # is the whole point: the derived form ("the cap is whatever is left over")
+    # could not fail, and r4's blocker was exactly that.  A legacy retune of
+    # IDLE_STALL_AGE_S, or a move of DELIVERY_MAX_LIFETIME_S, that does not also
+    # move the credit terms now fails the BUILD rather than silently leaving a
+    # row able to outlive the legacy stall notice (#568's non-overlap property).
+    if DELIVERY_MAX_LIFETIME_S + BUSY_CREDIT_CAP_S + BUSY_CREDIT_MARGIN_S != IDLE_STALL_AGE_S:
+        raise ValueError(
+            "I4-credit: DELIVERY_MAX_LIFETIME_S + BUSY_CREDIT_CAP_S + "
+            "BUSY_CREDIT_MARGIN_S must EQUAL IDLE_STALL_AGE_S, but reads "
+            f"{DELIVERY_MAX_LIFETIME_S} + {BUSY_CREDIT_CAP_S} + "
+            f"{BUSY_CREDIT_MARGIN_S} = "
+            f"{DELIVERY_MAX_LIFETIME_S + BUSY_CREDIT_CAP_S + BUSY_CREDIT_MARGIN_S} "
+            f"!= {IDLE_STALL_AGE_S}"
+        )
+
+    # AC-S1.24's SEVEN interrupt orderings.
+    #
+    # U1 the product limit may not exceed the safety bound, or "seen
+    #    immediately" would be promised past the point where the cancel is
+    #    quarantined and the promise is unowned.
+    if INTERRUPT_MAX_LATENCY_S > ACP_CANCEL_SETTLE_S:
+        raise ValueError(
+            f"U1: INTERRUPT_MAX_LATENCY_S ({INTERRUPT_MAX_LATENCY_S}) must be <= "
+            f"ACP_CANCEL_SETTLE_S ({ACP_CANCEL_SETTLE_S})"
+        )
+    # U2 a settle bound at or past the lease means the claim that issued the
+    #    cancel can expire while its own cancel is still legal.
+    if ACP_CANCEL_SETTLE_S >= DELIVERY_LEASE_S:
+        raise ValueError(
+            f"U2: ACP_CANCEL_SETTLE_S ({ACP_CANCEL_SETTLE_S}) must be < "
+            f"DELIVERY_LEASE_S ({DELIVERY_LEASE_S})"
+        )
+    # U3 the WHOLE cancelling reservation — settle plus hold margin, which is
+    #    what begin_cancel writes as I's lease_until — has to fit in one lease,
+    #    or the reservation outlives the mechanism that grants it.
+    if ACP_CANCEL_SETTLE_S + CANCEL_HOLD_MARGIN_S >= DELIVERY_LEASE_S:
+        raise ValueError(
+            "U3: ACP_CANCEL_SETTLE_S + CANCEL_HOLD_MARGIN_S "
+            f"({ACP_CANCEL_SETTLE_S + CANCEL_HOLD_MARGIN_S}) must be < "
+            f"DELIVERY_LEASE_S ({DELIVERY_LEASE_S})"
+        )
+    # U4 the per-terminal gap must cover a whole interrupt window, or a second
+    #    interrupt is admissible against a terminal whose first one has not
+    #    finished being paid for.
+    if INTERRUPT_MIN_GAP_S < ACP_CANCEL_SETTLE_S + INTERRUPT_MAX_LATENCY_S:
+        raise ValueError(
+            f"U4: INTERRUPT_MIN_GAP_S ({INTERRUPT_MIN_GAP_S}) must be >= "
+            "ACP_CANCEL_SETTLE_S + INTERRUPT_MAX_LATENCY_S "
+            f"({ACP_CANCEL_SETTLE_S + INTERRUPT_MAX_LATENCY_S})"
+        )
+    # U5 the budget must BIND: N gap-spaced interrupts have to fit inside the
+    #    window, or the per-terminal gap is the only bound and
+    #    INTERRUPT_BUDGET_N never refuses anything.
+    if INTERRUPT_BUDGET_N * INTERRUPT_MIN_GAP_S > INTERRUPT_BUDGET_WINDOW_S:
+        raise ValueError(
+            "U5: INTERRUPT_BUDGET_N * INTERRUPT_MIN_GAP_S "
+            f"({INTERRUPT_BUDGET_N * INTERRUPT_MIN_GAP_S}) must be <= "
+            f"INTERRUPT_BUDGET_WINDOW_S ({INTERRUPT_BUDGET_WINDOW_S})"
+        )
+    # U6 (added at r18) the local write receipt is charged INSIDE the latency
+    #    the product promises; a settle horizon at or past it would make every
+    #    accepted prompt a latency breach by construction.
+    if ACP_WRITE_SETTLE_S >= INTERRUPT_MAX_LATENCY_S:
+        raise ValueError(
+            f"U6: ACP_WRITE_SETTLE_S ({ACP_WRITE_SETTLE_S}) must be < "
+            f"INTERRUPT_MAX_LATENCY_S ({INTERRUPT_MAX_LATENCY_S})"
+        )
+    # U7 (added at r18) the recovery bound reserves one post-crash scan plus
+    #    process teardown INSIDE the promise, so teardown_at = recovery_deadline
+    #    - (DELIVERY_TICK_S + ACP_KILL_GRACE_S) is still in the future when
+    #    recovery begins.
+    if DELIVERY_TICK_S + ACP_KILL_GRACE_S >= RECOVERY_DEADLINE_S:
+        raise ValueError(
+            "U7: DELIVERY_TICK_S + ACP_KILL_GRACE_S "
+            f"({DELIVERY_TICK_S + ACP_KILL_GRACE_S}) must be < "
+            f"RECOVERY_DEADLINE_S ({RECOVERY_DEADLINE_S})"
         )
 
 

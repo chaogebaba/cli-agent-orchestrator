@@ -239,6 +239,32 @@ class AttemptOutcome(StrEnum):
                               would double-submit, so the attempt budget is the
                               wrong bound and ``dead_by`` is the only one that
                               applies.
+    WP-ACP-PLANE S1 adds ONE value, ``ACP_BUSY_RETRY``.  The blueprint's §10
+    collision row originally claimed both this and ``SUBMISSION_UNCERTAIN`` for
+    this WP; the 2026-09-16 entry audit (F1) amended that — WP-HERDR H2 owns
+    ``SUBMISSION_UNCERTAIN``, because the table's own sequencing puts H2 first
+    and one closed-enum widening per diff beats two.
+
+    ``ACP_BUSY_RETRY``      — the ACP receiver is mid-turn BY CAO'S OWN
+                              TRACKING (a prompt was sent, no ``stopReason``
+                              seen on its update stream), so the row was NEVER
+                              SUBMITTED: no second ``session/prompt`` left CAO.
+                              ACP has no wire busy class to branch on — S0's
+                              AC-S0.3c/S0.4 disproved the ``-32003`` model the
+                              blueprint was built on — so this outcome records
+                              a decision CAO made from its own state, never an
+                              error it received.  It keeps the lease like every
+                              other non-delivery outcome (so ``reclaim`` can
+                              see it at all) and spends NO attempt: a busy
+                              agent is the normal case, and charging it would
+                              dead-letter messages to a healthy worker inside
+                              one turn.  The row is re-offered on
+                              ``DeliveryTick.nudge`` at the first
+                              ``stopReason``, or by the ordinary reclaim floor
+                              if the driver's stream is severed (AC-S1.14).
+                              Its lifetime is extended by D7.3's busy ledger
+                              rather than by an attempt exemption, which is
+                              what keeps the bound finite (AC-S1.13/S1.15).
     """
 
     DELIVERED = "delivered"
@@ -251,6 +277,7 @@ class AttemptOutcome(StrEnum):
     WAKE_UNRESOLVABLE = "wake_unresolvable"
     PASTE_ATTEMPTED = "paste_attempted"
     SUBMISSION_UNCERTAIN = "submission_uncertain"
+    ACP_BUSY_RETRY = "acp_busy_retry"
 
 
 #: D12's non-delivery outcomes, in one place so the retention rule and the
@@ -295,6 +322,14 @@ NON_DELIVERY_OUTCOMES = frozenset(
         AttemptOutcome.WAKE_UNRESOLVABLE,
         AttemptOutcome.PASTE_ATTEMPTED,
         AttemptOutcome.SUBMISSION_UNCERTAIN,
+        # WP-ACP-PLANE S1, decided explicitly in this diff because the 2026-09-16
+        # entry audit (F2) found a THIRD closed set governing lease retention that
+        # neither blueprint named.  ``ACP_BUSY_RETRY`` IS a non-delivery outcome:
+        # the row must keep its lease, because lease retention is the only thing
+        # that makes an outcome observable by ``reclaim``, and a busy row that
+        # released its lease would sit in ``ready`` where nothing counts it — the
+        # exact shape of #604.
+        AttemptOutcome.ACP_BUSY_RETRY,
     }
 )
 
@@ -320,6 +355,12 @@ NON_DELIVERY_OUTCOMES = frozenset(
 #: it here and a row whose prompt may ALREADY be in the agent's composer would
 #: die at 325 s — the fast death is for conditions that cannot clear, and this
 #: one clears the moment the runtime reports a state change.
+#: ``ACP_BUSY_RETRY`` is absent for the reason ``WAKE_UNREACHABLE`` is: the
+#: condition heals on its own and on a timescale the attempt budget does not
+#: span.  A turn routinely outlives 325 s, so charging the budget would
+#: dead-letter a message to an agent that is working perfectly (AC-S1.3's
+#: fails-if, "the attempt budget is burned").  Its bound is the row's own
+#: ``effective_deadline`` under D7.3's capped busy credit, not an attempt count.
 ATTEMPT_BUDGET_OUTCOMES = frozenset(
     {
         AttemptOutcome.VETO_UNVERIFIED,

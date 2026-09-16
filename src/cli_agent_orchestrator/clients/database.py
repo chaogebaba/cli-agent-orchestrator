@@ -136,8 +136,16 @@ class TerminalModel(Base):
     __tablename__ = "terminals"
 
     id = Column(String, primary_key=True)  # "abc123ef"
-    tmux_session = Column(String, nullable=False)  # "cao-session-name"
-    tmux_window = Column(String, nullable=False)  # "window-name"
+    # WP-ACP-PLANE D20: NULLABLE, and only for ``transport='acp'``. A pane
+    # terminal still writes both. NULL here is the ABSENCE of a coordinate, never
+    # a signal that one went away — AC-S1.10 greps for exactly that confusion, so
+    # no consumer may test these for NULL; they branch on ``transport`` instead.
+    tmux_session = Column(String, nullable=True)  # "cao-session-name"; NULL on ACP
+    tmux_window = Column(String, nullable=True)  # "window-name"; NULL on ACP
+    # WP-ACP-PLANE D20: which message plane owns this terminal. 'pane' is every
+    # pre-ACP row and the migration's back-fill default, so the column is NOT
+    # NULL and needs no three-valued reading anywhere.
+    transport = Column(String, nullable=False, default="pane", server_default="pane")
     provider = Column(String, nullable=False)  # "kiro_cli", "claude_code"
     agent_profile = Column(String)  # "developer", "reviewer" (optional)
     working_directory = Column(String, nullable=True)  # launch-time cwd (optional)
@@ -222,6 +230,24 @@ class TerminalModel(Base):
             "substr(init_failure_token,19,1) = '-' AND "
             "substr(init_failure_token,24,1) = '-')",
             name="ck_terminals_init_failure_token_uuid",
+        ),
+        # WP-ACP-PLANE D20, as a CHECK rather than a convention, for the reason
+        # every other constraint on this table is one: the pair
+        # (transport, coordinates) has exactly two legal shapes and a third one
+        # would be discovered by a fleet projection stamping ERROR rather than by
+        # the write that created it.
+        CheckConstraint(
+            "transport IN ('pane','acp')",
+            name="ck_terminals_transport",
+        ),
+        # A pane terminal ALWAYS has both coordinates; only ACP may omit them.
+        # The converse is deliberately NOT asserted: an ACP row carrying stale
+        # coordinates is harmless because no consumer reads them for an ACP row,
+        # and forbidding it would break the S5 back-out, which converts rows in
+        # place.
+        CheckConstraint(
+            "transport != 'pane' OR (tmux_session IS NOT NULL AND tmux_window IS NOT NULL)",
+            name="ck_terminals_pane_has_coordinates",
         ),
     )
 
@@ -1991,6 +2017,156 @@ def init_db() -> None:
     # mailbox where evidence is unique; idempotent and provenance-audited. Runs
     # AFTER conversation_identity exists; appended LAST.
     _migrate_f829_a2_owner_backfill()
+    # WP-ACP-PLANE D20 (AC-S1.10): the terminal ``transport`` column and the two
+    # nullable tmux coordinates.  Appended LAST on purpose — it REWRITES the live
+    # ``terminals`` DDL rather than re-declaring a column list, so it has to see
+    # the final shape every ADD COLUMN migration above has produced.
+    _migrate_d20_acp_transport()
+
+
+
+def _d20_database_file() -> Path:
+    """The database file the D20 migration operates on.
+
+    A named indirection rather than an inline import, for one reason: the
+    idempotence claim in AC-S1.10 ("run twice -> same schema, no data change")
+    is only testable against a database a test controls, and every other
+    terminals migration in this module reaches straight for the production
+    constant.  One function is the smallest seam that lets the AC be executed
+    rather than asserted.
+    """
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    return Path(DATABASE_FILE)
+
+
+def _migrate_d20_acp_transport() -> None:
+    """WP-ACP-PLANE D20 (AC-S1.10): the ``transport`` column, and nullable tmux coordinates.
+
+    D20 in one sentence: a terminal row gains ``transport ('pane' | 'acp')``, the
+    two tmux coordinate columns become NULLABLE for ``transport='acp'``, and
+    **every consumer branches on ``transport``, never on NULL**.  The last clause
+    is the whole design.  A NULL coordinate is not a signal, it is the ABSENCE of
+    one, and a consumer that reads it as "the pane went away" is exactly the bug
+    that would stamp a healthy ACP seat ERROR in the fleet projection.  AC-S1.10's
+    grep therefore fails a NULL check on either column, and the branches this
+    migration enables are on the new column alone.
+
+    **Two steps, both idempotent, in ONE transaction** (AC-S1.10's "run twice ->
+    same schema, no data change", asserted under WAL):
+
+    1. ``ADD COLUMN transport TEXT NOT NULL DEFAULT 'pane'`` -- every existing row
+       IS a pane terminal, so the default is the back-fill and no UPDATE is
+       needed.  Skipped when the column is already there.
+    2. A table REBUILD to drop ``NOT NULL`` from ``tmux_session``/``tmux_window``.
+       SQLite has no ``ALTER COLUMN``, so rename/copy/drop is the only route, and
+       it follows the precedent ``_migrate_terminals_schema`` already set on this
+       very table rather than inventing a second shape.  Skipped when both columns
+       are already nullable, which is what makes a second boot a no-op rather than
+       a second rebuild.
+
+    The rebuild REWRITES THE LIVE DDL rather than re-declaring the column set.
+    ``terminals`` has accumulated a dozen ``ADD COLUMN`` migrations above it and
+    will accumulate more; a hand-written column list here would silently drop
+    whichever column was added after this function was written.  So the stored
+    ``sqlite_master`` text is read, the two ``NOT NULL`` tokens are struck from it
+    by a targeted pattern, and the copy is driven by ``PRAGMA table_info`` -- the
+    table's own answer to "what columns do you have".
+
+    Indexes and triggers are captured BEFORE the rename and replayed AFTER the
+    legacy table is dropped.  The ordering is forced: SQLite carries indexes and
+    triggers along with a renamed table, so recreating them by name before the
+    drop would collide with their own renamed selves.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(str(_d20_database_file()), isolation_level=None)
+    try:
+        table_info = list(conn.execute("PRAGMA table_info(terminals)"))
+        if not table_info:
+            return
+        columns = {row[1]: row for row in table_info}
+        # ``notnull`` is field 3 of PRAGMA table_info.
+        coordinates_not_null = [
+            name for name in ("tmux_session", "tmux_window") if name in columns and columns[name][3]
+        ]
+        table_sql_probe = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='terminals'"
+        ).fetchone()
+        has_transport_check = bool(table_sql_probe) and "ck_terminals_transport" in (
+            table_sql_probe[0] or ""
+        )
+        if "transport" in columns and not coordinates_not_null and has_transport_check:
+            return
+
+        index_sql = [
+            row[0]
+            for row in conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND "
+                "tbl_name='terminals' AND sql IS NOT NULL"
+            )
+        ]
+        trigger_sql = [
+            row[0]
+            for row in conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND tbl_name='terminals'"
+            )
+        ]
+        table_sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='terminals'"
+        ).fetchone()
+        table_sql = table_sql_row[0] if table_sql_row else ""
+
+        conn.execute("BEGIN IMMEDIATE")
+        if "transport" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN transport TEXT NOT NULL DEFAULT 'pane'")
+        # The rebuild runs for EITHER reason — a NOT NULL coordinate, or a schema
+        # that predates D20's two CHECKs — so a database migrated by a build that
+        # only added the column still converges on the same DDL a fresh
+        # ``create_all`` produces.  Divergence between those two is the defect
+        # this branch exists to prevent.
+        if (coordinates_not_null or not has_transport_check) and table_sql:
+            rewritten = re.sub(
+                r"(\b(?:tmux_session|tmux_window)\b\s+\w+)\s+NOT\s+NULL",
+                r"\1",
+                table_sql,
+            )
+            if "transport" not in columns:
+                # The ADD COLUMN above is not reflected in the DDL text captured
+                # before it ran, so carry it into the rebuilt table explicitly
+                # rather than re-reading a statement this transaction has already
+                # superseded.
+                rewritten = rewritten.rstrip().rstrip(")")
+                rewritten += ", transport TEXT NOT NULL DEFAULT 'pane')"
+            if "ck_terminals_transport" not in rewritten:
+                rewritten = rewritten.rstrip().rstrip(")")
+                rewritten += (
+                    ", CONSTRAINT ck_terminals_transport CHECK (transport IN ('pane','acp'))"
+                    ", CONSTRAINT ck_terminals_pane_has_coordinates CHECK ("
+                    "transport != 'pane' OR "
+                    "(tmux_session IS NOT NULL AND tmux_window IS NOT NULL)))"
+                )
+            conn.execute("ALTER TABLE terminals RENAME TO terminals_d20_legacy")
+            conn.execute(rewritten)
+            legacy = {row[1] for row in conn.execute("PRAGMA table_info(terminals_d20_legacy)")}
+            destination = [row[1] for row in conn.execute("PRAGMA table_info(terminals)")]
+            copied = [name for name in destination if name in legacy]
+            quoted = ",".join(f'"{name}"' for name in copied)
+            conn.execute(
+                f"INSERT INTO terminals ({quoted}) SELECT {quoted} FROM terminals_d20_legacy"
+            )
+            conn.execute("DROP TABLE terminals_d20_legacy")
+            for statement in index_sql + trigger_sql:
+                conn.execute(statement)
+        conn.execute("COMMIT")
+        logger.info("Migration: D20 transport column installed; tmux coordinates nullable")
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        logger.exception("Fatal D20 transport migration failure")
+        raise
+    finally:
+        conn.close()
 
 
 def _migrate_f218_dead_supervisor_safety() -> None:
@@ -6032,8 +6208,8 @@ def list_live_conversation_roots() -> List[Dict[str, Any]]:
 
 def create_terminal(
     terminal_id: str,
-    tmux_session: str,
-    tmux_window: str,
+    tmux_session: Optional[str],
+    tmux_window: Optional[str],
     provider: str,
     agent_profile: Optional[str] = None,
     allowed_tools: Optional[List[str]] = None,
@@ -6056,8 +6232,14 @@ def create_terminal(
     auth_token: Optional[str] = None,
     root_admission: Optional["RootAdmission"] = None,
     require_live_caller: bool = False,
+    transport: str = "pane",
 ) -> Dict[str, Any]:
     """Create terminal metadata record.
+
+    WP-ACP-PLANE D20: ``transport`` defaults to ``'pane'``, so every existing
+    caller keeps the shape it had and the two tmux coordinates stay required in
+    practice for them (the table's CHECK enforces it).  An ACP terminal passes
+    ``transport="acp"`` and ``None`` for both coordinates.
 
     ``require_live_caller`` (F867 r4) makes the caller-liveness check part of THIS
     transaction: an existing-session child create asks for it, and the child row
@@ -6071,6 +6253,7 @@ def create_terminal(
             id=terminal_id,
             tmux_session=tmux_session,
             tmux_window=tmux_window,
+            transport=transport,
             provider=provider,
             agent_profile=agent_profile,
             working_directory=working_directory,
@@ -6196,6 +6379,7 @@ def create_terminal(
             "id": terminal.id,
             "tmux_session": terminal.tmux_session,
             "tmux_window": terminal.tmux_window,
+            "transport": terminal.transport,  # WP-ACP-PLANE D20
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
             "working_directory": terminal.working_directory,
@@ -6535,6 +6719,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "id": terminal.id,
             "tmux_session": terminal.tmux_session,
             "tmux_window": terminal.tmux_window,
+            "transport": terminal.transport,  # WP-ACP-PLANE D20
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
             "working_directory": terminal.working_directory,
@@ -7140,6 +7325,10 @@ def _terminal_row_dict(t: Any) -> Dict[str, Any]:
         "id": t.id,
         "tmux_session": t.tmux_session,
         "tmux_window": t.tmux_window,
+        # WP-ACP-PLANE D20: carried in every terminal projection, because a
+        # consumer that cannot see the transport has no choice but to read the
+        # coordinates, which is the branch AC-S1.10 forbids.
+        "transport": t.transport,
         "provider": t.provider,
         "agent_profile": t.agent_profile,
         "working_directory": t.working_directory,
@@ -8542,6 +8731,7 @@ def list_terminals_by_provider_session_id(session_uuid: str) -> List[Dict[str, A
                 "id": r.id,
                 "tmux_session": r.tmux_session,
                 "tmux_window": r.tmux_window,
+                "transport": r.transport,  # WP-ACP-PLANE D20
                 "provider": r.provider,
             }
             for r in rows
@@ -8603,6 +8793,7 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "id": t.id,
                 "tmux_session": t.tmux_session,
                 "tmux_window": t.tmux_window,
+                "transport": t.transport,  # WP-ACP-PLANE D20
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
                 "working_directory": t.working_directory,
