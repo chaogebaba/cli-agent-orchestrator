@@ -123,7 +123,7 @@ def test_the_accumulator_is_capped(queue: SqliteQueueStore, ledger: BusyLedger) 
 def test_a_lease_expiring_without_a_nudge_closes_the_episode(
     queue: SqliteQueueStore, ledger: BusyLedger
 ) -> None:
-    """"No row survives with an uncleared ``busy_since`` past its lease".
+    """ "No row survives with an uncleared ``busy_since`` past its lease".
 
     A sweep rather than a timer, because the driver that opened the episode is
     exactly the component whose death leaves the marker behind.
@@ -197,9 +197,7 @@ def test_the_extended_row_is_not_swept_before_its_effective_deadline(
     assert message.msg_id not in dead_ids
 
 
-def test_the_row_dies_at_the_cap_not_later(
-    queue: SqliteQueueStore, ledger: BusyLedger
-) -> None:
+def test_the_row_dies_at_the_cap_not_later(queue: SqliteQueueStore, ledger: BusyLedger) -> None:
     """*Cap arm*: busy past the cap — the row dies AT the cap, with a typed reason."""
     message = _enqueue(queue)
     ledger.open_episode(message.msg_id, now=T0)

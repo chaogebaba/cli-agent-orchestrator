@@ -148,12 +148,11 @@ def reject_supplied_identity(payload: object) -> None:
     because the two edges hand this two different shapes and a check that only
     covered one would leave the other open.
     """
+    present: set[str]
     if isinstance(payload, dict):
-        present = FORBIDDEN_REQUEST_IDENTITY_FIELDS & set(payload)
+        present = set(FORBIDDEN_REQUEST_IDENTITY_FIELDS & set(payload))
     else:
-        present = {
-            field for field in FORBIDDEN_REQUEST_IDENTITY_FIELDS if hasattr(payload, field)
-        }
+        present = {field for field in FORBIDDEN_REQUEST_IDENTITY_FIELDS if hasattr(payload, field)}
     if present:
         raise SuppliedIdentityRejected(
             "identity is issued by the server, never supplied by a request; "

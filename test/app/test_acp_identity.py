@@ -105,9 +105,7 @@ def test_a_provably_wrong_claim_is_vetoed_before_absence_is_considered() -> None
     absence were considered first it would defer, and a stale incarnation could
     hold a terminal open by simply saying less.
     """
-    decision = _decide(
-        _binding(), _observation(presented_generation=3, presented_session_id=None)
-    )
+    decision = _decide(_binding(), _observation(presented_generation=3, presented_session_id=None))
     assert decision.outcome is IdentityOutcome.VETO
 
 
@@ -121,7 +119,8 @@ def test_an_unbound_terminal_defers_rather_than_vetoing() -> None:
     call has not arrived.
     """
     decision = _decide(
-        _binding(), _observation(presented_token=None, presented_generation=None, presented_session_id=None)
+        _binding(),
+        _observation(presented_token=None, presented_generation=None, presented_session_id=None),
     )
     assert decision.outcome is IdentityOutcome.DEFER
     assert decision.is_permanent is False

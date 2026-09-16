@@ -375,9 +375,7 @@ class AcpClient:
             self._next_id += 1
             request_id = self._next_id
             self._pending[request_id] = queue.Queue()
-        self._write(
-            {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}}
-        )
+        self._write({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}})
         return request_id
 
     def _write(self, frame: dict[str, Any]) -> None:
@@ -400,9 +398,7 @@ class AcpClient:
                 continue
             self._log.record("<<", frame)
             self._dispatch(frame)
-        self._log.record(
-            "meta", {"stdout": "closed", "returncode": self._proc.poll()}
-        )
+        self._log.record("meta", {"stdout": "closed", "returncode": self._proc.poll()})
         # The stream ending is itself a turn-ending fact.  Leaving ``turn_open``
         # set would make a dead agent look permanently busy and would stall every
         # row addressed to it behind a stopReason that can never arrive.
@@ -459,9 +455,7 @@ class AcpClient:
                 self.cancel()
                 reply["result"] = {"outcome": {"outcome": "cancelled"}}
             else:
-                reply["result"] = {
-                    "outcome": {"outcome": "selected", "optionId": option_id}
-                }
+                reply["result"] = {"outcome": {"outcome": "selected", "optionId": option_id}}
         else:
             reply["result"] = {}
         self._write(reply)

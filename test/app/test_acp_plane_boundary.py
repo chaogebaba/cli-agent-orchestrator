@@ -120,9 +120,7 @@ def test_the_plane_names_no_doctrine_identifier() -> None:
         hits = _hits(_surface_text(path))
         if hits:
             offenders.append(f"{path.relative_to(_SRC)}: {sorted(set(hits))}")
-    assert not offenders, "doctrine vocabulary inside the plane (AC-S1.9):\n" + "\n".join(
-        offenders
-    )
+    assert not offenders, "doctrine vocabulary inside the plane (AC-S1.9):\n" + "\n".join(offenders)
 
 
 def test_position_and_routing_are_not_in_the_forbidden_list() -> None:

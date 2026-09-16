@@ -108,9 +108,7 @@ def test_steering_capability_is_discovered_not_assumed(tmp_path: Path) -> None:
 # ------------------------------------------------- the client-side busy model
 
 
-def test_a_second_prompt_is_refused_and_never_written(
-    client: AcpClient, tmp_path: Path
-) -> None:
+def test_a_second_prompt_is_refused_and_never_written(client: AcpClient, tmp_path: Path) -> None:
     """AC-S1.3 / AC-S1.19: no second ``session/prompt`` leaves CAO mid-turn.
 
     Asserted from the FRAME LOG, not from the absence of an error — which is the
@@ -281,7 +279,10 @@ def test_a_denial_with_no_denial_option_cancels_first_then_answers_cancelled(
     without cancelling would be a lie about the agent's state.  Cancelling first
     is what makes it conformant.
     """
-    assert select_permission_option([{"kind": "allow_once", "optionId": "a"}], prefer="reject_once") is None
+    assert (
+        select_permission_option([{"kind": "allow_once", "optionId": "a"}], prefer="reject_once")
+        is None
+    )
 
     client = AcpClient(
         [sys.executable, _MOCK],
@@ -296,9 +297,7 @@ def test_a_denial_with_no_denial_option_cancels_first_then_answers_cancelled(
         client.prompt("do a thing")
         client.await_stop_reason(timeout=20)
         outgoing = [
-            f["frame"]
-            for f in AcpFrameLog(tmp_path / "frames.jsonl").frames()
-            if f["dir"] == ">>"
+            f["frame"] for f in AcpFrameLog(tmp_path / "frames.jsonl").frames() if f["dir"] == ">>"
         ]
         cancel_index = next(
             i for i, f in enumerate(outgoing) if f.get("method") == "session/cancel"
