@@ -64,6 +64,7 @@ __all__ = [
     "queue_owns_new_traffic",
     "queue_runtime",
     "write_through_enqueue",
+    "HerdrPromptInjector",
     "NativeSeatCarrier",
     "PaneWorkerInjector",
     "PersistentEnqueueRejection",
