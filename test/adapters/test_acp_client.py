@@ -331,3 +331,47 @@ def test_teardown_on_an_unstarted_client_is_a_no_op(tmp_path: Path) -> None:
     client = AcpClient([sys.executable, _MOCK], frame_log=AcpFrameLog(tmp_path / "f.jsonl"))
     assert client.terminate_process_group(grace_s=0.1) is True
     client.close()
+
+
+def test_a_prompt_that_errors_ends_the_turn(tmp_path: Path) -> None:
+    """A live-round finding, 2026-09-16, kept as a regression.
+
+    claude-agent-acp answered a ``session/prompt`` with ``authentication_failed``
+    because its OAuth session had expired. With only a ``stopReason`` branch this
+    client held ``turn_open`` forever, so every later row for that receiver would
+    park ``acp_busy_retry`` against an agent that was not busy but BROKEN, and
+    each would age out silently at its own deadline with no failing assertion
+    anywhere.
+
+    The stop reason is named distinctly — ``error:<code>`` — so a fold can tell
+    "the turn ended" from "the turn never started".
+    """
+    client = _spawn(tmp_path, MOCK_ACP_PROMPT_ERROR="1")
+    try:
+        client.prompt("this will come back an error")
+        assert client.await_stop_reason(timeout=10) == "error:-32603"
+        assert client.session_state().turn_open is False
+        # ...and the session is usable again rather than wedged busy forever.
+        client.prompt("the next row must not be refused")
+    finally:
+        client.terminate_process_group(grace_s=2)
+        client.close()
+
+
+def test_an_errored_turn_is_distinguishable_from_a_real_stop(tmp_path: Path) -> None:
+    """Both end the turn; only one of them means the agent did something."""
+    broken = _spawn(tmp_path / "broken", MOCK_ACP_PROMPT_ERROR="1")
+    try:
+        broken.prompt("x")
+        assert str(broken.await_stop_reason(timeout=10)).startswith("error:")
+    finally:
+        broken.terminate_process_group(grace_s=2)
+        broken.close()
+
+    healthy = _spawn(tmp_path / "healthy", MOCK_ACP_TURN_SECONDS="1")
+    try:
+        healthy.prompt("x")
+        assert healthy.await_stop_reason(timeout=20) == "end_turn"
+    finally:
+        healthy.terminate_process_group(grace_s=2)
+        healthy.close()

@@ -428,8 +428,23 @@ class AcpClient:
             self._busy_leaks.append(frame)
             self._log.record("note", {"DIAG-ACP-BUSY-LEAK": frame})
         result = frame.get("result") or {}
-        if "stopReason" in result and frame.get("id") == self._open_request_id:
-            self._settle_turn(str(result["stopReason"]))
+        if frame.get("id") == self._open_request_id:
+            if "stopReason" in result:
+                self._settle_turn(str(result["stopReason"]))
+            elif error:
+                # A prompt that came back an ERROR ends the turn too, and this
+                # line is here because a live round on 2026-09-16 proved it does
+                # not go without saying: claude-agent-acp answered a prompt with
+                # ``authentication_failed`` and, with only the ``stopReason``
+                # branch, this client held ``turn_open`` forever. Every later row
+                # for that receiver would then park ``acp_busy_retry`` against an
+                # agent that was not busy but broken, until each one aged out at
+                # its own deadline — a silent stall with no failing assertion
+                # anywhere, which is the exact shape the plane exists to remove.
+                #
+                # Named distinctly from a real stop reason so the fold can tell
+                # "the turn ended" from "the turn never started".
+                self._settle_turn(f"error:{error.get('code', 'unknown')}")
         with self._lock:
             pending = self._pending.get(int(frame["id"]))
         if pending is not None:
