@@ -32,6 +32,7 @@ from sqlalchemy import (
     exists,
     func,
     insert,
+    inspect,
     literal_column,
     or_,
     select,
@@ -11363,7 +11364,16 @@ def insert_identity_authority_notice(
                 pass
             return NoticeInsertOutcome.UNCERTAIN_COMMIT
         try:
-            db.refresh(row)
+            # F1003 (#851), same family as the mailbox send: at the 3b flip the
+            # choke point returns a never-added InboxModel, and refreshing it
+            # raises. Reported here as FAILED_AFTER_COMMIT, it would call a
+            # notice that IS enqueued a post-commit failure. Asked with
+            # ``inspect`` rather than the swallowing ``_refresh_if_persistent``
+            # helper because this call site's whole contract is the honest
+            # commit phase: a refresh that fails on a row the session DOES hold
+            # must still be reported.
+            if inspect(row).persistent:
+                db.refresh(row)
             int(row.id)
         except Exception:
             return NoticeInsertOutcome.FAILED_AFTER_COMMIT

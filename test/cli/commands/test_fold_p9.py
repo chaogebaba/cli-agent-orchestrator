@@ -6,11 +6,11 @@ import pytest
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.main import cli
+from cli_agent_orchestrator.cli.orchestrator_commands.fold_corpus import check_corpus
 from cli_agent_orchestrator.services import fold_service
 from cli_agent_orchestrator.services.fold_service import (
     P9Report,
     RepoMapping,
-    check_corpus,
     check_file,
 )
 

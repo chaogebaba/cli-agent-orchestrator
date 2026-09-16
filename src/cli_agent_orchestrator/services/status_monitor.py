@@ -46,6 +46,9 @@ from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
+from cli_agent_orchestrator.utils.herdr_runtime_gate import (
+    herdr_lifecycle_authoritative as _herdr_lifecycle_authoritative,
+)
 from cli_agent_orchestrator.utils.terminal_render import ScreenRenderCache
 
 logger = logging.getLogger(__name__)
@@ -2725,11 +2728,25 @@ class StatusMonitor:
                 return status, None
 
             # Rules 3a/3b: pane-delta downgrade, bounded by the hold clock.
+            #
+            # WP-ARCH 2b / WP-HERDR §6: INERT for a certified herdr terminal.
+            # These two rules are the pane's lifecycle move — 3a converts a
+            # published IDLE/COMPLETED into PROCESSING on pane churn alone — and
+            # the amendment disables the pane fallback for lifecycle kinds on a
+            # certified terminal, whose lifecycle comes from the herdr source.
+            # The gate is HERE and not in the sampler loop on purpose: the
+            # watchdog used to skip certified terminals wholesale, which also
+            # denied them the classification pass, and the amendment's own
+            # "vendor conditions and dialog cards still apply from the pane"
+            # needs that pass to run. So the sample is taken for every terminal
+            # and only the lifecycle rules read it selectively. Rules 1/2/2b are
+            # untouched: a question marker and an ERROR-over-a-working-pane are
+            # not pane-delta lifecycle moves, and herdr emits neither.
             if status in (
                 TerminalStatus.IDLE,
                 TerminalStatus.COMPLETED,
                 TerminalStatus.PROCESSING,
-            ):
+            ) and not _herdr_lifecycle_authoritative(terminal_id):
                 try:
                     from cli_agent_orchestrator.services.pane_liveness import pane_liveness
 
@@ -2961,6 +2978,85 @@ class StatusMonitor:
             with self._lock:
                 self._status_fusion_reason.pop(terminal_id, None)
         self._apply_detection(terminal_id, detected, pass_source="forced")
+        return True
+
+    def classify_pane_sample(self, terminal_id: str, filtered_tail: str) -> bool:
+        """WP-ARCH 2b — drive D1c/D1f on a backend that feeds no chunk pipeline.
+
+        Returns whether the classification producer ran. Never captures: the
+        caller supplies the sample ``pane_liveness`` already took, exactly as
+        ``resync_from_pane_tail`` does, so the single-sampler invariant (AC1, the
+        f295-half2 second-sampler ban) is untouched — this is a second RIDER on
+        one sample, not a second sampler.
+
+        **Why this exists.** ``record_pane_classification`` — the sole producer of
+        ``status.pane_classified``, and with it of D1c's ``usage.capped`` and
+        D1f's ``prompt.awaiting``/``prompt.answered`` — has exactly one call site,
+        the ``finally`` block of ``_apply_detection``. Every driver of
+        ``_apply_detection`` hangs off ``_process_chunk``, and an event-inbox
+        backend starts no FIFO reader (``rearm_fifo_readers_at_startup`` and
+        ``create_terminal`` both gate the FIFO setup on
+        ``not supports_event_inbox()``), so on herdr that whole family of
+        producers is silent. Not refused, not renamed, not gated on certification:
+        never invoked. The pane classifier is a first-class fallback for every
+        unsourced terminal (I7), and an UNSOURCED HERDR terminal had no fallback
+        at all.
+
+        ``resync_from_pane_tail`` is the one pane-driven path that does reach
+        ``_apply_detection``, and it cannot cover this: its ``dropped`` trigger
+        needs a stream that herdr does not have, and its ``periodic`` trigger
+        needs ``_last_status`` in ``{PROCESSING, ERROR}`` while ``_last_status``
+        is written ONLY by ``_apply_detection`` and the projection publisher — so
+        on an unsourced herdr terminal it is ``UNKNOWN`` forever and the backstop
+        deadlocks against itself.
+
+        **Why it is the producer and NOT ``_apply_detection``.** Routing this pass
+        through the latch would also make the pane herdr's status PUBLISHER, at
+        the sampler's cadence, against the native path that publishes there today
+        — a last-write-wins race, and a far larger change than the missing
+        diagnostic. ``status.pane_classified`` asserts no state by construction
+        (it is deliberately absent from ``mapping.STATE_ASSERTING_KINDS``), so producing
+        it cannot move any terminal's status. Who publishes herdr status is a
+        separate decision with its own evidence; this method does not take it.
+
+        **The certified cohort.** Deliberately NOT gated on
+        ``herdr_lifecycle_authoritative``. The §6 amendment disables the pane
+        fallback for LIFECYCLE kinds on a certified terminal, and none of the
+        three kinds this drives is one: the herdr runtime source emits only
+        ``turn.started``/``turn.ended``/``pane.missing`` and maps ``blocked`` to
+        nothing at all, so for a certified lane the dialog card and the vendor cap
+        have no other producer. Gating here would have made the amendment's own
+        "vendor conditions and dialog cards still apply from the pane" false.
+        """
+        from cli_agent_orchestrator.backends.registry import get_backend
+
+        try:
+            if not get_backend().supports_event_inbox():
+                # A pipe-pane backend classifies on every chunk through
+                # ``_apply_detection``. A second producer on the same edge map
+                # would not add a row (the pair is unchanged) but would race the
+                # chunk path for the edge, so the seam stays where it already is.
+                return False
+        except Exception:
+            return False
+
+        detected = self._classify_pane_snapshot(terminal_id, filtered_tail)
+        if detected is None:
+            return False
+
+        # ``latched_status`` is the WOULD-BE publish and ``raw_classification`` is
+        # what the classifier returned; on this path no latch stands between them,
+        # and saying so is more honest than leaving the raw field null and letting
+        # a reader infer a latch that did not run.
+        _wt_pane_classification.record_pane_classification(
+            terminal_id,
+            detected,
+            None,
+            "fresh_capture",
+            "forced",
+            detected,
+            monitor=self,
+        )
         return True
 
     def clear_terminal(self, terminal_id: str) -> None:
@@ -3439,7 +3535,24 @@ class StatusMonitor:
                 return None
             self._last_rederive_check[terminal_id] = now
 
-        if not filtered_tail:
+        return self._classify_pane_snapshot(terminal_id, filtered_tail)
+
+    def _classify_pane_snapshot(self, terminal_id: str, snapshot: str) -> Optional[TerminalStatus]:
+        """Run the provider's snapshot-safe detector on one rendered pane sample.
+
+        Extracted from ``_rederive_from_pane_sample`` (WP-ARCH 2b) for the reason
+        ``_snapshot_detector_mode`` was extracted from ``_fresh_capture_pane_status``
+        before it: a second caller appeared, and a parallel copy of the detector
+        ROUTING is how two callers start disagreeing about which providers may be
+        fed a rendered frame. The caller owns its own rate limit and its own
+        decision about what to do with the verdict; this is the classification and
+        nothing else.
+
+        Returns ``None`` — never a status — when there is no sample, no provider,
+        no snapshot-safe detector, or the detector raised. Every caller reads that
+        as "no evidence".
+        """
+        if not snapshot:
             return None
         try:
             provider = provider_manager.get_provider(terminal_id)
@@ -3452,11 +3565,11 @@ class StatusMonitor:
             return None
         try:
             if use_screen:
-                return provider.get_status_from_screen(filtered_tail.splitlines())
-            return provider.get_status(filtered_tail)
+                return provider.get_status_from_screen(snapshot.splitlines())
+            return provider.get_status(snapshot)
         except Exception:
             logger.debug(
-                "_rederive_from_pane_sample [%s]: detection failed", terminal_id, exc_info=True
+                "_classify_pane_snapshot [%s]: detection failed", terminal_id, exc_info=True
             )
             return None
 
