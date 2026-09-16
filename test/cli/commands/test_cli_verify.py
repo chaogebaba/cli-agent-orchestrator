@@ -3,6 +3,7 @@ from pathlib import Path
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.main import cli
+from cli_agent_orchestrator.cli.orchestrator_main import cli as orchestrator_cli
 from cli_agent_orchestrator.kernel.receiver_state.trace_manifest import (
     CONSUMER_MODULES,
     TRACE_MANIFEST_PATH,
@@ -560,7 +561,7 @@ def test_ledger_check_warns_for_drained_header_and_counts_pending(tmp_path, monk
         "| Feature Beta | x | c | p | pending | n |\n"
     )
     monkeypatch.chdir(tmp_path)
-    result = CliRunner().invoke(cli, ["ledger", "check"])
+    result = CliRunner().invoke(orchestrator_cli, ["ledger", "check"])
     assert result.exit_code == 0
     assert "warning:" in result.output
     assert "pending-row count: 1" in result.output
@@ -568,7 +569,7 @@ def test_ledger_check_warns_for_drained_header_and_counts_pending(tmp_path, monk
 
 def test_ledger_check_missing_file(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    result = CliRunner().invoke(cli, ["ledger", "check"])
+    result = CliRunner().invoke(orchestrator_cli, ["ledger", "check"])
     assert result.exit_code != 0
     assert "HANDOFF.md not found" in result.output
     assert "orchestrator/HANDOFF.md" in result.output
@@ -587,7 +588,7 @@ def test_ledger_check_finds_orchestrator_layout(tmp_path, monkeypatch):
         "| Feature Gamma | x | c | p | pending | n |\n"
     )
     monkeypatch.chdir(tmp_path)
-    result = CliRunner().invoke(cli, ["ledger", "check"])
+    result = CliRunner().invoke(orchestrator_cli, ["ledger", "check"])
     assert result.exit_code == 0
     assert "pending-row count: 1" in result.output
 
@@ -614,7 +615,7 @@ def test_ledger_check_prefers_orchestrator_over_legacy(tmp_path, monkeypatch):
         "| NewLayout | x | c | p | pending | n |\n"
     )
     monkeypatch.chdir(tmp_path)
-    result = CliRunner().invoke(cli, ["ledger", "check"])
+    result = CliRunner().invoke(orchestrator_cli, ["ledger", "check"])
     assert result.exit_code == 0
     # Should read from orchestrator/ (1 pending), not legacy (2 pending)
     assert "pending-row count: 1" in result.output

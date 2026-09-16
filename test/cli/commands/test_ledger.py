@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from click.testing import CliRunner
 
-from cli_agent_orchestrator.cli.commands.ledger import ledger
+from cli_agent_orchestrator.cli.orchestrator_commands.ledger import ledger
 
 
 # --- Fixtures: HANDOFF.md content variants ---
@@ -193,7 +193,7 @@ class TestLedgerCheckCanonicalTable:
         handoff.write_text(_CANONICAL_TABLE)
         runner = CliRunner()
         with patch(
-            "cli_agent_orchestrator.cli.commands.ledger.find_workspace_file",
+            "cli_agent_orchestrator.cli.orchestrator_commands.ledger.find_workspace_file",
             return_value=handoff,
         ):
             result = runner.invoke(ledger, ["check"])
@@ -209,7 +209,7 @@ class TestLedgerCheckLegacyBullets:
         handoff.write_text(_LEGACY_BULLETS)
         runner = CliRunner()
         with patch(
-            "cli_agent_orchestrator.cli.commands.ledger.find_workspace_file",
+            "cli_agent_orchestrator.cli.orchestrator_commands.ledger.find_workspace_file",
             return_value=handoff,
         ):
             result = runner.invoke(ledger, ["check"])
@@ -225,7 +225,7 @@ class TestLedgerCheckUnrelatedTableIgnored:
         handoff.write_text(_UNRELATED_TABLE_OUTSIDE)
         runner = CliRunner()
         with patch(
-            "cli_agent_orchestrator.cli.commands.ledger.find_workspace_file",
+            "cli_agent_orchestrator.cli.orchestrator_commands.ledger.find_workspace_file",
             return_value=handoff,
         ):
             result = runner.invoke(ledger, ["check"])
@@ -242,7 +242,7 @@ class TestLedgerCheckMalformedAndUnknownStatus:
         handoff.write_text(_MALFORMED_AND_UNKNOWN)
         runner = CliRunner()
         with patch(
-            "cli_agent_orchestrator.cli.commands.ledger.find_workspace_file",
+            "cli_agent_orchestrator.cli.orchestrator_commands.ledger.find_workspace_file",
             return_value=handoff,
         ):
             result = runner.invoke(ledger, ["check"])
@@ -261,7 +261,7 @@ class TestLedgerCheckStaleReentry:
         handoff.write_text(_STALE_REENTRY)
         runner = CliRunner()
         with patch(
-            "cli_agent_orchestrator.cli.commands.ledger.find_workspace_file",
+            "cli_agent_orchestrator.cli.orchestrator_commands.ledger.find_workspace_file",
             return_value=handoff,
         ):
             result = runner.invoke(ledger, ["check"])
@@ -281,7 +281,7 @@ class TestLedgerCheckNoLedgerSection:
         handoff.write_text(_NO_LEDGER_SECTION)
         runner = CliRunner()
         with patch(
-            "cli_agent_orchestrator.cli.commands.ledger.find_workspace_file",
+            "cli_agent_orchestrator.cli.orchestrator_commands.ledger.find_workspace_file",
             return_value=handoff,
         ):
             result = runner.invoke(ledger, ["check"])
@@ -299,7 +299,7 @@ class TestLedgerCheckExactMatchB1:
         handoff.write_text(_EXACT_MATCH_POSITIVE)
         runner = CliRunner()
         with patch(
-            "cli_agent_orchestrator.cli.commands.ledger.find_workspace_file",
+            "cli_agent_orchestrator.cli.orchestrator_commands.ledger.find_workspace_file",
             return_value=handoff,
         ):
             result = runner.invoke(ledger, ["check"])
@@ -313,7 +313,7 @@ class TestLedgerCheckExactMatchB1:
         handoff.write_text(_EXACT_MATCH_NEGATIVE)
         runner = CliRunner()
         with patch(
-            "cli_agent_orchestrator.cli.commands.ledger.find_workspace_file",
+            "cli_agent_orchestrator.cli.orchestrator_commands.ledger.find_workspace_file",
             return_value=handoff,
         ):
             result = runner.invoke(ledger, ["check"])
@@ -332,7 +332,7 @@ class TestLedgerCheckVerifiedStatusS1:
         handoff.write_text(_VERIFIED_HISTORICAL)
         runner = CliRunner()
         with patch(
-            "cli_agent_orchestrator.cli.commands.ledger.find_workspace_file",
+            "cli_agent_orchestrator.cli.orchestrator_commands.ledger.find_workspace_file",
             return_value=handoff,
         ):
             result = runner.invoke(ledger, ["check"])
@@ -363,7 +363,7 @@ Nothing.
         handoff.write_text(content)
         runner = CliRunner()
         with patch(
-            "cli_agent_orchestrator.cli.commands.ledger.find_workspace_file",
+            "cli_agent_orchestrator.cli.orchestrator_commands.ledger.find_workspace_file",
             return_value=handoff,
         ):
             result = runner.invoke(ledger, ["check"])
@@ -377,7 +377,7 @@ Nothing.
         handoff.write_text(_MULTIPLE_HEADINGS_WITH_ARCHIVE)
         runner = CliRunner()
         with patch(
-            "cli_agent_orchestrator.cli.commands.ledger.find_workspace_file",
+            "cli_agent_orchestrator.cli.orchestrator_commands.ledger.find_workspace_file",
             return_value=handoff,
         ):
             result = runner.invoke(ledger, ["check"])
@@ -397,7 +397,7 @@ class TestLedgerCheckMutationScopeRemoval:
         handoff.write_text(_UNRELATED_TABLE_OUTSIDE)
         runner = CliRunner()
         with patch(
-            "cli_agent_orchestrator.cli.commands.ledger.find_workspace_file",
+            "cli_agent_orchestrator.cli.orchestrator_commands.ledger.find_workspace_file",
             return_value=handoff,
         ):
             # Normal invocation should pass with count 1.
@@ -406,7 +406,7 @@ class TestLedgerCheckMutationScopeRemoval:
 
             # Mutant: bypass scoping by making _extract_ledger_section return all text.
             with patch(
-                "cli_agent_orchestrator.cli.commands.ledger._extract_ledger_section",
+                "cli_agent_orchestrator.cli.orchestrator_commands.ledger._extract_ledger_section",
                 return_value=handoff.read_text(),
             ):
                 mutant_result = runner.invoke(ledger, ["check"])
@@ -423,7 +423,7 @@ class TestLedgerCheckMutationUnknownAsPending:
         handoff.write_text(_MALFORMED_AND_UNKNOWN)
         runner = CliRunner()
         with patch(
-            "cli_agent_orchestrator.cli.commands.ledger.find_workspace_file",
+            "cli_agent_orchestrator.cli.orchestrator_commands.ledger.find_workspace_file",
             return_value=handoff,
         ):
             # Normal: only 1 pending.

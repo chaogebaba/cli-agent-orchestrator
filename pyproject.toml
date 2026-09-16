@@ -129,6 +129,9 @@ chatgpt_web = [
 
 [project.scripts]
 "cao" = "cli_agent_orchestrator.cli.main:cli"
+# The optional orchestrator skill's CLI. Nothing on base imports it;
+# a project that never runs it loads none of its knowledge readers.
+"cao-orchestrator" = "cli_agent_orchestrator.cli.orchestrator_main:cli"
 "cao-server" = "cli_agent_orchestrator.api.main:main"
 "cao-mcp-server" = "cli_agent_orchestrator.mcp_server.server:main"
 "cao-ops-mcp-server" = "cli_agent_orchestrator.ops_mcp_server.server:main"
@@ -152,6 +155,30 @@ Documentation = "https://github.com/awslabs/cli-agent-orchestrator#readme"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# The sdist ships everything git tracks unless told otherwise, and this repository tracks
+# the orchestrator skill's own knowledge next to the source: five blueprints (two of them
+# changelog archives), 28 top-level `f*-build-report.md` files and nine more under
+# `orchestrator/build-reports/`. None of it is infrastructure, and a lightweight project
+# installing CAO has no use for any of it — so it does not belong in the archive
+# (wp-arch-modular-core.md A.5, AC-LITE-5; slice 3).
+#
+# Exclusions, not an allowlist: an allowlist would have to re-enumerate ~2600 members and
+# would silently drop the next file someone adds. The leading `/` anchors each entry to the
+# project root, so a future `src/.../doctrine/` module directory is NOT swept up by accident.
+# The unanchored `*-build-report.md` is deliberate: these files are added at the repo root by
+# habit, and anchoring it would miss the next one that lands a directory down.
+#
+# Nothing is deleted from the repository — only archive membership changes. The wheel needs
+# no entry: its `packages` list already limits it to the two src packages, which is asserted
+# alongside the sdist in test/packaging/test_lite_sdist_manifest.py.
+[tool.hatch.build.targets.sdist]
+exclude = [
+  "/blueprints",
+  "/orchestrator",
+  "/doctrine",
+  "*-build-report.md",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/cli_agent_orchestrator", "src/cao_workflow"]
