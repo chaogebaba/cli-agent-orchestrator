@@ -27,6 +27,11 @@ from cli_agent_orchestrator.utils.terminal import (
 
 cao_http = CAOHttpClient(lambda: requests)
 
+# The one name the mode travels under. Imported from the server module so the
+# writer and the reader cannot drift: a second literal here is how a flag comes
+# to set a variable nothing reads.
+_MCP_MODE_ENV_VAR = "CAO_MCP_MODE"
+
 # Providers that require workspace folder access
 PROVIDERS_REQUIRING_WORKSPACE_ACCESS = {
     "antigravity_cli",
@@ -320,6 +325,17 @@ def _finish_launch_after_start(terminal, *, headless, message, is_async):
     "are rejected. See issue #248.",
 )
 @click.option(
+    "--mode",
+    "surface_mode",
+    type=click.Choice(["bare", "skill"], case_sensitive=False),
+    default=None,
+    help="MCP tool surface for this seat (WP-ACP-PLANE D21) [default: bare]. "
+    "'bare' exposes the five infrastructure tools (assign, send_message, handoff, "
+    "list, load_skill); 'skill' exposes the full orchestration surface. Fixed at "
+    "launch: a bare seat that needs the skill tools is RELAUNCHED in skill mode, "
+    "never widened in place. Travels to the seat as CAO_MCP_MODE.",
+)
+@click.option(
     "--allow-incomplete-brief",
     is_flag=True,
     help="Allow a required session brief to degrade loudly instead of aborting startup.",
@@ -346,6 +362,7 @@ def launch(
     working_directory,
     memory,
     env_pairs,
+    surface_mode,
     allow_incomplete_brief,
     resume_session_id,
 ):
@@ -359,6 +376,24 @@ def launch(
         display_dir = working_directory or os.path.realpath(os.getcwd())
         explicit_provider = provider is not None  # True only when --provider was passed
         forwarded_env = _parse_env_pairs(env_pairs) if env_pairs else {}
+        # WP-ACP-PLANE D21: the surface mode is FIXED AT LAUNCH, and this is the
+        # launch. It rides the forwarded-env channel because that is the one path
+        # that reaches the supervisor's process environment AND every worker
+        # spawned later in the session, which is exactly the scope the mode has:
+        # one process, decided once. Applied AFTER --env so an explicit
+        # `--env CAO_MCP_MODE=...` cannot quietly disagree with `--mode`; the
+        # flag is the authority and the CLI refuses an unreadable value itself
+        # (click.Choice), so the server never has to guess.
+        #
+        # Sent ONLY when the flag was passed. The flag's default and the reader's
+        # default are the SAME value, so transmitting `bare` for a launch that
+        # said nothing would change no behaviour while breaking the standing
+        # contract that a launch with no --env sends no request body at all
+        # (test_launch_without_env_omits_request_body). "Default bare" is
+        # therefore a property of the reader, which is where a default fixed at
+        # launch belongs.
+        if surface_mode is not None:
+            forwarded_env[_MCP_MODE_ENV_VAR] = str(surface_mode).lower()
 
         # Resolve allowedTools: --yolo > --allowed-tools CLI > profile/role defaults
         from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile

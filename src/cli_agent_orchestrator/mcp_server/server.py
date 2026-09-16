@@ -6679,17 +6679,31 @@ mcp.add_middleware(_DeterministicToolOrder())
 # nothing, and the import-time gate is the one that makes the surface a
 # property of the process rather than of each request.
 #
-# **The ABSENT position is not the same as the default.**  D21 fixes the mode at
-# launch and says the ``cao launch --mode bare|skill`` FLAG defaults to ``bare``.
-# That flag does not exist yet, so an MCP process that names no mode is a
-# pre-D21 process, not a caller asking for BARE — and resolving it to BARE would
-# silently shrink the surface of every deployment that has never heard of this
-# switch.  So: absent resolves to ``skill``, the compatibility position, and it
-# is marked for removal the moment ``cao launch --mode`` lands and starts passing
-# the flag explicitly.  An explicitly-set value that cannot be parsed still
-# resolves to ``bare``: the operator ASKED for something, and the conservative
-# answer to an unparseable request is the smaller surface.
+# **Default BARE, and an unreadable request is REFUSED rather than guessed.**
+# The plane is infrastructure first; a deployment that wants the doctrine surface
+# asks for it with ``cao launch --mode skill``, which is where the flag lives and
+# what sets ``CAO_MCP_MODE`` for the seat.  A bare seat that turns out to need the
+# SKILL tools is RELAUNCHED in skill mode — explicit and visible — never widened
+# in place, because a surface that can grow at runtime is not fixed at launch.
+# ``load_skill`` returns doctrine TEXT and never changes the tool list, which is
+# what keeps that true.
+#
+# An explicitly-set value that cannot be parsed raises.  That is deliberately
+# unlike ``core/switches.py``, whose refusals are VALUES because the server's boot
+# must not be self-inflicted-failed by a diagnosability feature — there, a caller
+# can decline ONE subsystem and keep booting.  Here the subsystem IS the process:
+# there is no "start anyway without the mode", and starting with a GUESSED
+# surface is the one outcome nobody could debug from the outside.
 # ---------------------------------------------------------------------------
+
+
+class InvalidSurfaceMode(ValueError):
+    """``CAO_MCP_MODE`` (or ``--mode``) named something that is not a mode.
+
+    Carries the accepted values and the literal line to type, in the shape
+    ``core/switches.py`` established for a refused switch position: an operator
+    who typed something wrong needs the fix, not a description of the fix.
+    """
 
 #: The five BARE tools (D21).  ``assign``, ``send_message`` and ``handoff`` are
 #: dispatch; ``list`` is A2.9(v)'s outstanding-ids and unresolved-cuts view, which
@@ -6710,37 +6724,43 @@ def _resolve_surface_mode(argv: list[str], environ: Mapping[str, str]) -> str:
     specific statement and an inherited ``CAO_MCP_MODE`` from a parent process is
     the less specific one.
 
-    Three positions, not two:
+    Three positions, and the third is a refusal:
 
     * a recognised value, anywhere — that mode;
-    * an explicitly-set value that cannot be parsed — ``bare``.  It never raises:
-      this runs at import in a server whose boot must not be
-      self-inflicted-failed by a configuration typo, and BARE is the safe
-      direction for a request nobody can read, because a missing tool is visible
-      the moment something reaches for it and an unexpectedly exposed one is not;
-    * nothing set at all — ``skill``, the COMPATIBILITY position.  Every existing
-      deployment is here, and none of them has asked for anything; answering
-      BARE would take 47 tools away from a caller that never opted in.  This
-      position goes away with ``cao launch --mode``, which will pass the flag.
+    * nothing set at all — ``bare``.  D21's default, and the direction that fails
+      SMALL: a missing tool is visible the moment something reaches for it, while
+      an unexpectedly exposed one is not visible at all;
+    * an explicitly-set value that cannot be parsed — :class:`InvalidSurfaceMode`.
+      The operator ASKED for something and the server cannot tell what, so the
+      honest answer is to refuse rather than to serve a surface nobody requested.
+      A set-but-EMPTY value is treated as unset, because clearing a variable is
+      how an operator withdraws a request rather than makes an unreadable one.
     """
     for index, token in enumerate(argv):
         if token == "--mode" and index + 1 < len(argv):
-            candidate = argv[index + 1].strip().lower()
-            return candidate if candidate in ("bare", "skill") else "bare"
+            return _parse_surface_mode(argv[index + 1], source="--mode")
         if token.startswith("--mode="):
-            candidate = token.split("=", 1)[1].strip().lower()
-            return candidate if candidate in ("bare", "skill") else "bare"
+            return _parse_surface_mode(token.split("=", 1)[1], source="--mode")
     raw = environ.get(_MODE_ENV_VAR)
     if raw is None:
-        return "skill"
+        return "bare"
+    return _parse_surface_mode(raw, source=_MODE_ENV_VAR)
+
+
+def _parse_surface_mode(raw: str, *, source: str) -> str:
+    """One mode value, or a refusal naming what was typed and what is accepted."""
     candidate = raw.strip().lower()
+    if candidate == "":
+        # Clearing a variable is how an operator WITHDRAWS a request, not how
+        # they make an unreadable one.
+        return "bare"
     if candidate in ("bare", "skill"):
         return candidate
-    if candidate == "":
-        # Set-but-empty is indistinguishable from unset for an operator who
-        # cleared the variable, so it takes the compatibility position too.
-        return "skill"
-    return "bare"
+    raise InvalidSurfaceMode(
+        f"{source}={raw!r} is not a surface mode; accepted values are 'bare' and "
+        f"'skill'. Set it with `cao launch --mode skill`, or export "
+        f"{_MODE_ENV_VAR}=skill for a seat launched by hand."
+    )
 
 
 SURFACE_MODE = _resolve_surface_mode(list(sys.argv[1:]), os.environ)
