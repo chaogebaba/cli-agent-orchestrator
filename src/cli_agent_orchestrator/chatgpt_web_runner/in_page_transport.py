@@ -21,10 +21,16 @@ Measured seams reimplemented from the bun spike (cited per the blueprint's
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
 import logging
 import re
+import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from dataclasses import field as dataclass_field
+from enum import Enum
+from typing import TYPE_CHECKING, Any, Awaitable, Dict, List, Optional, Sequence, cast
 
 from cli_agent_orchestrator.chatgpt_web_runner.errors import (
     DeliveryState,
@@ -41,6 +47,387 @@ SEL_USER_TURN = "div[data-message-author-role='user']"
 SEL_ASSISTANT_TURN = "div[data-message-author-role='assistant']"
 SEL_FILE_INPUT = "input#upload-files"
 SEL_PLUS_BTN = "#composer-plus-btn"
+
+
+class RouteDisposition(str, Enum):
+    """Holder-owned truth about the intercepted browser request (Amendment D)."""
+
+    HELD = "held"
+    FULFILLING = "fulfilling"
+    FULFILLED = "fulfilled"
+    ABORTED = "aborted"
+    LOST = "lost"
+    RELEASED_TO_ORIGIN = "released_to_origin"
+
+
+_TERMINAL_ROUTE_DISPOSITIONS = {
+    RouteDisposition.FULFILLED,
+    RouteDisposition.ABORTED,
+    RouteDisposition.LOST,
+    RouteDisposition.RELEASED_TO_ORIGIN,
+}
+
+
+class RouteCustodyError(RuntimeError):
+    """An operation would violate the one-owner held-route interlock."""
+
+
+@dataclass(frozen=True)
+class RouteGenerations:
+    page: int
+    context: int
+    cdp_session: int
+
+
+@dataclass(frozen=True)
+class CapturedSend:
+    """The single in-memory packet minted by the real composer.
+
+    Header values and body bytes are intentionally excluded from ``repr`` and
+    never have a serializer. Only their names/digest may enter durable state.
+    """
+
+    route_holder: "HeldRoute"
+    method: str
+    url: str
+    ordered_headers: tuple[tuple[str, str], ...] = dataclass_field(repr=False)
+    raw_body: bytes = dataclass_field(repr=False)
+    captured_monotonic: float
+    profile_epoch: str
+    attempt_id: str
+    mint_id: str
+
+    @property
+    def body_sha256(self) -> str:
+        return hashlib.sha256(self.raw_body).hexdigest()
+
+    @property
+    def header_names(self) -> tuple[str, ...]:
+        return tuple(name.lower() for name, _value in self.ordered_headers)
+
+
+class HeldRoute:
+    """One live Playwright ``Route`` with a first-terminal-wins disposition.
+
+    Playwright has no public "still held" predicate. This object is therefore
+    the sole authority. Every action/event proposal is serialized by one lock;
+    terminal state can be written exactly once, and no private Playwright field
+    is inspected.
+    """
+
+    def __init__(
+        self,
+        route: Any,
+        request: Any,
+        *,
+        attempt_id: str,
+        generations: RouteGenerations,
+        owner_task: Optional["asyncio.Task[Any]"] = None,
+    ) -> None:
+        self.route = route
+        self.request = request
+        self.attempt_id = attempt_id
+        self.generations = generations
+        self._owner_task = owner_task or asyncio.current_task()
+        self._lock = asyncio.Lock()
+        self._disposition = RouteDisposition.HELD
+        self._python_invoked = False
+        self._terminal_written_at: Optional[float] = None
+        self._owner_death_settled = False
+        # D1: "any holder-task exit for another reason ... before invocation it
+        # is ABANDONED_PRE_INVOKE with route disposition `lost`". A cancelled
+        # worker never gets to call on_teardown(), so without this callback the
+        # disposition stays HELD forever: the send guard still refuses (it
+        # checks the live task), but the attempt can never record a terminal
+        # and forbid_while_held() locks out its own cleanup. The holder writing
+        # its own terminal as it dies keeps the one-writer rule intact, and
+        # _set_terminal is idempotent, so a real terminal already written by
+        # fulfil/abort/observe always wins.
+        if self._owner_task is not None:
+            self._owner_task.add_done_callback(self._on_owner_done)
+
+    def _on_owner_done(self, _task: "asyncio.Task[Any]") -> None:
+        """Write the fail-closed terminal when the holder task stops existing."""
+        self._owner_death_settled = True
+        if self._disposition not in _TERMINAL_ROUTE_DISPOSITIONS:
+            # Conservative by construction: a hold whose owner died mid-flight
+            # is never provably un-sent, so it is `lost`, never `aborted`.
+            self._set_terminal(RouteDisposition.LOST)
+
+    @property
+    def owner_death_settled(self) -> bool:
+        """True once the holder task has ended and its terminal is written."""
+        return self._owner_death_settled
+
+    @property
+    def disposition(self) -> RouteDisposition:
+        return self._disposition
+
+    @property
+    def terminal_written_at(self) -> Optional[float]:
+        return self._terminal_written_at
+
+    @property
+    def python_invoked(self) -> bool:
+        return self._python_invoked
+
+    def _owner_alive(self) -> bool:
+        return bool(
+            self._owner_task is not None
+            and not self._owner_task.done()
+            and not self._owner_task.cancelled()
+        )
+
+    async def guard_for_python(self, live_generations: RouteGenerations) -> None:
+        """Refuse unless the same live holder still owns a genuinely held route."""
+        async with self._lock:
+            if not self._owner_alive():
+                raise RouteCustodyError("route holder task is not live")
+            if live_generations != self.generations:
+                raise RouteCustodyError("page/context/CDP generation changed")
+            if self._disposition is not RouteDisposition.HELD:
+                raise RouteCustodyError(
+                    f"route is {self._disposition.value}, not held; Python POST refused"
+                )
+
+    async def mark_python_invoked(self, live_generations: RouteGenerations) -> None:
+        await self.guard_for_python(live_generations)
+        async with self._lock:
+            if self._python_invoked:
+                raise RouteCustodyError("Python POST already invoked for this held mint")
+            self._python_invoked = True
+
+    async def observe(self, event: str) -> RouteDisposition:
+        """Apply a public Playwright request event to holder state."""
+        if event not in {"requestfailed", "requestfinished", "response"}:
+            raise ValueError(f"unsupported route event {event!r}")
+        async with self._lock:
+            if self._disposition in _TERMINAL_ROUTE_DISPOSITIONS:
+                return self._disposition
+            if event == "requestfailed":
+                return self._set_terminal(RouteDisposition.LOST)
+            if self._disposition is RouteDisposition.FULFILLING:
+                return self._set_terminal(RouteDisposition.FULFILLED)
+            # A response/finish while still HELD proves the browser copy escaped.
+            return self._set_terminal(RouteDisposition.RELEASED_TO_ORIGIN)
+
+    async def on_teardown(self) -> RouteDisposition:
+        async with self._lock:
+            if self._disposition in _TERMINAL_ROUTE_DISPOSITIONS:
+                return self._disposition
+            return self._set_terminal(RouteDisposition.LOST)
+
+    async def abort(self) -> RouteDisposition:
+        """Abort is resend-safe only when this call itself succeeds from HELD."""
+        async with self._lock:
+            if self._disposition in _TERMINAL_ROUTE_DISPOSITIONS:
+                return self._disposition
+            if self._disposition is not RouteDisposition.HELD:
+                raise RouteCustodyError(f"cannot abort from {self._disposition.value}")
+            try:
+                await self.route.abort()
+            except Exception:
+                return self._set_terminal(RouteDisposition.LOST)
+            return self._set_terminal(RouteDisposition.ABORTED)
+
+    async def fulfil(self, *, body: bytes) -> RouteDisposition:
+        """Complete the browser copy locally exactly once."""
+        async with self._lock:
+            if self._disposition is not RouteDisposition.HELD:
+                raise RouteCustodyError(f"cannot fulfil from {self._disposition.value}")
+            self._disposition = RouteDisposition.FULFILLING
+        try:
+            await self.route.fulfill(
+                status=200,
+                headers={"content-type": "text/event-stream; charset=utf-8"},
+                body=body,
+            )
+        except Exception:
+            async with self._lock:
+                if self._disposition is RouteDisposition.FULFILLING:
+                    return self._set_terminal(RouteDisposition.LOST)
+                return self._disposition
+        async with self._lock:
+            if self._disposition is RouteDisposition.FULFILLING:
+                return self._set_terminal(RouteDisposition.FULFILLED)
+            return self._disposition
+
+    async def forbid_while_held(self, operation: str) -> None:
+        """Guard navigation/close/unroute/lease handoff/cancellation-with-release."""
+        async with self._lock:
+            if self._disposition not in _TERMINAL_ROUTE_DISPOSITIONS:
+                raise RouteCustodyError(
+                    f"{operation} forbidden while route disposition is {self._disposition.value}"
+                )
+
+    def _set_terminal(self, proposal: RouteDisposition) -> RouteDisposition:
+        if self._disposition in _TERMINAL_ROUTE_DISPOSITIONS:
+            return self._disposition
+        self._disposition = proposal
+        self._terminal_written_at = time.monotonic()
+        return proposal
+
+
+class LiveGenerations:
+    """Derive the three D1 generations from public Playwright lifecycle events.
+
+    ``HeldRoute.guard_for_python`` compares the generations recorded at
+    ``REQUEST_HELD`` against the live ones; something has to produce the live
+    triple from real objects. This tracker is that seam: it subscribes to the
+    public ``close``/``crash``/``disconnected`` events and bumps the matching
+    counter, so a page/context/browser that died between the hold and the
+    socket call is observable without reading any private Playwright state.
+
+    It is deliberately monotonic and never decrements: a bumped generation can
+    only make the guard refuse, never admit.
+    """
+
+    def __init__(
+        self,
+        page: Any,
+        context: Any = None,
+        cdp_session: Any = None,
+    ) -> None:
+        self._page_gen = 1
+        self._context_gen = 1
+        self._cdp_gen = 1
+        self._page = page
+        self._context = context
+        self._cdp_session = cdp_session
+        if page is not None:
+            page.on("close", lambda *_a: self.bump_page())
+            page.on("crash", lambda *_a: self.bump_page())
+        if context is not None:
+            context.on("close", lambda *_a: self.bump_context())
+        if cdp_session is not None:
+            # A detached CDP session invalidates every command issued on it.
+            on = getattr(cdp_session, "on", None)
+            if callable(on):
+                on("detached", lambda *_a: self.bump_cdp_session())
+
+    def bump_page(self) -> None:
+        self._page_gen += 1
+
+    def bump_context(self) -> None:
+        self._context_gen += 1
+        # A dead context takes its pages with it.
+        self._page_gen += 1
+
+    def bump_cdp_session(self) -> None:
+        self._cdp_gen += 1
+
+    @property
+    def current(self) -> RouteGenerations:
+        return RouteGenerations(
+            page=self._page_gen,
+            context=self._context_gen,
+            cdp_session=self._cdp_gen,
+        )
+
+
+def is_conversation_post(method: str, url: str) -> bool:
+    """Match only the real conversation POST, never a ``/prepare`` request."""
+    return (
+        method.upper() == "POST" and "/backend-api/f/conversation" in url and "/prepare" not in url
+    )
+
+
+async def capture_held_route(
+    route: Any,
+    *,
+    attempt_id: str,
+    mint_id: str,
+    profile_epoch: str,
+    generations: RouteGenerations,
+) -> CapturedSend:
+    """Capture a matching Playwright route and leave it unresolved.
+
+    This callback is intentionally tiny: it performs no ``continue_`` or
+    network action. The caller persists ``REQUEST_HELD`` using the returned
+    digest/name metadata before the one-shot sender is admitted.
+    """
+    request = route.request
+    method = str(getattr(request, "method", "POST"))
+    url = str(getattr(request, "url", ""))
+    if not is_conversation_post(method, url):
+        # Non-conversation traffic must retain its normal page behaviour.
+        await route.continue_()
+        raise RouteCustodyError("route did not match the conversation POST")
+    body = getattr(request, "post_data_buffer", None)
+    if callable(body):
+        body = body()
+    if hasattr(body, "__await__"):
+        body = await cast(Awaitable[Any], body)
+    if body is None:
+        post_data = getattr(request, "post_data", None)
+        body = post_data.encode("utf-8") if isinstance(post_data, str) else post_data
+    if not isinstance(body, bytes):
+        raise RouteCustodyError("conversation POST body unavailable; held proof failed")
+    raw_headers = getattr(request, "headers", {}) or {}
+    ordered = tuple((str(k), str(v)) for k, v in raw_headers.items())
+    holder = HeldRoute(
+        route,
+        request,
+        attempt_id=attempt_id,
+        generations=generations,
+    )
+    return CapturedSend(
+        route_holder=holder,
+        method=method,
+        url=url,
+        ordered_headers=ordered,
+        raw_body=body,
+        captured_monotonic=time.monotonic(),
+        profile_epoch=profile_epoch,
+        attempt_id=attempt_id,
+        mint_id=mint_id,
+    )
+
+
+def synthetic_v1_stream(
+    *,
+    posted_user_message: dict[str, Any],
+    conversation_id: str,
+    assistant_id: str,
+    final_text: str,
+) -> bytes:
+    """Build D4's seven semantic frames from the exact Python-posted object."""
+    root = {
+        "v": {
+            "message": {
+                "id": assistant_id,
+                "author": {"role": "assistant"},
+                "content": {"content_type": "text", "parts": [""]},
+                "status": "in_progress",
+                "end_turn": False,
+            },
+            "conversation_id": conversation_id,
+        }
+    }
+    frames: list[tuple[Optional[str], Any]] = [
+        ("delta_encoding", "v1"),
+        (None, root),
+        (
+            "input_message",
+            {"message": posted_user_message, "conversation_id": conversation_id},
+        ),
+        (None, {"p": "/message/content/parts/0", "o": "append", "v": final_text}),
+        (
+            None,
+            [
+                {"p": "/message/status", "o": "replace", "v": "finished_successfully"},
+                {"p": "/message/end_turn", "o": "replace", "v": True},
+            ],
+        ),
+        ("message_stream_complete", {"conversation_id": conversation_id}),
+    ]
+    chunks: list[bytes] = []
+    for event, payload in frames:
+        if event is not None:
+            chunks.append(f"event: {event}\n".encode())
+        chunks.append(("data: " + json.dumps(payload, separators=(",", ":")) + "\n\n").encode())
+    chunks.append(b"data: [DONE]\n\n")
+    return b"".join(chunks)
 
 
 @dataclass(frozen=True)
