@@ -84,7 +84,11 @@ NPX_ADAPTERS: tuple[AdapterSpec, ...] = (
     AdapterSpec(
         name="pi-acp",
         package="pi-acp",
-        version="latest",
+        # PINNED, like the other two. It read ``latest`` while the certification
+        # row said ``pi-acp@0.0.33``, so the pin could not hold the row it keys —
+        # and D13 keys certification on ``adapter package@version``. 0.0.33 is
+        # the version the row was measured against (laptop, 2026-09-16).
+        version="0.0.33",
         entry="dist/index.js",
     ),
 )

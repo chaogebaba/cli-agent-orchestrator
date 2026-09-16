@@ -95,10 +95,23 @@ def test_the_versions_are_pinned_not_floated() -> None:
     pinned = {spec.name: spec.version for spec in NPX_ADAPTERS}
     assert pinned["claude-acp"] == "0.76.0"
     assert pinned["codex-acp"] == "1.11.0"
-    # pi-acp is published without the pinned release S0 measured; it is recorded
-    # as `latest` HONESTLY rather than pinned to a version that does not exist,
-    # and its certification row carries that as the known gap.
-    assert pinned["pi-acp"] == "latest"
+    # pi-acp WAS ``latest`` while its certification row said 0.0.33 — a pin that
+    # could not hold the row it keys, which the S1 review caught (S5). It is now
+    # the version the row was measured against.
+    assert pinned["pi-acp"] == "0.0.33"
+
+
+def test_no_adapter_floats() -> None:
+    """The general form of the rule, so a fourth adapter cannot slip in loose.
+
+    D13 keys certification on ``adapter package@version``. A floating spec
+    invalidates a row nobody touched, and the failure is silent: the row still
+    names a version, and the thing that starts is a different one.
+    """
+    floating = {spec.name: spec.version for spec in NPX_ADAPTERS if spec.version == "latest"}
+    assert (
+        not floating
+    ), f"these adapters float and their certification rows cannot hold: {floating}"
 
 
 def test_prefetch_installs_all_three_into_the_vendor_root(tmp_path: Path) -> None:

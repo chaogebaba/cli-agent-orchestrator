@@ -43,8 +43,8 @@ from cli_agent_orchestrator.core.delivery import (
 from cli_agent_orchestrator.core.events import AnyKind, EventDraft, WorkerEvent
 from cli_agent_orchestrator.core.interrupt import (
     ActiveTurnHandle,
-    CallerPrincipal,
     AdmissionOutcome,
+    CallerPrincipal,
     CancelHandle,
     CancelOutcome,
     CancelSettlement,
