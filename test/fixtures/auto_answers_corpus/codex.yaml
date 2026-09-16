@@ -1,0 +1,140 @@
+- name: codex-usage-resets
+  enabled: true
+  match_mode: regex
+  question: You have \d+ usage limit resets available
+  options:
+  - Yes, continue
+  - No, quit
+  answer: wait
+- name: codex-trust-dir
+  modality: hard
+  enabled: true
+  match_mode: contains
+  question: Do you trust the contents of this directory?
+  options:
+  - Yes, continue
+  - No, quit
+  answer:
+  - Enter
+- name: codex-trust-dir-subdir
+  modality: hard
+  enabled: true
+  match_mode: contains
+  question: subdirectory of a Git project. Trusting will apply to the repository root
+  options:
+  - Press enter to continue
+  answer:
+  - Enter
+- name: codex-hooks-trust
+  modality: hard
+  enabled: true
+  match_mode: regex
+  question: Hooks need review \d+ hooks? (is|are) new or changed
+  options:
+  - Review hooks
+  - Trust all and continue
+  - Continue without trusting
+  answer:
+  - Down
+  - Enter
+- name: codex-fork-workdir-choice
+  enabled: true
+  match_mode: contains
+  question: Choose working directory to fork this session
+  options:
+  - Use session directory
+  - Use current directory
+  answer:
+  - Down
+  - Enter
+- name: codex-resume-workdir-choice
+  enabled: false
+  match_mode: contains
+  question: Choose working directory to resume this session
+  options:
+  - Use session directory
+  - Use current directory
+  answer:
+  - Down
+  - Enter
+- name: codex-ratelimit-model-switch
+  enabled: true
+  match_mode: regex
+  question: Switch to \S+ for lower credit usage\?
+  options:
+  - Keep current model
+  - Keep current model (never show again)
+  answer:
+  - Down
+  - Down
+  - Enter
+- name: codex-skills-toggle-panel
+  enabled: true
+  match_mode: contains
+  question: Enable/Disable Skills Turn skills on or off. Your changes are saved automatically.
+  options:
+  - Press space or enter to toggle
+  answer: wait
+- name: codex-update-available
+  enabled: true
+  match_mode: regex
+  question: Update available! [\d.]+ -> [\d.]+
+  options:
+  - Update now
+  - Skip until next version
+  answer: wait
+- name: codex-additional-safety-checks
+  match_mode: contains
+  question: Additional safety checks This request requires additional safety checks
+  options:
+  - Retry with a faster model
+  - Keep waiting
+  answer:
+  - '2'
+  - Enter
+- name: codex-resume-working-directory
+  enabled: false
+  match_mode: regex
+  question: Choose working directory to resume this session
+  options:
+  - Use session directory
+  - Use current directory
+  - Press enter to continue
+  answer:
+  - Down
+  - Enter
+- name: codex-resume-working-directory-4opt
+  enabled: false
+  match_mode: contains
+  question: Choose working directory to resume this session
+  options:
+  - Always use current directory
+  answer:
+  - Down
+  - Enter
+- name: codex-trust-dir-card
+  enabled: true
+  match_mode: contains
+  question: Do you trust the contents of this directory
+  options:
+  - continue
+  answer:
+  - Enter
+- name: codex-resume-workdir-card
+  enabled: true
+  match_mode: contains
+  question: Choose working directory to resume this session
+  options:
+  - Use current directory
+  answer:
+  - Down
+  - Enter
+- name: codex-hooks-trust-v0152
+  modality: hard
+  enabled: true
+  match_mode: regex
+  question: hooks? needs? review before (it|they) can run
+  options:
+  - Press t to trust all
+  answer:
+  - t

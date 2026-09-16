@@ -1,0 +1,11 @@
+# Additional rendered screens for a rule that has more than one, keyed by rule
+# name. The primary sample is always `<rule-name>.txt` and is NOT listed here.
+#
+# Declaring extras explicitly (rather than globbing `<rule>-*.txt`) is what lets
+# `test_every_sample_belongs_to_a_corpus_rule` be exact: `codex-trust-dir-card`
+# and `codex-trust-dir-subdir` are separate RULES, not extra samples of
+# `codex-trust-dir`, and a glob could not tell the two cases apart.
+grok-trust-directory:
+  # The revived grok trust card: same question, "y Yes, proceed / n No, quit"
+  # keyed options and an "Enter or y to trust" footer instead of the arrow list.
+  - grok-trust-directory-revival.txt

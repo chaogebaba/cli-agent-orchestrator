@@ -519,6 +519,12 @@ filterwarnings = [
     "ignore:'asyncio.iscoroutinefunction':DeprecationWarning",
     "ignore::pytest_mock.plugin.PytestMockWarning",
     "ignore:\\[tier-budget WARN\\]:UserWarning",
+    # F932 #784: test_live_rule_drift_is_reported_not_asserted REPORTS the
+    # machine's uncovered auto-answers rules. "default" (not "ignore") keeps it
+    # visible in the warnings summary; the bare "error" above would turn a
+    # property of the operator's home into a red test, which is the defect the
+    # versioned corpus removed.
+    "default:\\[auto-answers drift\\]:UserWarning",
 ]
 
 # ---------------------------------------------------------------------------------------

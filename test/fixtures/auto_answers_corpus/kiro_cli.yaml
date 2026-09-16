@@ -1,0 +1,11 @@
+- name: kiro-kas-trust-all-tools-confirm
+  enabled: true
+  match_mode: contains
+  question: 'Warning: Kiro is running in trust all tools mode'
+  options:
+  - No, exit
+  - Yes, I accept
+  - Yes, and don't ask again
+  answer:
+  - Down
+  - Enter

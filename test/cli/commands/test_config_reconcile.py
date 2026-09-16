@@ -240,16 +240,184 @@ def test_sandbox_guard_runs_before_reconcile_or_mutation(reconcile_env, monkeypa
 
 #: Shell/text-processing verbs that would mean the installer is *reading into*
 #: a TOML document rather than moving its bytes around.
+# fmt: off
 _TEXT_PROCESSORS = frozenset(
     {
         "grep", "egrep", "fgrep", "sed", "awk", "gawk", "cut", "tr",
         "head", "tail", "sort", "uniq", "xargs", "eval", "read", "source",
     }
 )
+# fmt: on
 
 #: TOML readers. Any of these anywhere in the script (shell *or* an embedded
 #: python heredoc) means install.sh re-grew the parser the fork already owns.
 _TOML_PARSERS = ("tomllib", "tomlkit", "import toml", "from toml", "toml.load")
+
+#: Verbs that WRITE the file they name. ``install`` is deliberately absent: the
+#: installer's own log prefix is the literal token ``[install]``, so including
+#: it would flag every diagnostic line that merely names the path.
+_FILE_MUTATORS = frozenset({"cp", "mv", "rm", "tee", "ln", "truncate", "dd", "touch"})
+
+#: ``> providers.toml`` / ``>> .../providers.toml`` — a write by redirection.
+_REDIRECT_INTO_PROVIDERS = re.compile(r">>?\s*\"?\$?\{?[^\s\"|;)]*providers\.toml")
+
+
+def _assert_installer_delegates(contents: str, origin: str = "install.sh") -> None:
+    """The four structural checks of F63 criterion 11, over an installer's text.
+
+    Split out of the cross-repo test (F1000 #848) so the invariant itself can be
+    exercised hermetically — a fork-only checkout has no root ``install.sh`` to
+    read, and the regression that motivated this (a COMMENT counted as a second
+    delegation point) is otherwise only reachable by editing the other repo.
+    """
+    lowered = contents.lower()
+
+    # Comment lines may describe the delegation freely; only executable lines
+    # are constrained. (F1000 #848: the delegation count used to run over the
+    # whole file, so a prose comment naming `cao config reconcile` — install.sh
+    # grew one in F937 #815 — turned this test red on a root doc edit.)
+    code_lines = [
+        (n, raw)
+        for n, raw in enumerate(contents.splitlines(), start=1)
+        if not raw.strip().startswith("#")
+    ]
+    code = "\n".join(raw for _, raw in code_lines).lower()
+
+    # (1) Exactly one delegation point, counted on executable lines only.
+    delegations = [(n, raw) for n, raw in code_lines if "cao config reconcile" in raw]
+    assert len(delegations) == 1, (
+        f"{origin} must call `cao config reconcile` exactly once; found "
+        f"{len(delegations)} executable call(s): "
+        + "; ".join(f"{origin}:{n} {raw.strip()!r}" for n, raw in delegations)
+    )
+
+    # (2) No TOML reader is constructed anywhere — shell or embedded heredoc.
+    #     Heredoc bodies are not comments, so this one keeps the whole file:
+    #     an `import tomllib` inside a python heredoc must still be caught.
+    for parser in _TOML_PARSERS:
+        assert parser not in lowered, (
+            f"{origin} re-grew a TOML parser ({parser!r}); "
+            "D6 delegates that to `cao config reconcile`"
+        )
+
+    # (3) providers.toml is the reconcile command's file: the installer must
+    #     never WRITE it — no seeding, copying, moving, backing up, or
+    #     redirecting into it. Reading into it is forbidden separately by (2)
+    #     and (4).
+    #
+    #     Merely NAMING the path is allowed, and has to be: since F937 #815 the
+    #     installer points the SHARED legacy-key detector at the live file and
+    #     prints the offending stanza names so a pre-F786 machine stops failing
+    #     every spawn with E-LEGACY-PROFILE-KEY. That detector lives in one
+    #     script, parses nothing in the shell, and reads its retired-name table
+    #     from the fork — it is the delegation D6 asks for, not a bypass. The
+    #     old blanket ``"providers.toml" not in code`` outlawed the diagnostic
+    #     along with the mutation; it was unreachable behind check (1) until
+    #     F1000 #848 fixed the comment miscount, so the drift went unseen.
+    for lineno, raw in code_lines:
+        if "providers.toml" not in raw.lower():
+            continue
+        assert not _REDIRECT_INTO_PROVIDERS.search(raw), (
+            f"{origin}:{lineno} redirects into providers.toml: {raw.strip()!r} "
+            "— that file is written by `cao config reconcile`"
+        )
+        tokens = {tok.lower() for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_-]*", raw)}
+        mutators = sorted(tokens & _FILE_MUTATORS)
+        assert not mutators, (
+            f"{origin}:{lineno} mutates providers.toml with {mutators}: "
+            f"{raw.strip()!r} — that file is written by `cao config reconcile`"
+        )
+
+    # (4) No provider-stanza reasoning, and no text-processing pointed at a
+    #     TOML path — every executable `toml` mention must be a plain file op.
+    assert ".profiles." not in code, f"{origin} reasons about provider stanzas"
+    for lineno, raw in code_lines:
+        if "toml" not in raw.lower():
+            continue
+        tokens = {tok.lower() for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_-]*", raw)}
+        offenders = sorted(tokens & _TEXT_PROCESSORS)
+        assert not offenders, (
+            f"{origin}:{lineno} text-processes a TOML file with {offenders}: "
+            f"{raw.strip()!r} — parsing belongs to `cao config reconcile`"
+        )
+
+
+#: Synthetic installers for the hermetic half of criterion 11. Each is the
+#: smallest script that isolates one behaviour of ``_assert_installer_delegates``.
+_ONE_CALL = '#!/bin/bash\n(cd "$REPO_DIR" && cao config reconcile)\n'
+
+
+def test_installer_contract_ignores_comment_mentions_of_the_delegation():
+    """F1000 #848 (the regression itself): prose that names the delegation is
+    documentation, not a second call site. Any number of comment mentions is
+    fine while exactly one executable call remains."""
+    _assert_installer_delegates(
+        _ONE_CALL
+        + "# `cao config reconcile` seeds providers.toml only when it is MISSING.\n"
+        + "    # ...and a second, indented comment mentioning cao config reconcile\n"
+    )
+
+
+def test_installer_contract_still_rejects_a_second_executable_call():
+    """The check must not have been widened into a no-op: two real call sites
+    are still a violation, and the message names both lines."""
+    with pytest.raises(AssertionError) as excinfo:
+        _assert_installer_delegates(_ONE_CALL + "cao config reconcile\n")
+    assert "found 2 executable call(s)" in str(excinfo.value)
+
+
+def test_installer_contract_rejects_zero_executable_calls():
+    """Deleting the delegation (leaving only prose about it) is a violation."""
+    with pytest.raises(AssertionError) as excinfo:
+        _assert_installer_delegates("#!/bin/bash\n# cao config reconcile\n")
+    assert "found 0 executable call(s)" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "line,needle",
+    [
+        ("python3 -c 'import tomllib; print(1)'", "tomllib"),
+        ('cp "$X" "$HOME/providers.toml"', "mutates providers.toml with ['cp']"),
+        ('mv "$T" "$CAO_HOME/providers.toml.bak"', "mutates providers.toml"),
+        ('printf "[codex]\\n" > "$CAO_HOME/providers.toml"', "redirects into providers.toml"),
+        ('echo x >> "$CAO_HOME/providers.toml"', "redirects into providers.toml"),
+        ('grep "\\[codex.profiles.foo\\]" x.toml', ".profiles."),
+        ('sed -i s/a/b/ "$AGENT_STORE/routing.toml"', "text-processes"),
+        ('grep -c stanza "$CAO_HOME/providers.toml"', "text-processes"),
+    ],
+    ids=[
+        "toml-parser",
+        "copy-onto",
+        "backup",
+        "redirect-truncate",
+        "redirect-append",
+        "stanza",
+        "text-processing",
+        "grep-providers",
+    ],
+)
+def test_installer_contract_rejects_each_workaround_d6_rejected(line: str, needle: str):
+    """Checks (2)-(4) still fire on executable lines."""
+    with pytest.raises(AssertionError) as excinfo:
+        _assert_installer_delegates(_ONE_CALL + line + "\n")
+    assert needle in str(excinfo.value)
+
+
+def test_installer_contract_allows_the_read_only_legacy_key_diagnostic():
+    """F937 #815: naming providers.toml to point the SHARED detector at it, and
+    printing what it found, is the delegation D6 asks for — not a bypass. This
+    is the exact shape install.sh carries; it must stay green."""
+    _assert_installer_delegates(
+        _ONE_CALL
+        + "check_providers_legacy_keys() {\n"
+        + '    _live="${CAO_HOME_DIR:-$HOME/.aws/cli-agent-orchestrator}/providers.toml"\n'
+        + '    [ -f "$_live" ] || return 0\n'
+        + '    _found=$(uv run --directory "$FORK_DIR" python \\\n'
+        + '        "$REPO_DIR/scripts/lib/providers_legacy_keys.py" "$_live" 2>/dev/null) || _rc=$?\n'
+        + '        skipped:*) echo "[install] providers.toml legacy-key check $_found" ;;\n'
+        + '    echo "[install]   \\`cao redeploy --force-providers\\` resets it from providers.toml.default"\n'
+        + "}\n"
+    )
 
 
 def test_root_installer_delegates_without_toml_or_stanza_parsing():
@@ -270,54 +438,28 @@ def test_root_installer_delegates_without_toml_or_stanza_parsing():
     ``orchestrator/routing.toml`` into the agent store via ``cp``/``mv``; the
     shell never interprets those bytes. The original blanket
     ``"toml" not in contents`` was a stale proxy for the invariant above and is
-    replaced by the four checks below, which still fail on every workaround D6
-    rejected.
+    replaced by the four checks in ``_assert_installer_delegates``, which still
+    fail on every workaround D6 rejected.
+
+    This is a CROSS-REPO CONTRACT test by design and stays one (ruling, F1000
+    #848): the contract it pins is precisely that the ROOT installer delegates
+    to a fork command, so there is nothing inside the fork to assert it against.
+    Two properties make that safe, and both are load-bearing:
+
+    * it SKIPS cleanly when the root repo is absent — a fork-only CI checkout
+      has no ``install.sh`` and must not invent a failure (``ROOT_REPO`` is
+      ``None`` there; see ``test/conftest.py``); and
+    * it is never red on a root COMMENT edit — the checks read executable lines
+      only, and the comment-immunity is itself pinned hermetically by
+      ``test_installer_contract_ignores_comment_mentions_of_the_delegation``,
+      which runs with or without a root checkout.
     """
     from test.conftest import ROOT_REPO
+
     if ROOT_REPO is None:
         pytest.skip("root repo not found (worktree without .git context)")
     install_script = ROOT_REPO / "install.sh"
-    contents = install_script.read_text(encoding="utf-8")
-    lowered = contents.lower()
-
-    # (1) Exactly one delegation point.
-    assert contents.count("cao config reconcile") == 1
-
-    # (2) No TOML reader is constructed anywhere — shell or embedded heredoc.
-    for parser in _TOML_PARSERS:
-        assert parser not in lowered, (
-            f"install.sh re-grew a TOML parser ({parser!r}); "
-            "D6 delegates that to `cao config reconcile`"
-        )
-
-    # Comment lines may describe the delegation freely; only executable lines
-    # are constrained.
-    code_lines = [
-        (n, raw)
-        for n, raw in enumerate(contents.splitlines(), start=1)
-        if not raw.strip().startswith("#")
-    ]
-    code = "\n".join(raw for _, raw in code_lines).lower()
-
-    # (3) providers.toml is the reconcile command's file; the installer neither
-    #     seeds, diffs, backs up nor names it.
-    assert "providers.toml" not in code, (
-        "install.sh touches providers.toml directly; that file is owned by "
-        "`cao config reconcile`"
-    )
-
-    # (4) No provider-stanza reasoning, and no text-processing pointed at a
-    #     TOML path — every executable `toml` mention must be a plain file op.
-    assert ".profiles." not in code, "install.sh reasons about provider stanzas"
-    for lineno, raw in code_lines:
-        if "toml" not in raw.lower():
-            continue
-        tokens = {tok.lower() for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_-]*", raw)}
-        offenders = sorted(tokens & _TEXT_PROCESSORS)
-        assert not offenders, (
-            f"install.sh:{lineno} text-processes a TOML file with {offenders}: "
-            f"{raw.strip()!r} — parsing belongs to `cao config reconcile`"
-        )
+    _assert_installer_delegates(install_script.read_text(encoding="utf-8"))
 
 
 def test_backup_failure_aborts_before_atomic_publish(reconcile_env, monkeypatch):

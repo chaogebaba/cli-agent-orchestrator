@@ -8,21 +8,33 @@ stripped the punctuation/glyphs their regexes need. The fix (two domains:
 contains→full canonical, regex→LIGHT canonical with punctuation preserved) must
 NOT rewrite the shipped rules.
 
-This test loads EVERY enabled rule from the live
-`~/.aws/cli-agent-orchestrator/auto-answers/*.yaml` files READ-ONLY and asserts
-each still matches a representative rendered sample under the shipped matcher
-(via dialog_region, exactly as production evaluates a screen). Samples live in
-`test/fixtures/auto_answers_samples/<rule-name>.txt`.
+The corpus is REPO-VERSIONED (F932 #784). Every rule is read from
+``test/fixtures/auto_answers_corpus/<provider>.yaml`` and asserted to still match
+its rendered sample under ``test/fixtures/auto_answers_samples/`` via
+``dialog_region``, exactly as production evaluates a screen.
 
-If this file is run in an environment without the user's auto-answers yaml (e.g.
-a clean CI checkout), it skips — the seed rules are covered by
-test_auto_responder_seed_rules.py and test_f597_canonical_matcher.py.
+Why versioned, and not read from the live yaml as this file used to do: the
+``~/.aws/cli-agent-orchestrator/auto-answers/*.yaml`` files are OPERATOR STATE.
+``cao install`` seeds them and a human edits them afterwards; nothing versions
+them in either repo. Enumerating them made the suite's colour a property of the
+host — the same commit was green on grok-box-003, red on grok-box-009
+(``codex-hooks-list-close``) and red on a third set on the laptop — so a
+"new vs pre-existing failure" tally could not be compared across machines at
+all. Every assertion here is now repo-vs-repo and reads the same on any host.
+
+The live directory has exactly one remaining role:
+``test_live_rule_drift_is_reported_not_asserted`` REPORTS rules installed on
+this machine that the corpus does not cover. It warns; it never fails. The
+enforceable half of that intent — no SHIPPED rule may lack a sample — is
+hermetic and lives in ``test_seed_rule_is_in_the_corpus_and_matches_its_sample``,
+which reads ``auto_responder.SEED_RULES``, the bytes CAO actually ships.
 """
 
 from __future__ import annotations
 
 import glob
 import os
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +44,7 @@ import yaml
 from cli_agent_orchestrator.services import auto_responder as ar
 
 # F704 #559: overridable so the nameless-rule handling can be tested against a
-# scratch fixture dir (must be set before pytest collects, _RULES is module-level).
+# scratch fixture dir (must be set before pytest collects, _LIVE is module-level).
 AUTO_ANSWERS_DIR = Path(
     os.environ.get(
         "F597_AUTO_ANSWERS_DIR",
@@ -40,6 +52,12 @@ AUTO_ANSWERS_DIR = Path(
     )
 )
 SAMPLES_DIR = Path(__file__).parents[1] / "fixtures" / "auto_answers_samples"
+CORPUS_DIR = Path(__file__).parents[1] / "fixtures" / "auto_answers_corpus"
+
+#: Not a rule file. It is a rule-name -> [extra sample filenames] mapping, so the
+#: corpus loader must skip it by name; left in the same directory because it is
+#: part of the corpus's definition and drifts with it.
+EXTRA_SAMPLES_FILE = "extra-samples.yaml"
 
 
 def _rule_name(item: dict[str, Any]) -> str:
@@ -59,8 +77,10 @@ def _is_malformed_doc(item: dict[str, Any]) -> bool:
     return "__malformed_document__" in item
 
 
-def _enabled_rules(rules_dir: Path | str | None = None) -> list[tuple[str, int, dict[str, Any]]]:
-    """(file basename, 0-based index within the file, rule) for every enabled rule.
+def _load_rules(
+    rules_dir: Path | str | None = None, *, enabled_only: bool = True
+) -> list[tuple[str, int, dict[str, Any]]]:
+    """(file basename, 0-based index within the file, rule) for every rule.
 
     Collection must NEVER raise, whatever the yaml decodes to: a truthy
     non-list top level (scalar, mapping, ...) is not iterable/enumerable
@@ -70,7 +90,11 @@ def _enabled_rules(rules_dir: Path | str | None = None) -> list[tuple[str, int, 
     A null/empty file decodes to no rules (skips), as before.
     """
     out: list[tuple[str, int, dict[str, Any]]] = []
-    for path in sorted(glob.glob(str((Path(rules_dir) if rules_dir else AUTO_ANSWERS_DIR) / "*.yaml"))):
+    base = Path(rules_dir) if rules_dir else AUTO_ANSWERS_DIR
+    for path in sorted(glob.glob(str(base / "*.yaml"))):
+        fname = os.path.basename(path)
+        if fname == EXTRA_SAMPLES_FILE:
+            continue
         try:
             raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or []
         except Exception:
@@ -78,28 +102,77 @@ def _enabled_rules(rules_dir: Path | str | None = None) -> list[tuple[str, int, 
         if not isinstance(raw, list):
             out.append(
                 (
-                    os.path.basename(path),
+                    fname,
                     -1,
-                    {"__malformed_document__": f"top-level {type(raw).__name__}, expected a list of rules"},
+                    {
+                        "__malformed_document__": f"top-level {type(raw).__name__}, expected a list of rules"
+                    },
                 )
             )
             continue
         for idx, item in enumerate(raw):
-            if isinstance(item, dict) and item.get("enabled", True):
-                out.append((os.path.basename(path), idx, item))
+            if isinstance(item, dict) and (not enabled_only or item.get("enabled", True)):
+                out.append((fname, idx, item))
     return out
 
 
-_RULES = _enabled_rules()
+def _enabled_rules(rules_dir: Path | str | None = None) -> list[tuple[str, int, dict[str, Any]]]:
+    """Enabled-only view of :func:`_load_rules` (the historical helper name)."""
+    return _load_rules(rules_dir, enabled_only=True)
 
 
-@pytest.mark.skipif(not _RULES, reason="no live auto-answers yaml present (clean checkout)")
+def _extra_samples() -> dict[str, list[str]]:
+    raw = yaml.safe_load((CORPUS_DIR / EXTRA_SAMPLES_FILE).read_text(encoding="utf-8")) or {}
+    assert isinstance(raw, dict), f"{EXTRA_SAMPLES_FILE} must be a rule-name -> [file] mapping"
+    return {k: list(v or []) for k, v in raw.items()}
+
+
+def _samples_for(name: str) -> list[Path]:
+    """Primary sample ``<rule>.txt`` first, then any declared extras."""
+    return [SAMPLES_DIR / f"{name}.txt"] + [
+        SAMPLES_DIR / extra for extra in _extra_samples().get(name, [])
+    ]
+
+
+def _as_rule(item: dict[str, Any]) -> ar.Rule:
+    return ar.Rule(
+        name=_rule_name(item),
+        enabled=True,
+        match_mode=item.get("match_mode", "contains"),
+        question=item["question"],
+        options=list(item.get("options", []) or []),
+        answer=item.get("answer", "wait"),
+    )
+
+
+#: The whole corpus, enabled and disabled alike: ``matches()`` is independent of
+#: ``enabled``, and a canonicalization regression does not care whether a rule is
+#: currently switched on. Versioned, so this list is identical on every host.
+_CORPUS = _load_rules(CORPUS_DIR, enabled_only=False)
+#: The machine's own rules. Drift reporting ONLY — never assert against these.
+_LIVE = _enabled_rules()
+
+#: (rule, sample) pairs, one test each. The id is the sample's stem, which is the
+#: rule name for every rule that has a single screen.
+_PAIRS = [
+    pytest.param((item, sample), id=sample.stem)
+    for _f, _i, item in _CORPUS
+    for sample in _samples_for(_rule_name(item))
+]
+
+
+def test_corpus_is_present_and_non_empty() -> None:
+    """The corpus is versioned, so an empty one means it was lost, not that this
+    host has no rules — the failure mode the live-yaml skipif used to hide."""
+    assert _CORPUS, f"no rules found under {CORPUS_DIR}"
+
+
 def test_every_rule_is_named() -> None:
-    """Every enabled shipped rule must carry a non-empty ``name`` — a nameless
-    rule is unmatchable (production keys rules by name) and breaks the corpus
-    ids, so it must fail HERE as one clear listing, not a collection KeyError."""
-    nameless = [(fname, idx, item) for fname, idx, item in _RULES if not _rule_name(item).strip()]
-    assert not nameless, "every enabled rule must have a non-empty 'name'; offenders: " + "; ".join(
+    """Every corpus rule must carry a non-empty ``name`` — a nameless rule is
+    unmatchable (production keys rules by name) and breaks the corpus ids, so it
+    must fail HERE as one clear listing, not a collection KeyError."""
+    nameless = [(fname, idx, item) for fname, idx, item in _CORPUS if not _rule_name(item).strip()]
+    assert not nameless, "every rule must have a non-empty 'name'; offenders: " + "; ".join(
         f"{_rule_id(fname, idx, item)} -> {str(item)[:60]}" for fname, idx, item in nameless
     )
 
@@ -117,9 +190,7 @@ _NON_LIST_CASES = [
 
 
 @pytest.mark.parametrize("fixture,decoded_type", _NON_LIST_CASES)
-def test_non_list_yaml_yields_one_named_failure_not_crash(
-    fixture: str, decoded_type: str
-) -> None:
+def test_non_list_yaml_yields_one_named_failure_not_crash(fixture: str, decoded_type: str) -> None:
     """A truthy non-list top level must produce exactly one malformed sentinel
     entry that names the file — not a collection crash."""
     rules = _enabled_rules(SHAPES_DIR / fixture)
@@ -148,81 +219,147 @@ def test_nameless_rule_still_yields_named_entry() -> None:
     assert _rule_id(fname, idx, item) == f"{fname}:rule0"
 
 
-@pytest.mark.skipif(not _RULES, reason="no live auto-answers yaml present (clean checkout)")
-@pytest.mark.parametrize(
-    "fname_and_rule",
-    [
-        pytest.param(
-            (fname, item),
-            id=_rule_id(fname, idx, item),
-            marks=pytest.mark.skipif(
-                not _rule_name(item).strip(),
-                reason="nameless rule (failed test_every_rule_is_named; cannot key a sample)",
-            ),
-        )
-        for fname, idx, item in _RULES
-    ],
-)
+@pytest.mark.parametrize("rule_and_sample", _PAIRS)
 def test_enabled_shipped_rule_matches_its_sample(
-    fname_and_rule: tuple[str, dict[str, Any]],
+    rule_and_sample: tuple[dict[str, Any], Path],
 ) -> None:
-    """Each enabled shipped rule must still match a representative rendered
-    screen under the two-domain canonical matcher (F597 #454 B2)."""
-    fname, rule_item = fname_and_rule
+    """Each corpus rule must still match a representative rendered screen under
+    the two-domain canonical matcher (F597 #454 B2)."""
+    rule_item, sample = rule_and_sample
     name = _rule_name(rule_item)
-    assert name, f"nameless rule in {fname} (see test_every_rule_is_named)"
-    sample = SAMPLES_DIR / f"{name}.txt"
-    assert sample.exists(), (
-        f"missing representative sample for enabled rule {name!r}: " f"add {sample}"
-    )
-    rule = ar.Rule(
-        name=name,
-        enabled=True,
-        match_mode=rule_item.get("match_mode", "contains"),
-        question=rule_item["question"],
-        options=list(rule_item.get("options", []) or []),
-        answer=rule_item.get("answer", "wait"),
-    )
-    lines = sample.read_text(encoding="utf-8").splitlines()
-    region = ar.dialog_region(lines)
+    assert name, "nameless rule (see test_every_rule_is_named)"
+    assert sample.exists(), f"missing representative sample for rule {name!r}: add {sample}"
+    rule = _as_rule(rule_item)
+    region = ar.dialog_region(sample.read_text(encoding="utf-8").splitlines())
     assert rule.matches(region), (
-        f"rule {name!r} ({rule.match_mode}) failed to match its sample; "
+        f"rule {name!r} ({rule.match_mode}) failed to match {sample.name}; "
         f"reject={rule.reject_reason(region)!r}\n"
         f"full={region.normalized!r}\nlight={region.normalized_light!r}"
     )
 
 
-@pytest.mark.skipif(not _RULES, reason="no live auto-answers yaml present (clean checkout)")
 def test_every_enabled_rule_has_a_sample() -> None:
-    """No enabled shipped rule may lack a sample (else a regression could hide)."""
+    """No corpus rule may lack its primary sample (else a regression could hide).
+
+    Hermetic since F932 #784: this ranges over the versioned corpus, not over
+    whatever rule set this machine happens to have installed.
+    """
     missing = [
         _rule_name(item)
-        for _f, _i, item in _RULES
+        for _f, _i, item in _CORPUS
         if _rule_name(item) and not (SAMPLES_DIR / f"{_rule_name(item)}.txt").exists()
     ]
-    assert not missing, f"enabled rules without a sample fixture: {missing}"
+    assert not missing, f"corpus rules without a sample fixture: {missing}"
 
 
-@pytest.mark.skipif(not _RULES, reason="no live auto-answers yaml present (clean checkout)")
+def test_every_sample_belongs_to_a_corpus_rule() -> None:
+    """The reverse direction: a sample no rule claims is dead weight that no
+    test exercises. Declare it in extra-samples.yaml or delete it."""
+    claimed = {p.name for _f, _i, item in _CORPUS for p in _samples_for(_rule_name(item))}
+    orphans = sorted(p.name for p in SAMPLES_DIR.glob("*.txt") if p.name not in claimed)
+    assert not orphans, (
+        f"sample fixtures claimed by no corpus rule: {orphans} — add the rule to "
+        f"{CORPUS_DIR.name}/, list the file under {EXTRA_SAMPLES_FILE}, or delete it"
+    )
+
+
+def test_declared_extra_samples_exist_and_name_a_corpus_rule() -> None:
+    """extra-samples.yaml must not accumulate entries for deleted rules/files."""
+    names = {_rule_name(item) for _f, _i, item in _CORPUS}
+    for rule_name, files in _extra_samples().items():
+        assert rule_name in names, f"{EXTRA_SAMPLES_FILE} names unknown rule {rule_name!r}"
+        for fname in files:
+            assert (
+                SAMPLES_DIR / fname
+            ).exists(), f"{EXTRA_SAMPLES_FILE}: {rule_name!r} lists missing sample {fname!r}"
+
+
+def _seed_rule_params() -> list[Any]:
+    out = []
+    for fname, text in sorted(ar.SEED_RULES.items()):
+        for item in yaml.safe_load(text) or []:
+            if isinstance(item, dict) and item.get("name") and item.get("enabled", True):
+                out.append(pytest.param((fname, item), id=item["name"]))
+    return out
+
+
+@pytest.mark.parametrize("seed", _seed_rule_params())
+def test_seed_rule_is_in_the_corpus_and_matches_its_sample(
+    seed: tuple[str, dict[str, Any]],
+) -> None:
+    """The enforceable half of "no shipped rule may lack a sample".
+
+    ``SEED_RULES`` is what CAO actually writes into a fresh
+    ``~/.aws/cli-agent-orchestrator/auto-answers/<provider>.yaml``, so it is the
+    only rule set the fork ships and the only one it can be held to. Each seeded
+    rule must be covered by the corpus AND match its sample as shipped — the
+    live file may have been hand-edited since, which is precisely why the live
+    file cannot carry this assertion (F932 #784).
+    """
+    fname, item = seed
+    name = item["name"]
+    corpus = {_rule_name(it) for _f, _i, it in _CORPUS}
+    assert name in corpus, (
+        f"SEED_RULES[{fname!r}] ships rule {name!r} but the versioned corpus does not "
+        f"cover it; add it to {CORPUS_DIR.name}/{fname} with a sample"
+    )
+    sample = SAMPLES_DIR / f"{name}.txt"
+    assert sample.exists(), f"shipped rule {name!r} has no sample: add {sample}"
+    rule = _as_rule(item)
+    region = ar.dialog_region(sample.read_text(encoding="utf-8").splitlines())
+    assert rule.matches(region), (
+        f"shipped rule {name!r} regressed against its sample: " f"{rule.reject_reason(region)!r}"
+    )
+
+
 def test_regressed_regex_rules_present_and_match() -> None:
     """Explicit guard for the exact three rules the gate flagged: they use regex
-    with punctuation/glyph anchors and MUST match under the light domain."""
-    by_name = {_rule_name(item): item for _f, _i, item in _RULES if _rule_name(item)}
+    with punctuation/glyph anchors and MUST match under the light domain.
+
+    These are asserted PRESENT, not skipped-if-absent: the corpus is versioned,
+    so deleting one of them is a change to this repo, not a property of the host.
+    """
+    by_name = {_rule_name(item): item for _f, _i, item in _CORPUS if _rule_name(item)}
     for name in (
         "askuserquestion-fork-prompt",
         "codex-ratelimit-model-switch",
         "codex-update-available",
     ):
-        if name not in by_name:
-            pytest.skip(f"{name} not present in this environment's yaml")
-        item = by_name[name]
-        rule = ar.Rule(
-            name,
-            True,
-            item.get("match_mode", "contains"),
-            item["question"],
-            list(item.get("options", []) or []),
-            item.get("answer", "wait"),
-        )
+        assert name in by_name, f"{name} must stay in the versioned corpus"
+        rule = _as_rule(by_name[name])
         region = ar.dialog_region((SAMPLES_DIR / f"{name}.txt").read_text().splitlines())
         assert rule.matches(region), f"{name} regressed: {rule.reject_reason(region)!r}"
+
+
+@pytest.mark.skipif(not _LIVE, reason="no live auto-answers yaml present (clean checkout)")
+def test_live_rule_drift_is_reported_not_asserted() -> None:
+    """Report, never fail: enabled rules installed on THIS machine that the
+    versioned corpus does not cover.
+
+    This is the only place the live directory is read, and it deliberately makes
+    no assertion about it. Operator state cannot decide a commit's colour
+    (F932 #784) — a rule a human added to their own home an hour ago is not a
+    regression in this repo. The gap is still worth surfacing, because a rule
+    with no sample is a rule no regression guard covers; the fix is to add the
+    rule and a rendered sample to the corpus, not to make this test red.
+    """
+    covered = {_rule_name(item) for _f, _i, item in _CORPUS}
+    drift = sorted(
+        f"{fname}:{_rule_name(item)}"
+        for fname, _i, item in _LIVE
+        if _rule_name(item) and _rule_name(item) not in covered
+    )
+    if drift:
+        # The "[auto-answers drift]" prefix is load-bearing: pyproject's
+        # filterwarnings turns warnings into errors by default, and this one is
+        # downgraded to "default" by that exact prefix (precedent:
+        # "[tier-budget WARN]"). Without it the report would become a failure —
+        # the host-dependence this whole rewrite removed.
+        warnings.warn(
+            "[auto-answers drift] live auto-answers rules not covered by the "
+            f"versioned corpus ({len(drift)}): {drift} — add each rule to "
+            "test/fixtures/auto_answers_corpus/ with a rendered sample",
+            UserWarning,
+            stacklevel=1,
+        )
+    assert True  # reporting only, by design

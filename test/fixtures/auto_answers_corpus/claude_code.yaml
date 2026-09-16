@@ -1,0 +1,21 @@
+- name: theme-selection-onboarding
+  enabled: true
+  match_mode: regex
+  question: Choose the text style that looks best
+  options:
+  - Dark mode
+  answer: Enter
+- name: api-provider-onboarding
+  enabled: true
+  match_mode: regex
+  question: Who is your Claude API provider
+  options:
+  - Anthropic
+  answer: Enter
+- name: askuserquestion-fork-prompt
+  enabled: true
+  match_mode: regex
+  question: ☐|☑|✔
+  options:
+  - ❯ 1.
+  answer: wait

@@ -1,0 +1,29 @@
+- name: grok-project-directory-picker
+  enabled: true
+  match_mode: contains
+  question: Run Grok Build in a project directory?
+  options:
+  - current
+  - Enter:submit
+  answer:
+  - Enter
+- name: grok-slash-command-palette
+  enabled: true
+  match_mode: contains
+  question: Quit the application
+  options:
+  - /quit
+  - /help
+  - Browse commands and keyboard shortcuts
+  answer:
+  - Escape
+- name: grok-trust-directory
+  modality: hard
+  enabled: true
+  match_mode: contains
+  question: Do you trust the contents of this directory?
+  options:
+  - Yes, proceed
+  - No, quit
+  answer:
+  - y
