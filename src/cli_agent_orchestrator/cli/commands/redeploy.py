@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 import shutil
 import subprocess
@@ -15,6 +14,7 @@ import click
 import requests
 
 from cli_agent_orchestrator.constants import MCP_REQUEST_TIMEOUT
+from cli_agent_orchestrator.public_api.workspace import atomic_copy
 from cli_agent_orchestrator.services.verification_service import (
     DeploymentStatus,
     cli_deploy_root,
@@ -72,18 +72,6 @@ def _install_python_version(source_root: Path) -> str:
     return f"{match.group(1)}.{match.group(2)}"
 
 
-def _atomic_copy(src: Path, dst: Path) -> None:
-    """Copy ``src`` over ``dst`` via a same-directory temp file + rename.
-
-    F838 (#695): a plain copy truncates then streams, so a concurrent resolver
-    (an assign resolving a composition stub) can read a half-written fragment.
-    """
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_name(f".{dst.name}.{os.getpid()}.tmp")
-    shutil.copyfile(src, tmp)
-    os.replace(tmp, dst)
-
-
 def _sync_composition_stores(workspace_root: Path) -> None:
     """Mirror install.sh's F497 D3/D9 step for the neutral stores: positions/, overlays/.
 
@@ -108,10 +96,10 @@ def _sync_composition_stores(workspace_root: Path) -> None:
             first = frag.read_text(encoding="utf-8").splitlines()[:1]
             if first and first[0].startswith(_FROZEN_PROFILE_MARKER):
                 continue
-            _atomic_copy(frag, store_dir / frag.name)
+            atomic_copy(frag, store_dir / frag.name)
         clauses = src_dir / "_clauses.toml"
         if clauses.is_file():
-            _atomic_copy(clauses, store_dir / clauses.name)
+            atomic_copy(clauses, store_dir / clauses.name)
 
 
 def _install_redeploy(source_root: Path, *, force_providers: bool = False) -> None:

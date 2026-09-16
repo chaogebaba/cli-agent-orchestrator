@@ -13,8 +13,11 @@ from pathlib import Path
 
 import click
 
-from cli_agent_orchestrator.cli.commands.redeploy import _atomic_copy
-from cli_agent_orchestrator.constants import local_agent_store_dir, routing_toml_path
+from cli_agent_orchestrator.public_api.workspace import (
+    atomic_copy,
+    local_agent_store_dir,
+    routing_toml_path,
+)
 
 
 @click.command("sync-routing")
@@ -31,5 +34,5 @@ def sync_routing(workspace: Path | None) -> None:
     if not routing.is_file():
         raise click.ClickException(f"{routing}: not found")
     local_agent_store_dir().mkdir(parents=True, exist_ok=True)
-    _atomic_copy(routing, routing_toml_path())
+    atomic_copy(routing, routing_toml_path())
     click.echo(f"synced: {routing} -> {routing_toml_path()}")
