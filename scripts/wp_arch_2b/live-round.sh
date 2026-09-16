@@ -48,6 +48,18 @@ POSITION="developer"
 CERT_DIR=""
 # How long a lane gets to answer ONE probe turn before the arm is abandoned.
 READY_SECONDS=300
+# THE UNSOURCED CONTROL (AC-2b case 6).  One extra lane of this provider, spawned
+# under the FLAT built-in profile, which can never be certified: a flat name has
+# no position, so split_effective_name returns None and the D9 predicate is never
+# even consulted (utils/agent_profiles.py:1333, measured).  It is therefore
+# unsourced BY CONSTRUCTION rather than by an accident of credentials.
+#
+# It used to be the kiro lane, which made the control hostage to kiro's login on
+# whichever box the round landed on -- and kiro was logged out on two of them.
+# The control does not need to be certified or allowlisted; it needs to be ALIVE
+# and unsourced, so the provider that is already working on the box is the right
+# one to use twice.  Empty disables it.
+FLAT_CONTROL="claude_code"
 PORT=9889
 BOXHOME=/workspace/cao/home
 REMOTE_SCRATCH='/workspace/cao/home/box-scratch/2b-live'
@@ -69,6 +81,7 @@ while [ $# -gt 0 ]; do
     --position) POSITION="${2:-}"; shift 2 ;;
     --certification-dir) CERT_DIR="${2:-}"; shift 2 ;;
     --ready-seconds) READY_SECONDS="${2:-}"; shift 2 ;;
+    --flat-control) FLAT_CONTROL="${2:-}"; shift 2 ;;
     -h|--help) usage ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -165,6 +178,7 @@ ARM_SESSION=$SESSION-$arm
 COMPOSED_NAMES=$COMPOSED
 POSITION=$POSITION
 SUPERVISOR_PROFILE=$SUPERVISOR_PROFILE
+FLAT_CONTROL=$FLAT_CONTROL
 # The profile a lane spawns under.  A composed <position>-<provider> name is the
 # ONLY shape D9 can certify; the flat built-in name is the uncertified fallback
 # for a round run without a certification store.
@@ -211,11 +225,13 @@ export PATH="\$HOME/.bun/bin:\$HOME/.local/bin:\$HOME/.grok/bin:/home/box/.local
 # under (providers/kiro_cli.py:602 falls back to kiro_default and says so), so a
 # composed spawn name needs a manifest under the COMPOSED name.  Seeding only
 # "developer" here is how a composed kiro lane would quietly run as kiro_default.
-if [ ! -f "\$HOME/.kiro/agents/$KIRO_PROFILE.json" ] &&
-   [ -f "\$HOME/.kiro/agents/kiro_dev.json" ]; then
-  mkdir -p "\$HOME/.kiro/agents"
-  cp "\$HOME/.kiro/agents/kiro_dev.json" "\$HOME/.kiro/agents/$KIRO_PROFILE.json"
-fi
+for _kiro_name in $KIRO_PROFILE developer; do
+  if [ ! -f "\$HOME/.kiro/agents/\$_kiro_name.json" ] &&
+     [ -f "\$HOME/.kiro/agents/kiro_dev.json" ]; then
+    mkdir -p "\$HOME/.kiro/agents"
+    cp "\$HOME/.kiro/agents/kiro_dev.json" "\$HOME/.kiro/agents/\$_kiro_name.json"
+  fi
+done
 
 cd $BOXHOME/cli-subagents/cli-agent-orchestrator || exit 2
 git fetch origin >/dev/null 2>&1
@@ -393,6 +409,17 @@ for provider in $LANE_PROVIDERS; do
     -H 'content-type: application/json' -d '{}' >>"\$ROUND/launch.log" 2>&1
   echo " <- \$provider lane" >>"\$ROUND/launch.log"
 done
+
+# THE UNSOURCED CONTROL, added only when the other lanes are composed: in a flat
+# round every lane is already uncertified and a second one would prove nothing.
+# Same provider as a working lane, different PROFILE -- that is the whole trick,
+# and it is why this lane needs no credentials of its own.
+if [ -n "\$COMPOSED_NAMES" ] && [ -n "\$FLAT_CONTROL" ]; then
+  curl -s --max-time 420 -o "\$ROUND/lane-flat-control.json" -w "%{http_code}" -X POST \\
+    "http://127.0.0.1:$PORT/sessions/\$ARM_SESSION/terminals?agent_profile=developer&provider=\$FLAT_CONTROL&working_directory=$BOXHOME/cli-subagents/cli-agent-orchestrator" \\
+    -H 'content-type: application/json' -d '{}' >>"\$ROUND/launch.log" 2>&1
+  echo " <- \$FLAT_CONTROL UNSOURCED CONTROL (flat profile 'developer')" >>"\$ROUND/launch.log"
+fi
 # Same rule for the worker lanes.  ``pi_cli`` answered 500 ("startup error
 # banner") on a box where ``pi`` was installed but broken, and the round
 # continued with the control lane missing — which is precisely the lane the
@@ -405,6 +432,18 @@ for provider in $LANE_PROVIDERS; do
     exit 2
   fi
 done
+# The control is checked exactly like the others.  A control lane that silently
+# failed to start is the same defect as a missing workload lane: the criterion it
+# carries would SKIP, and a SKIP is never a pass.
+if [ -n "\$COMPOSED_NAMES" ] && [ -n "\$FLAT_CONTROL" ]; then
+  if ! grep -q '^201' "\$ROUND/lane-flat-control.json" 2>/dev/null &&
+     ! python3 -c "import json,sys; json.load(open(sys.argv[1]))['id']" \\
+       "\$ROUND/lane-flat-control.json" >/dev/null 2>&1; then
+    echo "HARNESS: the unsourced control lane (\$FLAT_CONTROL, flat profile) did not start;"
+    echo "HARNESS: \$(head -c 200 "\$ROUND/lane-flat-control.json" 2>/dev/null)"
+    exit 2
+  fi
+fi
 sleep 20
 
 # The fleet series: one snapshot per heartbeat for the length of the workload,
@@ -880,7 +919,7 @@ for arm in off on; do
   if ! grokfleet ssh --lease "$LEASE_ID" "echo $payload_b64 | base64 -d > $REMOTE_SCRATCH-payload.sh && bash $REMOTE_SCRATCH-payload.sh" >>"$OUT/round.log" 2>&1; then
     die "arm $arm did not complete; see $OUT/round.log"
   fi
-  for artefact in db fleet.json fleet-series.jsonl read-path.jsonl server.log cao.log launch.log preconditions.json lane-providers.txt lane-readiness.txt composed-names.txt send.log; do
+  for artefact in db fleet.json fleet-series.jsonl read-path.jsonl server.log cao.log launch.log preconditions.json lane-providers.txt lane-readiness.txt composed-names.txt lane-flat-control.json send.log; do
     grokfleet ssh --lease "$LEASE_ID" "cat $REMOTE_SCRATCH/$arm/$artefact 2>/dev/null | base64 -w0" \
       2>/dev/null | base64 -d > "$OUT/$arm/$artefact" 2>/dev/null || true
   done
