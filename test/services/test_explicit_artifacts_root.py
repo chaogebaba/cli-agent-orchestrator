@@ -120,3 +120,90 @@ def test_mutant_directory_probe_is_detectably_different(tmp_path: Path) -> None:
         return base / "tmp" / "orch"
 
     assert probing_fallback(str(tmp_path)) != _root(canonical_session_env(str(tmp_path), {}))
+
+
+# ---------------------------------------------------------------------------------------
+# D1 — the managed env store is honoured (2026-09-16 ruling, confirmed by lite-review r1)
+# ---------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def managed_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Point ``cao env``'s store at a temp file and hand back a setter.
+
+    Patches the constant where ``utils.env`` READ it, not where it was defined — the module
+    binds ``CAO_ENV_FILE`` at import time, so patching ``constants`` alone would be a no-op
+    and every assertion below would pass against an empty store.
+    """
+    from cli_agent_orchestrator.utils import env as env_utils
+
+    store = tmp_path / "store" / ".env"
+    store.parent.mkdir(parents=True)
+    store.touch()
+    monkeypatch.setattr(env_utils, "CAO_ENV_FILE", store)
+
+    def setter(key: str, value: str) -> None:
+        env_utils.set_env_var(key, value)
+
+    return setter
+
+
+def test_store_value_is_used_when_no_explicit_override(tmp_path: Path, managed_store) -> None:
+    """What `cao env set CAO_ARTIFACTS_DIR <abs>` is supposed to do, and now does."""
+    explicit = tmp_path / "repo" / "orchestrator" / "tmp" / "orch"
+    managed_store(ARTIFACTS_DIR_ENV, str(explicit))
+    env = canonical_session_env(str(tmp_path), {})
+    assert _root(env) == explicit.resolve()
+
+
+def test_explicit_override_beats_the_store(tmp_path: Path, managed_store) -> None:
+    """`cao launch --env` is a per-launch override and must outrank the persistent store."""
+    managed_store(ARTIFACTS_DIR_ENV, str(tmp_path / "from-store"))
+    per_launch = tmp_path / "from-env-flag"
+    env = canonical_session_env(str(tmp_path), {ARTIFACTS_DIR_ENV: str(per_launch)})
+    assert _root(env) == per_launch.resolve()
+
+
+def test_empty_store_falls_back_to_the_neutral_root(tmp_path: Path, managed_store) -> None:
+    del managed_store  # the store exists but carries no artifacts key
+    env = canonical_session_env(str(tmp_path), {})
+    assert _root(env) == tmp_path.resolve() / "tmp" / "orch"
+
+
+def test_a_relative_store_value_is_rejected_like_a_relative_flag(
+    tmp_path: Path, managed_store
+) -> None:
+    """The store gets the same validation as --env, and the error names where it came from."""
+    managed_store(ARTIFACTS_DIR_ENV, "relative/tmp/orch")
+    with pytest.raises(ValueError, match="artifacts_dir_not_absolute") as excinfo:
+        canonical_session_env(str(tmp_path), {})
+    assert "env store" in str(excinfo.value)
+
+
+def test_only_the_artifacts_key_is_taken_from_the_store(tmp_path: Path, managed_store) -> None:
+    """The store must not become a process-environment injector for unrelated keys.
+
+    Operators already keep values like `API_TOKEN` there for `${VAR}` substitution. If the
+    whole store were splatted into the session floor, every one of them would silently reach
+    every worker process.
+    """
+    managed_store("API_TOKEN", "secret")
+    managed_store("BASE_URL", "http://localhost:27124")
+    managed_store(ARTIFACTS_DIR_ENV, str(tmp_path / "root"))
+    env = canonical_session_env(str(tmp_path), {})
+    assert "API_TOKEN" not in env
+    assert "BASE_URL" not in env
+    assert _root(env) == (tmp_path / "root").resolve()
+
+
+def test_store_does_not_reintroduce_directory_sniffing(tmp_path: Path, managed_store) -> None:
+    """AC-LITE-4's mutation arm must survive the D1 fix.
+
+    The fix adds a second source for an EXPLICIT value; it must not add a second way for a
+    directory's mere presence to matter.
+    """
+    del managed_store
+    (tmp_path / "orchestrator").mkdir()
+    env = canonical_session_env(str(tmp_path), {})
+    assert _root(env) == tmp_path.resolve() / "tmp" / "orch"
+    assert _root(env) != tmp_path.resolve() / "orchestrator" / "tmp" / "orch"
