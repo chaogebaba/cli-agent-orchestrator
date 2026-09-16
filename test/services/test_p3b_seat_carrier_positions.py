@@ -672,6 +672,72 @@ def test_the_write_through_row_satisfies_the_public_message_shape(flip_env) -> N
     assert message.status is MessageStatus.PENDING
 
 
+# ---------------------------------------------------------------------------
+# F1003 (#851) — the SERVICE entry point, not just the choke point.
+#
+# The shape arm above calls ``_insert_routed_inbox_row`` directly and stops at
+# the returned row, so it never reached what the callers do with that row NEXT.
+# Two of the three refresh it through the session; the third — the mailbox send,
+# which is every worker callback to the seat — called ``Session.refresh`` on an
+# instance the write-through never added, and SQLAlchemy raises
+# ``InvalidRequestError: not persistent within this Session``. On a fresh CAO
+# home, where the queue is armed by construction (``bootstrap._start_delivery``
+# reads no environment), that is an unconditional 500 on the first send: box
+# evidence 2026-09-16, ``POST /terminals/mb_.../inbox/messages`` twice.
+#
+# These arms enter where the API does.
+# ---------------------------------------------------------------------------
+
+
+def test_a_mailbox_send_through_the_service_survives_the_write_through(flip_env) -> None:
+    """F1003: ``create_logical_inbox_message`` returns the message, not a 500."""
+    sessions, store, install = flip_env
+    with sessions.begin() as db:
+        _seat(db)
+    install()
+
+    message = mailbox_service.create_logical_inbox_message(
+        sender_id=WORKER_TERMINAL,
+        mailbox_id="mb_p3b_sup",
+        message="F1003_SERVICE_PROBE",
+    )
+
+    assert message.id > 0
+    assert message.message == "F1003_SERVICE_PROBE"
+    assert message.status is MessageStatus.PENDING
+    assert message.created_at is not None
+    # §6: the row went to the QUEUE, and the legacy inbox stayed read-only.
+    assert _legacy_row_count(sessions) == 0
+    queued = [m for m in store.all_rows() if m.payload == "F1003_SERVICE_PROBE"]
+    assert len(queued) == 1, "the send must leave exactly one queue row"
+    assert queued[0].receiver_id == "mb_p3b_sup"
+
+
+def test_an_authority_notice_at_the_flip_reports_the_commit_it_made(flip_env) -> None:
+    """F1003, same family: an enqueued notice is never reported as failed.
+
+    ``insert_identity_authority_notice`` refreshed the same never-added row and
+    turned the exception into ``FAILED_AFTER_COMMIT`` — a message that IS in the
+    queue, reported to its caller as a post-commit failure.
+    """
+    from cli_agent_orchestrator.clients.database import (
+        NoticeInsertOutcome,
+        insert_identity_authority_notice,
+    )
+
+    sessions, store, install = flip_env
+    with sessions.begin() as db:
+        _seat(db)
+    install()
+
+    outcome = insert_identity_authority_notice(
+        f"message-trace:{SEAT_TERMINAL}", SEAT_TERMINAL, "F1003_NOTICE_PROBE"
+    )
+
+    assert outcome is NoticeInsertOutcome.INSERTED
+    assert _legacy_row_count(sessions) == 0
+
+
 # WP-ARCH 3c K6: ``test_k6_the_interim_reconcile_is_muted_when_the_queue_owns_delivery``
 # pinned the mute on ``services/seat_wake_reconcile``. The module is DELETED —
 # a mute is a flag in front of a second emitter, and 3c removes the emitter — so
