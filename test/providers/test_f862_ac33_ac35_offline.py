@@ -579,3 +579,116 @@ def test_d11_the_oracle_distinguishes_a_release_from_a_local_fulfil() -> None:
     released_disposition, fulfilled_disposition = asyncio.run(_run())
     assert released_disposition is RouteDisposition.RELEASED_TO_ORIGIN
     assert fulfilled_disposition is RouteDisposition.FULFILLED
+
+
+# =====================================================================
+# D6 — the composed path's ledger sequence is legal end to end
+# =====================================================================
+
+
+def test_d6_the_composed_ledger_sequence_is_legal_and_accepts(tmp_path: Path) -> None:
+    """Replay exactly the transitions ``_drive_composed_turn`` performs.
+
+    The state machine refuses illegal orderings by raising, so a sequence that
+    completes and then passes ``acceptance_failure`` is the proof that the
+    composed path's ordering is admissible — including the two that are easy to
+    get wrong: the relay window must close BEFORE the mint is reserved, and the
+    submit-dispatch count must end equal to the observed-send count.
+    """
+    import time
+
+    from cli_agent_orchestrator.chatgpt_web_runner.send_intent import AttemptState, SendIntentLog
+
+    log = SendIntentLog(tmp_path / "attempt")
+    log.create_locked_attempt(
+        run_id="r",
+        attempt_id="a",
+        prompt_sha="0" * 64,
+        deadline_at=time.time() + 600,
+        profile_epoch="epoch",
+        mint_id="m",
+        mint_ordinal=1,
+        relay_token_hash="f" * 64,
+        relay_token_expires_at=time.time() + 600,
+    )
+    log.transition(AttemptState.OWNED_BROWSER_READY)
+    log.transition(AttemptState.CONNECTOR_READY)
+    log.transition(AttemptState.INPUT_READY)
+    log.transition(AttemptState.INTERCEPT_ARMED)
+    log.record_send_intent(conversation_id=None, current_node=None, attempt_nonce="nonce")
+    # The binding window closes here — before anything network-capable.
+    log.record_relay_skipped(skipped_at=time.time())
+    log.transition(AttemptState.COMPOSER_MINT_TRIGGERED)
+    log.record_submit_dispatch()
+    log.record_request_held(
+        body_sha256="a" * 64,
+        header_names=("content-type",),
+        page_generation=1,
+        context_generation=1,
+        cdp_session_generation=1,
+    )
+    log.record_send_observed()
+    log.reserve_mint()
+    assert log.record.attempt_state == AttemptState.MINT_RESERVED.value
+    assert log.record.reserved_at is not None
+    log.record_python_post_invoked()
+    assert log.record.attempt_state == AttemptState.PYTHON_POST_INVOKED.value
+    log.transition(AttemptState.RAW_SSE_RELAY, relay_status="complete")
+    log.transition(AttemptState.GET_VERIFY)
+    log.transition(AttemptState.BROWSER_FULFIL)
+
+    assert log.acceptance_failure() is None
+    counters = log.counters()
+    assert counters["submits_dispatched"] == 1
+    assert counters["sends_observed"] == 1
+    # The recovery path is deleted, so this can only ever be zero.
+    assert counters["recoveries_used"] == 0
+
+
+def test_d6_the_relay_window_cannot_reopen_after_the_mint(tmp_path: Path) -> None:
+    """A reserved mint closes the binding window for good."""
+    import time
+
+    import pytest as _pytest
+
+    from cli_agent_orchestrator.chatgpt_web_runner.send_intent import (
+        AttemptState,
+        SendIntentLog,
+        SendIntentViolation,
+    )
+
+    log = SendIntentLog(tmp_path / "attempt")
+    log.create_locked_attempt(
+        run_id="r",
+        attempt_id="a",
+        prompt_sha="0" * 64,
+        deadline_at=time.time() + 600,
+        profile_epoch="epoch",
+        mint_id="m",
+        mint_ordinal=1,
+        relay_token_hash="f" * 64,
+        relay_token_expires_at=time.time() + 600,
+    )
+    for state in (
+        AttemptState.OWNED_BROWSER_READY,
+        AttemptState.CONNECTOR_READY,
+        AttemptState.INPUT_READY,
+        AttemptState.INTERCEPT_ARMED,
+    ):
+        log.transition(state)
+    log.record_send_intent(conversation_id=None, current_node=None, attempt_nonce="n")
+    log.record_relay_skipped(skipped_at=time.time())
+    log.transition(AttemptState.COMPOSER_MINT_TRIGGERED)
+    log.record_submit_dispatch()
+    log.record_request_held(
+        body_sha256="a" * 64,
+        header_names=(),
+        page_generation=1,
+        context_generation=1,
+        cdp_session_generation=1,
+    )
+    log.record_send_observed()
+    log.reserve_mint()
+
+    with _pytest.raises(SendIntentViolation):
+        log.record_relay_bound(subscriber_id="late", bound_at=time.time())
