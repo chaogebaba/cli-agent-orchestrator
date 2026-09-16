@@ -24,9 +24,12 @@ from cli_agent_orchestrator.cli.orchestrator_main import cli as orchestrator_cli
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# The three commands A.4 moves. `fold` itself stays on base — only corpus discovery left,
+# The closed skill-only command set: the three commands A.4 MOVED off base, plus the
+# F788 #645 certification verbs, which are born here and must never appear on base —
+# a `cao certify` would put a writer of orchestration judgment on the infra CLI that a
+# lightweight project runs. `fold` itself stays on base — only corpus discovery left,
 # so `cao fold FILE` is untouched and is asserted separately below.
-MOVED = ("ledger", "fold-corpus", "sync-routing")
+MOVED = ("ledger", "fold-corpus", "sync-routing", "certify", "cert-status")
 
 POINTER = "cao-orchestrator"
 
@@ -121,7 +124,7 @@ def test_base_fold_file_is_unchanged(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
 
 
-def test_orchestrator_cli_exposes_exactly_the_three_moved_commands() -> None:
+def test_orchestrator_cli_exposes_exactly_the_skill_command_set() -> None:
     assert _visible_commands(orchestrator_cli) == set(MOVED)
 
 
@@ -182,7 +185,7 @@ def test_mutant_reregistering_ledger_on_base_turns_red() -> None:
 
 
 def test_mutant_orchestrator_cli_growing_a_fourth_command_turns_red() -> None:
-    """The reverse drift: the skill CLI is a closed set of three, not a dumping ground."""
+    """The reverse drift: the skill CLI is a closed set, not a dumping ground."""
     mutant = click.Group("cao-orchestrator", commands=dict(orchestrator_cli.commands))
     mutant.add_command(click.Command("extra", callback=lambda: None))
     assert _visible_commands(mutant) != set(MOVED)

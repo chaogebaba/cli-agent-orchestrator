@@ -34,7 +34,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import frontmatter
 
@@ -241,7 +241,6 @@ def lint_positions(
     return results
 
 
-
 # --------------------------------------------------------------------------
 # F837 #694 — stale certification-row lint (WARN level)
 # --------------------------------------------------------------------------
@@ -263,6 +262,22 @@ def lint_positions(
 
 E_CERT_STALE = "E-CERT-STALE"
 
+#: F788 #645 — the herdr axis has a SECOND way to go stale that the sha pair does
+#: not express: the row pins ``herdr_sha256`` to the binary the smoke exercised, and
+#: an upgraded binary makes the row a claim about a runtime that is no longer here.
+#: Reported separately from ``E-CERT-STALE`` because the remedy differs (re-run the
+#: backend smoke, not just re-hash the fragments), and only for rows whose sha pair
+#: is otherwise current — a stale row is already reported once.
+E_CERT_BINARY_DRIFT = "E-CERT-BINARY-DRIFT"
+
+#: Axis -> frontmatter block, the two axes of D9.
+CERT_AXIS_BLOCKS = {"provider": "certification", "herdr": "herdr_certification"}
+
+#: Sentinel: resolve the installed herdr binary lazily (and only if a herdr row
+#: exists). ``None`` passed explicitly means "no binary here", which is a fact the
+#: lint reports rather than resolves.
+_RESOLVE_BINARY = object()
+
 
 @dataclass(frozen=True)
 class CertFinding:
@@ -276,10 +291,21 @@ class CertFinding:
     row_overlay_sha: str
     current_position_sha: str
     current_overlay_sha: str
+    axis: str = "provider"
+    row_herdr_sha256: str = ""
+    installed_herdr_sha256: str = ""
 
     def message(self) -> str:
+        cell = f"cell ({self.position}, {self.provider})"
+        axis = "" if self.axis == "provider" else f" [{self.axis} axis]"
+        if self.code == E_CERT_BINARY_DRIFT:
+            return (
+                f"{self.code}: {cell}{axis} row (outcome={self.outcome}) pins "
+                f"herdr_sha256={self.row_herdr_sha256} but the installed binary is "
+                f"{self.installed_herdr_sha256}; re-run the backend smoke and re-certify"
+            )
         return (
-            f"{self.code}: cell ({self.position}, {self.provider}) row "
+            f"{self.code}: {cell}{axis} row "
             f"(outcome={self.outcome}) is stale — recorded "
             f"position_sha={self.row_position_sha} overlay_sha={self.row_overlay_sha} "
             f"but current position_sha={self.current_position_sha} "
@@ -287,9 +313,7 @@ class CertFinding:
         )
 
 
-def _current_sha_pair(
-    position: str, provider: str, positions_dir: Path
-) -> "tuple[str, str]":
+def _current_sha_pair(position: str, provider: str, positions_dir: Path) -> "tuple[str, str]":
     """Compute the CURRENT (position_sha, overlay_sha) for a cell from the store.
 
     Mirrors ``routing.cell_certified``'s pair computation exactly so the lint and
@@ -314,54 +338,101 @@ def _current_sha_pair(
     return pos_sha, overlay_sha(frags)
 
 
-def lint_certifications(positions_dir: Path) -> List[CertFinding]:
-    """WARN-level sweep for stale ``certification:`` rows across every position.
+def lint_certifications(
+    positions_dir: Path,
+    *,
+    axis: str = "all",
+    installed_herdr_sha256: Any = _RESOLVE_BINARY,
+) -> List[CertFinding]:
+    """WARN-level sweep for stale certification rows across every position.
 
     Returns a list of ``CertFinding`` (possibly empty). Never raises on a stale
     row — staleness is a warning, not a hard failure, so ``install.sh`` can print
-    it without failing the deploy. A ``certification:`` row whose recorded
+    it without failing the deploy. A row whose recorded
     (position_sha, overlay_sha) no longer equals the CURRENT pair for that row's
     provider is flagged ``E-CERT-STALE``. A cell with no row is not flagged
     (UNCERTIFIED is the resolver's assign-time verdict, not a stale row).
+
+    ``axis`` selects which block(s) are swept: ``provider`` (``certification:``),
+    ``herdr`` (``herdr_certification:``) or ``all`` (both, the default — F788 #645:
+    a sweep that covers one axis silently certifies nothing about the other, and
+    the herdr axis is the one whose rows a binary upgrade invalidates). On the
+    herdr axis a sha-current PASS row whose ``herdr_sha256`` differs from the
+    installed binary is additionally flagged ``E-CERT-BINARY-DRIFT``; an
+    unresolvable binary yields no finding, because "we cannot see it" is not
+    "it changed".
     """
+    if axis not in ("provider", "herdr", "all"):
+        raise ValueError(f"{axis}: axis is provider|herdr|all")
+    axes = ("provider", "herdr") if axis == "all" else (axis,)
+    live_sha = installed_herdr_sha256
     findings: List[CertFinding] = []
     for pos_path in sorted(positions_dir.glob("*.md")):
         position = pos_path.stem
         parsed = frontmatter.loads(pos_path.read_text(encoding="utf-8"))
-        rows = parsed.metadata.get("certification") or []
-        if not isinstance(rows, list):
-            continue
         # Cache the current pair per provider (position_sha is provider-independent
         # but overlay_sha is not; compute once per provider we actually see).
         current_by_provider: Dict[str, "tuple[str, str]"] = {}
-        for row in rows:
-            if not isinstance(row, dict):
+        for row_axis in axes:
+            rows = parsed.metadata.get(CERT_AXIS_BLOCKS[row_axis]) or []
+            if not isinstance(rows, list):
                 continue
-            provider = row.get("provider")
-            if not isinstance(provider, str) or not provider:
-                continue
-            if provider not in current_by_provider:
-                current_by_provider[provider] = _current_sha_pair(
-                    position, provider, positions_dir
-                )
-            cur_pos_sha, cur_ov_sha = current_by_provider[provider]
-            row_pos_sha = str(row.get("position_sha", ""))
-            row_ov_sha = str(row.get("overlay_sha", ""))
-            if row_pos_sha != cur_pos_sha or row_ov_sha != cur_ov_sha:
-                findings.append(
-                    CertFinding(
-                        code=E_CERT_STALE,
-                        position=position,
-                        provider=provider,
-                        outcome=str(row.get("outcome", "UNCERTIFIED")),
-                        row_position_sha=row_pos_sha,
-                        row_overlay_sha=row_ov_sha,
-                        current_position_sha=cur_pos_sha,
-                        current_overlay_sha=cur_ov_sha,
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                provider = row.get("provider")
+                if not isinstance(provider, str) or not provider:
+                    continue
+                if provider not in current_by_provider:
+                    current_by_provider[provider] = _current_sha_pair(
+                        position, provider, positions_dir
                     )
-                )
-    return findings
+                cur_pos_sha, cur_ov_sha = current_by_provider[provider]
+                row_pos_sha = str(row.get("position_sha", ""))
+                row_ov_sha = str(row.get("overlay_sha", ""))
+                outcome = str(row.get("outcome", "UNCERTIFIED"))
+                if row_pos_sha != cur_pos_sha or row_ov_sha != cur_ov_sha:
+                    findings.append(
+                        CertFinding(
+                            code=E_CERT_STALE,
+                            position=position,
+                            provider=provider,
+                            outcome=outcome,
+                            row_position_sha=row_pos_sha,
+                            row_overlay_sha=row_ov_sha,
+                            current_position_sha=cur_pos_sha,
+                            current_overlay_sha=cur_ov_sha,
+                            axis=row_axis,
+                            row_herdr_sha256=str(row.get("herdr_sha256", "")),
+                        )
+                    )
+                    continue
+                if row_axis != "herdr" or outcome != "PASS":
+                    continue
+                if live_sha is _RESOLVE_BINARY:
+                    from cli_agent_orchestrator.utils.routing import installed_herdr_sha256 as _live
 
+                    live_sha = _live()
+                if not live_sha:
+                    continue
+                row_bin = str(row.get("herdr_sha256", ""))
+                if row_bin != live_sha:
+                    findings.append(
+                        CertFinding(
+                            code=E_CERT_BINARY_DRIFT,
+                            position=position,
+                            provider=provider,
+                            outcome=outcome,
+                            row_position_sha=row_pos_sha,
+                            row_overlay_sha=row_ov_sha,
+                            current_position_sha=cur_pos_sha,
+                            current_overlay_sha=cur_ov_sha,
+                            axis=row_axis,
+                            row_herdr_sha256=row_bin,
+                            installed_herdr_sha256=str(live_sha),
+                        )
+                    )
+    return findings
 
 
 #
@@ -467,9 +538,7 @@ def lint_budgets(
                 f"id-shaped position name (fail-closed: unknown budget key)"
             )
         if key not in table.required:
-            logger.warning(
-                "forward-declared budget key %s (no position file)", key
-            )
+            logger.warning("forward-declared budget key %s (no position file)", key)
 
     overlay_budget = budget.get("overlay")
     composed_slack = budget.get("composed_slack")
@@ -487,8 +556,7 @@ def lint_budgets(
         n = _body_bytes(body)
         if n > pos_budget:
             raise ClauseLintError(
-                f"position '{pos}' body is {n} B, over its budget of {pos_budget} B "
-                f"({path})"
+                f"position '{pos}' body is {n} B, over its budget of {pos_budget} B " f"({path})"
             )
         results[pos] = n
 

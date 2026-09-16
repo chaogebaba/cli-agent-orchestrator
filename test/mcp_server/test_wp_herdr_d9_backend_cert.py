@@ -46,33 +46,44 @@ def _herdr_certify(
     position_sha_override: str | None = None,
     reduced_assurance: str | None = None,
 ) -> None:
-    """Append a ``herdr_certification`` row at the CURRENT sha pair.
+    """Record a ``herdr_certification`` row through the PRODUCTION writer (F788 #645).
 
     ``reduced_assurance`` defaults to ABSENT, which is what a row written before
     amendment (7)'s field existed looks like — the shape the reader has to
     tolerate.
+
+    ``position_sha_override`` is the one thing the writer will not do, by design:
+    it only ever records the CURRENT pair. The fixture writes a real row and then
+    rewrites that single field, which is exactly the drift a fragment edit causes
+    in the field and what ``cao-orchestrator cert-status`` exists to catch.
     """
     import frontmatter
 
-    p_sha, o_sha = _shas(positions, position, provider)
+    from cli_agent_orchestrator.cli.orchestrator_commands.certify import (
+        read_evidence,
+        write_certification_row,
+    )
+    from .test_f497_routing_d9 import _fixture_evidence
+
+    write_certification_row(
+        positions,
+        position,
+        provider,
+        axis="herdr",
+        outcome=outcome,
+        evidence=read_evidence(_fixture_evidence(positions, position, provider)),
+        date="2026-09-11",
+        herdr_sha256=binary_sha,
+        herdr_version="0.9.0",
+        protocol=22,
+        reduced_assurance=reduced_assurance,
+    )
+    if position_sha_override is None:
+        return
     path = positions / f"{position}.md"
     parsed = frontmatter.loads(path.read_text(encoding="utf-8"))
     rows = list(parsed.metadata.get("herdr_certification") or [])
-    rows.append(
-        {
-            "provider": provider,
-            "herdr_version": "0.9.0",
-            "herdr_sha256": binary_sha,
-            "protocol": 22,
-            "position_sha": position_sha_override or p_sha,
-            "overlay_sha": o_sha,
-            "outcome": outcome,
-            "date": "2026-09-11",
-            "evidence": "/data/cao-scratch/briefs/h1-live.md",
-        }
-    )
-    if reduced_assurance is not None:
-        rows[-1]["reduced_assurance"] = reduced_assurance
+    rows[-1]["position_sha"] = position_sha_override
     parsed.metadata["herdr_certification"] = rows
     path.write_text(frontmatter.dumps(parsed) + "\n", encoding="utf-8")
 
