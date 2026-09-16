@@ -59,7 +59,7 @@ from cli_agent_orchestrator.core.timing import ACP_KILL_GRACE_S
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["ReceiverDeliveryTask", "TaskOutcome", "TaskStep"]
+__all__ = ["ReceiverDeliveryTask", "ReceiverTaskRegistry", "TaskOutcome", "TaskReport", "TaskStep"]
 
 
 class TaskStep(StrEnum):
@@ -412,3 +412,71 @@ from cli_agent_orchestrator.core.delivery import DeadReason as _DeadReason  # no
 
 _DEAD_REASON_WINDOW_LOST = _DeadReason.INTERRUPT_WINDOW_LOST
 _DEAD_REASON_UNCERTAIN = _DeadReason.INTERRUPT_UNCLAIMED
+
+
+class ReceiverTaskRegistry:
+    """One :class:`ReceiverDeliveryTask` per ACP receiver, and exactly one.
+
+    D6b(3): "Persisted phase plus the task registry prevents duplicates; restart
+    creates one replacement task." Both halves live here. The phase row is the
+    durable authority — a restarted process finds the truth in the row, not in
+    this object — and this is the in-process half that stops a scheduler tick
+    from starting a second task for a receiver whose first one is still running.
+
+    **Signalling is non-blocking by construction.** ``signal`` returns as soon as
+    the task is running or has been handed off; it never waits for the task's
+    wire work. That is what makes ``DeliveryTick.signal_acp_receivers`` a
+    scheduler rather than a serializer, and it is why the registry owns a
+    re-entrancy guard rather than a lock the scheduler could block on: a lock
+    would turn "already running" into "wait for it", which is the head-of-line
+    blocking the whole split exists to remove.
+
+    ``runner`` exists so a test can drive the task synchronously on the calling
+    thread and still exercise the real registry. Production passes the default,
+    which runs the task inline on the scheduler's thread ONLY up to its first
+    await — the executor that carries it past that is wired by the composition
+    root and is out of this module's scope.
+    """
+
+    def __init__(self, tasks: dict[str, ReceiverDeliveryTask] | None = None) -> None:
+        self._tasks: dict[str, ReceiverDeliveryTask] = dict(tasks or {})
+        self._running: set[str] = set()
+        self.reports: list[TaskReport] = []
+
+    def register(self, receiver_id: str, task: ReceiverDeliveryTask) -> None:
+        """Bind a receiver to its ONE task.  A second bind replaces, never adds."""
+        self._tasks[receiver_id] = task
+
+    def forget(self, receiver_id: str) -> None:
+        self._tasks.pop(receiver_id, None)
+        self._running.discard(receiver_id)
+
+    def receivers(self) -> tuple[str, ...]:
+        """The receivers to signal this tick, in a stable order.
+
+        Sorted so a tick's behaviour does not depend on dict insertion order,
+        which is the kind of hidden input that makes an isolation arm pass on one
+        machine and fail on another.
+        """
+        return tuple(sorted(self._tasks))
+
+    def signal(self, receiver_id: str) -> TaskReport | None:
+        """Run this receiver's task once, unless it is already running.
+
+        The re-entrancy guard is the duplicate-task rule in code: a receiver
+        whose task is mid-await is NOT started again, and the scheduler is told
+        so by a ``None`` rather than by being made to wait.
+        """
+        task = self._tasks.get(receiver_id)
+        if task is None or receiver_id in self._running:
+            return None
+        self._running.add(receiver_id)
+        try:
+            report = task.run_once()
+        finally:
+            self._running.discard(receiver_id)
+        self.reports.append(report)
+        return report
+
+    def is_running(self, receiver_id: str) -> bool:
+        return receiver_id in self._running
