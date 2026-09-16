@@ -83,7 +83,7 @@ from cli_agent_orchestrator.core.status_cutover import (
     parse_status_switch,
     resolve_status_switch,
 )
-from cli_agent_orchestrator.core.switches import Rejected
+from cli_agent_orchestrator.core.switches import Rejected, boot_switch_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +97,7 @@ __all__ = [
     "build_readonly_diag_stores",
     "build_readonly_gate_store",
     "current_runtime",
+    "herdr_delivery_enabled",
     "ingest_enabled",
     "shutdown_worker_truth",
     "start_worker_truth",
@@ -112,6 +113,20 @@ INGEST_ENV_VAR = "CAO_WORKER_TRUTH_INGEST"
 STATUS_ENV_VAR = "CAO_WORKER_TRUTH_STATUS"
 STATUS_PROVIDERS_ENV_VAR = "CAO_WORKER_TRUTH_STATUS_PROVIDERS"
 
+#: WP-HERDR Seam B's own switch (H2, blueprint §4 and §8's H2 row).  A FOURTH
+#: variable for the reason the third one exists: one master flag would couple a
+#: Seam B rollback to a phase-2 rollback, and each phase must be backable out on
+#: its own.
+#:
+#: It is deliberately NOT ``CAO_HERDR_RUNTIME``.  That one arms Seam A — whom to
+#: BELIEVE about a terminal's lifecycle — and this one arms Seam B — how to
+#: SUBMIT a prompt to it.  A deployment that wants herdr's lifecycle truth while
+#: keeping the composer paste is a coherent position and was H1's whole shipping
+#: story; folding the two into one variable would delete it.  Seam B does still
+#: require the certified-cohort half of ``herdr_lifecycle_authoritative``, which
+#: is a per-terminal fact rather than a switch position.
+HERDR_DELIVERY_ENV_VAR = "CAO_HERDR_DELIVERY"
+
 
 def ingest_enabled(env: dict[str, str] | None = None) -> bool:
     """True when ``CAO_WORKER_TRUTH_INGEST=1`` is set in the process environment.
@@ -122,6 +137,24 @@ def ingest_enabled(env: dict[str, str] | None = None) -> bool:
     """
     source = os.environ if env is None else env
     return source.get(INGEST_ENV_VAR) == "1"
+
+
+def herdr_delivery_enabled(env: dict[str, str] | None = None) -> bool:
+    """Is WP-HERDR Seam B armed for this process?
+
+    Default OFF, strictly ``"1"``, through the shared
+    :func:`~core.switches.boot_switch_enabled` idiom.  OFF is not a degraded
+    mode: with this unset, ``_build_delivery_tick`` wires the bare
+    ``PaneWorkerInjector`` it wired before H2 and the herdr injector is never
+    constructed, so the delivery path is byte-identical to ``ad4339e9``.
+
+    Read per call rather than cached at import, matching
+    :func:`~utils.herdr_runtime_gate.herdr_runtime_enabled`: the composition root
+    reads it once at boot, and a test that sets the variable must not have to
+    reload a module.
+    """
+    source = os.environ if env is None else env
+    return boot_switch_enabled(HERDR_DELIVERY_ENV_VAR, source)
 
 
 def status_position(env: dict[str, str] | None = None) -> StatusPosition | Rejected:
