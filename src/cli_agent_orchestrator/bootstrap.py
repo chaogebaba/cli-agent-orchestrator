@@ -70,12 +70,14 @@ from cli_agent_orchestrator.app.worker_truth.projector import Projector, StaticS
 from cli_agent_orchestrator.app.worker_truth.publisher import StatusPublisher
 from cli_agent_orchestrator.app.worker_truth.sweep import ProjectorSweep
 from cli_agent_orchestrator.core.delivery import InjectionResult
+from cli_agent_orchestrator.core.delivery import WakeEmission
 from cli_agent_orchestrator.core.ports import (
     Clock,
     EventStore,
     FindingStore,
     PaneInjector,
     QueueStore,
+    SeatCarrier,
     StateStore,
 )
 from cli_agent_orchestrator.core.status_cutover import (
@@ -85,7 +87,11 @@ from cli_agent_orchestrator.core.status_cutover import (
     parse_status_switch,
     resolve_status_switch,
 )
-from cli_agent_orchestrator.core.switches import Rejected, boot_switch_enabled
+from cli_agent_orchestrator.core.switches import (
+    Rejected,
+    boot_switch_enabled,
+    boot_switch_selected,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +135,16 @@ STATUS_PROVIDERS_ENV_VAR = "CAO_WORKER_TRUTH_STATUS_PROVIDERS"
 #: is a per-terminal fact rather than a switch position.
 HERDR_DELIVERY_ENV_VAR = "CAO_HERDR_DELIVERY"
 
+#: WP-ACP-PLANE D16.  Two NAMED positions, ``native`` by default, and the words
+#: are the decision's own: a switch spelled ``1`` would be unreadable from a
+#: process listing, which is the property the boot-switch idiom protects.
+SEAT_TRANSPORT_ENV_VAR = "CAO_SEAT_TRANSPORT"
+
+#: The armed position.  Anything else — including ``native`` and an unset
+#: variable — is the default, so there is exactly one spelling of "off" a reader
+#: has to recognise.
+SEAT_TRANSPORT_ACP = "acp"
+
 
 def ingest_enabled(env: dict[str, str] | None = None) -> bool:
     """True when ``CAO_WORKER_TRUTH_INGEST=1`` is set in the process environment.
@@ -157,6 +173,24 @@ def herdr_delivery_enabled(env: dict[str, str] | None = None) -> bool:
     """
     source = os.environ if env is None else env
     return boot_switch_enabled(HERDR_DELIVERY_ENV_VAR, source)
+
+
+def seat_transport_acp(env: dict[str, str] | None = None) -> bool:
+    """Is the ACP message plane armed for the SEAT in this process (D16)?
+
+    Default NATIVE, strictly ``"acp"``, through the shared
+    :func:`~core.switches.boot_switch_selected` idiom.  Native is not a degraded
+    mode: with this unset, ``_build_delivery_tick`` wires the bare
+    ``NativeSeatCarrier`` it wired before S1 and no ACP object is constructed, so
+    the delivery path is byte-identical to the pre-S1 tree — which is AC-S1.1
+    stated as an object graph rather than as a behaviour nobody can check.
+
+    Read per call rather than cached at import, matching
+    :func:`herdr_delivery_enabled`: the composition root reads it once at boot,
+    and a test that states a position must not have to reload a module.
+    """
+    source = os.environ if env is None else env
+    return boot_switch_selected(SEAT_TRANSPORT_ENV_VAR, SEAT_TRANSPORT_ACP, source)
 
 
 def status_position(env: dict[str, str] | None = None) -> StatusPosition | Rejected:
@@ -785,6 +819,119 @@ def _build_injector(
     return _CertifiedInjectorDispatch(pane, herdr_factory, predicate or _seam_b_selected)
 
 
+class _TransportSeatCarrierDispatch:
+    """One :class:`~core.ports.SeatCarrier` that picks a transport per terminal.
+
+    The seat's exact analogue of H2's ``_CertifiedInjectorDispatch``, and a
+    deliberate copy of its shape rather than a shared base: the two ports are
+    separate on purpose (D7's K8 kill is a property of the call graph), and a
+    common parent would be the one object that could reach both.
+
+    ``WakeService`` holds ONE carrier for ALL seats (``wake.py`` ``wake_seat``),
+    so "per terminal" is not expressible by handing it a different object. This
+    resolves it where H2 resolved the injector: a dispatching implementation of
+    the SAME port, built in the composition root, that answers the transport
+    question inside ``emit()`` and delegates.
+
+    **The question is ``transport``, never a NULL coordinate** (D20/AC-S1.10). An
+    ACP row's tmux columns are NULL by design, and a carrier that read their
+    absence as a signal could not tell a seat that never had a pane from one
+    whose pane died.
+
+    **The ACP transport is built LAZILY and only once**, on the first ACP
+    terminal. With the switch native — the default — ``factory`` is never called
+    and no ACP object exists in the process, so the seat path is what it was
+    before S1 down to the object graph.
+    """
+
+    def __init__(
+        self,
+        native: SeatCarrier,
+        factory: Callable[[], SeatCarrier],
+        predicate: Callable[[str], bool],
+    ) -> None:
+        self._native = native
+        self._factory = factory
+        self._predicate = predicate
+        self._acp: SeatCarrier | None = None
+
+    def emit(
+        self,
+        *,
+        terminal_id: str,
+        line: str,
+        sender_key: str,
+        sender_name: str,
+        msg_id: str,
+    ) -> WakeEmission:
+        if not self._predicate(terminal_id):
+            return self._native.emit(
+                terminal_id=terminal_id,
+                line=line,
+                sender_key=sender_key,
+                sender_name=sender_name,
+                msg_id=msg_id,
+            )
+        if self._acp is None:
+            self._acp = self._factory()
+        return self._acp.emit(
+            terminal_id=terminal_id,
+            line=line,
+            sender_key=sender_key,
+            sender_name=sender_name,
+            msg_id=msg_id,
+        )
+
+
+def _acp_seat_selected(terminal_id: str) -> bool:
+    """Is THIS seat on the ACP plane?
+
+    The switch is NOT re-read here, for the reason H2's ``_seam_b_selected``
+    gives and learned the hard way: asking the environment on every emit is an
+    ``os.environ`` lookup per wake whose answer can disagree with the object
+    graph that exists because the switch was on. The switch is STRUCTURAL —
+    ``_build_seat_carrier`` reads it once at boot and returns the bare native
+    carrier when it is off — so this function is only ever reached from inside a
+    dispatch that exists because the switch was armed.
+
+    What is left is the per-terminal half, and it is one column: D20's
+    ``transport``. Never a NULL check on the coordinates (AC-S1.10), and never a
+    detection of what kind of agent occupies a pane — D22 moved identity to a
+    token CAO issued, and this is the transport question, not the identity one.
+
+    Fails toward NATIVE on any read it cannot complete. A terminal whose row
+    cannot be read is not an ACP seat: sending an ACP wake to a pane terminal
+    would deliver nothing, while the reverse merely takes the path that already
+    reports its own typed refusals.
+    """
+    try:
+        from cli_agent_orchestrator.core.transport import is_acp_terminal
+        from cli_agent_orchestrator.services.terminal_service import get_terminal_metadata
+
+        return is_acp_terminal(get_terminal_metadata(terminal_id) or {})
+    except Exception:  # noqa: BLE001 — a transport probe may not fail a wake
+        logger.debug("transport probe failed for %s; taking the native seat path", terminal_id)
+        return False
+
+
+def _build_seat_carrier(
+    native: SeatCarrier,
+    acp_factory: Callable[[], SeatCarrier],
+    *,
+    predicate: Callable[[str], bool] | None = None,
+) -> SeatCarrier:
+    """The carrier the tick gets: the native wake, or the dispatch.
+
+    With ``CAO_SEAT_TRANSPORT`` unset this returns the SAME object
+    ``_build_delivery_tick`` passed before S1 — not a wrapper around it. That is
+    AC-S1.1's rollback property stated as code: native is not "the dispatch
+    chooses native every time", it is that no dispatch exists.
+    """
+    if not seat_transport_acp():
+        return native
+    return _TransportSeatCarrierDispatch(native, acp_factory, predicate or _acp_seat_selected)
+
+
 def _build_delivery_tick(
     store: QueueStore,
     clock: Clock,
@@ -808,6 +955,7 @@ def _build_delivery_tick(
     """
     try:
         from cli_agent_orchestrator.services.queue_carrier import (
+            AcpTransport,
             HerdrPromptInjector,
             LegacyInboxAdoption,
             LegacyReceiverDirectory,
@@ -819,7 +967,10 @@ def _build_delivery_tick(
         wake = WakeService(
             store=store,
             directory=directory,
-            carrier=NativeSeatCarrier(),
+            # WP-ACP-PLANE D16/B1: purely ADDITIVE. With the switch unset this is
+            # the same ``NativeSeatCarrier()`` expression it was before S1, and
+            # ``_build_seat_carrier`` returns that object rather than a wrapper.
+            carrier=_build_seat_carrier(NativeSeatCarrier(), AcpTransport),
             injector=_build_injector(PaneWorkerInjector(), HerdrPromptInjector),
             clock=clock,
         )

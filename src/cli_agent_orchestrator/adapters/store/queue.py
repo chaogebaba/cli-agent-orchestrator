@@ -640,6 +640,37 @@ class SqliteQueueStore:
                 )
             return True
 
+    def release_busy(self, receiver_id: str, *, now: datetime) -> int:
+        """Return this receiver's ACP-busy rows to ``ready``, available now.
+
+        The statement is narrow on purpose. It matches only rows that are
+        ``leased`` AND whose most recent attempt row records ``ACP_BUSY_RETRY``,
+        so a delivery genuinely in flight keeps its lease and its fencing token.
+
+        ``attempts`` is NOT touched and ``dead_by`` is NOT named — the module's
+        standing rule, and here it is load-bearing twice over: the row's life
+        must not be extended by being nudged, and a nudge must not cost the
+        budget a busy agent was never meant to spend.
+
+        ``available_at`` is set to ``now`` rather than ``now + backoff``. The
+        backoff exists to space out RETRIES of something that failed; this is not
+        a retry, it is the first opportunity since the receiver became idle, and
+        AC-S1.14 asks for delivery well inside the 65-second floor.
+        """
+        conn = self._pool.connection()
+        stamp = render_timestamp(now)
+        with immediate_transaction(conn):
+            cursor = conn.execute(
+                "UPDATE delivery_msg SET state = 'ready', available_at = ?, "
+                "lease_owner = NULL, lease_expires_at = NULL "
+                "WHERE receiver_id = ? AND state = 'leased' AND mode = 'live' "
+                "AND (SELECT outcome FROM delivery_attempt "
+                "     WHERE delivery_attempt.msg_id = delivery_msg.msg_id "
+                "     ORDER BY claim_id DESC, rowid DESC LIMIT 1) = ?",
+                (stamp, receiver_id, AttemptOutcome.ACP_BUSY_RETRY.value),
+            )
+            return int(cursor.rowcount)
+
     def mark_dialog_hold(self, msg_id: str, *, held_since: datetime | None) -> None:
         """Set or clear the dialog-hold clock (D12)."""
         self._pool.connection().execute(

@@ -559,6 +559,28 @@ class QueueStore(Protocol):
         """
         ...
 
+    def release_busy(self, receiver_id: str, *, now: datetime) -> int:
+        """D7.2/AC-S1.14 — re-offer this receiver's BUSY-parked rows, now.
+
+        The event-driven half of the pair. ``reclaim`` is the floor: it re-offers
+        on lease expiry, which for a row parked behind an open ACP turn means
+        waiting out ``DELIVERY_LEASE_S`` plus the tick, and D7.2 exists because
+        an agent that just published a ``stopReason`` is idle NOW.
+
+        Scoped to rows whose last attempt was ``ACP_BUSY_RETRY``, and to nothing
+        else. A nudge that re-offered every leased row for a receiver would cut
+        short the lease of a delivery that is genuinely in flight, which is the
+        double-send the fencing token exists to prevent.
+
+        Spends NO attempt, for the same reason ``reclaim`` does not spend one on
+        this outcome: a busy agent is the normal case.
+
+        Returns how many rows were re-offered, so the caller can report a nudge
+        that found nothing — which is the shape of a driver nudging a terminal
+        whose rows another path already served.
+        """
+        ...
+
     def mark_dialog_hold(self, msg_id: str, *, held_since: datetime | None) -> None:
         """Set or clear the ``held_since`` clock (D12)."""
         ...
