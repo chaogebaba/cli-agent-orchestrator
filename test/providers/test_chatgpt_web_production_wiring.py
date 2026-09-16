@@ -559,3 +559,28 @@ def test_a_real_subscriber_keeps_its_binding_through_the_turn(tmp_path, monkeypa
 
     assert relay.binding is binding
     assert relay.status == "bound"
+
+
+def test_a_second_conversation_post_is_refused_not_held(tmp_path, monkeypatch) -> None:
+    """One mint per turn: a second conversation POST is aborted, not captured.
+
+    Without this the dispatcher would park a second handler forever (and would
+    replace the captured route under the attempt that owns it).
+    """
+    import asyncio
+
+    monkeypatch.setenv("CAO_ARTIFACTS_DIR", str(tmp_path))
+    page, _ = _composed_turn_with_fakes(monkeypatch, tmp_path, attempt_id="second-post")
+    dispatcher = page.routed[0][1]
+
+    body = b'{"messages":[{"id":"u","author":{"role":"user"},"content":{"parts":["x"]}}]}'
+    first = _Route("https://chatgpt.com/backend-api/f/conversation", "POST", body)
+    second = _Route("https://chatgpt.com/backend-api/f/conversation", "POST", body)
+
+    asyncio.run(dispatcher(first))
+    asyncio.run(dispatcher(second))
+
+    # The first is HELD (neither continued nor aborted); the second is refused.
+    assert first.continued is False and first.aborted is False
+    assert second.aborted is True, "a second conversation POST must not be held"
+    assert second.continued is False, "and must never be released to the origin"

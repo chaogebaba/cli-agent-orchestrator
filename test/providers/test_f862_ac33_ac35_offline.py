@@ -494,9 +494,58 @@ def test_ac35_the_composed_path_has_no_transport_fallback() -> None:
     """One sender. No `except ... : try the other transport` anywhere."""
     text = Path(production.__file__).read_text(encoding="utf-8")
     assert text.count("send_once(") == 1, "more than one origin sender call site"
-    # The browser copy is fulfilled locally; it is never continued to the origin.
-    assert "route.continue_()" in text  # only for NON-conversation traffic
-    assert "await route.continue_()\n            return\n        # The conversation POST" in text
+
+    # Structural, not textual: every `continue_` call in the dispatcher must sit
+    # ABOVE the conversation-POST branch, i.e. on the non-conversation path. A
+    # snippet match here would break on any reformat while proving less.
+    import ast
+
+    tree = ast.parse(text)
+    dispatcher = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_dispatcher"
+    )
+    # The `if not is_conversation_post(...)` statement, and its body.
+    guard_if = next(
+        node
+        for node in ast.walk(dispatcher)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(inner, ast.Call)
+            and isinstance(inner.func, ast.Name)
+            and inner.func.id == "is_conversation_post"
+            for inner in ast.walk(node.test)
+        )
+    )
+
+    def _continues(scope) -> set:
+        return {
+            id(node)
+            for node in ast.walk(scope)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "continue_"
+        }
+
+    all_continues = _continues(dispatcher)
+    non_conversation = set()
+    for statement in guard_if.body:
+        non_conversation |= _continues(statement)
+    # The defensive `except` before the guard also continues; it cannot reach
+    # the conversation branch because it has no method/url to match on.
+    defensive = {
+        id(node)
+        for handler in ast.walk(dispatcher)
+        if isinstance(handler, ast.ExceptHandler) and handler.lineno < guard_if.lineno
+        for node in ast.walk(handler)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "continue_"
+    }
+    assert non_conversation, "non-conversation traffic must still load the page"
+    leaked = all_continues - non_conversation - defensive
+    assert not leaked, "a continue_ call is reachable from the conversation-POST branch"
 
 
 def test_ac35_send_once_is_the_only_origin_post_in_the_runner() -> None:

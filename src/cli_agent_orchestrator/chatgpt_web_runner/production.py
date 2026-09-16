@@ -423,6 +423,17 @@ async def _drive_composed_turn(
                 return
             await route.continue_()
             return
+        # A SECOND conversation POST is not this attempt's mint. One mint per
+        # turn is the whole invariant, and the composer side is already guarded
+        # by the durable record — but a page-initiated retry would otherwise
+        # park a second handler forever, or quietly replace the captured route.
+        # Aborting it is safe and conservative: that copy provably never reached
+        # the origin, and the attempt's own held route is untouched.
+        if custody.entered.is_set():
+            custody.refused = "a second conversation POST was refused; one mint per turn"
+            logger.warning("chatgpt_web refused a second conversation POST for %s", attempt_id)
+            await route.abort()
+            return
         # The conversation POST: capture, hold, and PARK so the owner task
         # outlives the custody window (capture_held_route's contract).
         try:
@@ -453,6 +464,10 @@ async def _drive_composed_turn(
 
     transport = Transport(page, intent_log=intent_log)
     await transport.type_prompt(task_text)
+    # The dispatcher was installed before navigation, i.e. EARLIER than D6's
+    # INTERCEPT_ARMED position requires. The row is written here, at the last
+    # moment before the mint, so it records "still armed with the prompt in the
+    # composer" rather than merely "was armed at some earlier point".
     intent_log.transition(AttemptState.INTERCEPT_ARMED)
 
     attempt_nonce = new_run_id()
