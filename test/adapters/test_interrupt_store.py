@@ -28,6 +28,7 @@ from cli_agent_orchestrator.adapters.store.interrupt import SqliteInterruptStore
 from cli_agent_orchestrator.adapters.store.migrator import migrate
 from cli_agent_orchestrator.app.acp.interrupt_limiter import InterruptLimiter
 from cli_agent_orchestrator.core.interrupt import (
+    WINDOW_LOST,
     ActiveTurnHandle,
     CallerPrincipal,
     CancelWindow,
@@ -39,7 +40,6 @@ from cli_agent_orchestrator.core.interrupt import (
     SessionState,
     SubmitEnvelope,
     Urgency,
-    WINDOW_LOST,
     urgency_rank,
 )
 from cli_agent_orchestrator.core.timing import (
@@ -68,9 +68,7 @@ def store(pool: ConnectionPool) -> SqliteInterruptStore:
 
 
 def mcp(subject: str = "caller-1") -> CallerPrincipal:
-    return CallerPrincipal(
-        origin=PrincipalOrigin.TERMINAL, subject=subject, lifecycle_generation=3
-    )
+    return CallerPrincipal(origin=PrincipalOrigin.TERMINAL, subject=subject, lifecycle_generation=3)
 
 
 def admission(
@@ -353,9 +351,7 @@ def test_force_waives_the_quota_bounds_but_never_the_reservation(
     forced = store.admit_interrupt(admission(callback_id="cb-2", now=inside_gap, force=True))
     assert forced.admitted, "force waives the per-terminal gap"
 
-    blocked = store.admit_interrupt(
-        admission(callback_id="cb-3", now=inside_gap, force=True)
-    )
+    blocked = store.admit_interrupt(admission(callback_id="cb-3", now=inside_gap, force=True))
     assert blocked.refused is InterruptRefusal.IN_PROGRESS, "force never waives the mutex"
 
 
@@ -471,9 +467,11 @@ def test_the_claim_leases_exactly_one_row_and_leaves_the_rest_ready(
 
     claimed = store.claim_next(TERMINAL, now=T0, lease_owner="tick")
     assert claimed is not None
-    rows = pool.connection().execute(
-        "SELECT msg_id, state, attempts FROM delivery_msg ORDER BY msg_id"
-    ).fetchall()
+    rows = (
+        pool.connection()
+        .execute("SELECT msg_id, state, attempts FROM delivery_msg ORDER BY msg_id")
+        .fetchall()
+    )
     leased = [r["msg_id"] for r in rows if r["state"] == "leased"]
     ready = [r["msg_id"] for r in rows if r["state"] == "ready"]
     assert len(leased) == 1
@@ -496,9 +494,11 @@ def test_a_receiver_mid_interrupt_is_served_no_row(
     _enqueue_normal(pool, "msg-N", available_at=T0 - timedelta(minutes=5))
     _set_phase(pool, phase)
     assert store.claim_next(TERMINAL, now=T0, lease_owner="tick") is None
-    row = pool.connection().execute(
-        "SELECT state FROM delivery_msg WHERE msg_id = 'msg-N'"
-    ).fetchone()
+    row = (
+        pool.connection()
+        .execute("SELECT state FROM delivery_msg WHERE msg_id = 'msg-N'")
+        .fetchone()
+    )
     assert row["state"] == "ready", "no session/prompt may be written mid-interrupt"
 
 
@@ -553,9 +553,11 @@ def test_begin_cancel_persists_exactly_the_two_computed_instants(
     assert state is not None
     assert state.phase is InterruptPhase.CANCELLING
     assert state.deadline == window.deadline, "the stored deadline IS the returned one"
-    row = pool.connection().execute(
-        "SELECT lease_expires_at FROM delivery_msg WHERE msg_id = ?", (fence.msg_id,)
-    ).fetchone()
+    row = (
+        pool.connection()
+        .execute("SELECT lease_expires_at FROM delivery_msg WHERE msg_id = ?", (fence.msg_id,))
+        .fetchone()
+    )
     assert row["lease_expires_at"] == render_timestamp(window.lease_until)
 
 

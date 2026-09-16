@@ -40,6 +40,8 @@ from cli_agent_orchestrator.adapters.store.connection import (
 from cli_agent_orchestrator.core.delivery import DeadReason, MsgState, compute_dead_by
 from cli_agent_orchestrator.core.ids import new_ulid
 from cli_agent_orchestrator.core.interrupt import (
+    MID_INTERRUPT_PHASES,
+    WINDOW_LOST,
     ActiveTurnHandle,
     AdmissionOutcome,
     CancelSettlement,
@@ -51,14 +53,12 @@ from cli_agent_orchestrator.core.interrupt import (
     InterruptRefusal,
     InterruptStateRow,
     LedgerWindow,
-    MID_INTERRUPT_PHASES,
     Quota,
     RecoveryWindow,
     SettleKind,
     SubmitEnvelope,
     SubmitReceipt,
     Urgency,
-    WINDOW_LOST,
     WindowLost,
     effective_deadline,
     urgency_rank,
@@ -102,7 +102,9 @@ def _row_to_state(row: sqlite3.Row) -> InterruptStateRow:
             if row["active_turn_generation"] is not None
             else None
         ),
-        active_turn_seq=(int(row["active_turn_seq"]) if row["active_turn_seq"] is not None else None),
+        active_turn_seq=(
+            int(row["active_turn_seq"]) if row["active_turn_seq"] is not None else None
+        ),
         deadline=parse_timestamp(row["deadline"]) if row["deadline"] else None,
         pending_deadline=(
             parse_timestamp(row["pending_deadline"]) if row["pending_deadline"] else None
@@ -188,9 +190,7 @@ class SqliteInterruptStore:
                 available_at=request.now,
                 expire_after_s=request.envelope_expire_after_s,
             )
-            needed = request.now + timedelta(
-                seconds=ACP_CANCEL_SETTLE_S + CANCEL_HOLD_MARGIN_S
-            )
+            needed = request.now + timedelta(seconds=ACP_CANCEL_SETTLE_S + CANCEL_HOLD_MARGIN_S)
             if dead_by < needed:
                 return AdmissionOutcome(
                     refused=InterruptRefusal.WINDOW_TOO_SHORT, quota=decision.quota
@@ -271,9 +271,7 @@ class SqliteInterruptStore:
             quota=decision.quota,
         )
 
-    def _ledger_window(
-        self, conn: sqlite3.Connection, request: InterruptAdmission
-    ) -> LedgerWindow:
+    def _ledger_window(self, conn: sqlite3.Connection, request: InterruptAdmission) -> LedgerWindow:
         """Both bounds' evidence, read under the SAME write lock as the CAS.
 
         Read here rather than by the limiter because the limiter is application
@@ -281,9 +279,7 @@ class SqliteInterruptStore:
         two concurrent admissions at the budget edge must serialize — AC-S1.22(c)
         is exactly the claim that one of them wins.
         """
-        horizon = render_timestamp(
-            request.now - timedelta(seconds=INTERRUPT_BUDGET_WINDOW_S)
-        )
+        horizon = render_timestamp(request.now - timedelta(seconds=INTERRUPT_BUDGET_WINDOW_S))
         principal_rows = conn.execute(
             "SELECT admitted_at FROM interrupt_ledger WHERE principal = ? AND admitted_at > ? "
             "ORDER BY admitted_at",
@@ -303,9 +299,7 @@ class SqliteInterruptStore:
 
     # -- claim --------------------------------------------------------------
 
-    def claim_next(
-        self, receiver_id: str, *, now: datetime, lease_owner: str
-    ) -> ClaimedRow | None:
+    def claim_next(self, receiver_id: str, *, now: datetime, lease_owner: str) -> ClaimedRow | None:
         """The ONLY claim path for an ACP receiver: exactly one row, phase-total.
 
         The ordering ``urgency_rank, available_at, msg_id`` lives in the SQL, not

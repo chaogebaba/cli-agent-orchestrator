@@ -99,7 +99,7 @@ def test_the_schema_makes_the_cancel_deadline_nullable_and_phase_conditional() -
 
 
 def test_the_deadline_is_persisted_by_begin_cancel_not_merely_returned() -> None:
-    """"Omit deadline persistence" is a named r18 mutant; a restart reads the row."""
+    """ "Omit deadline persistence" is a named r18 mutant; a restart reads the row."""
     source = ast.dump(_method("begin_cancel"))
     assert "deadline = ?" in inspect.getsource(SqliteInterruptStore.begin_cancel)
     assert "interrupt_state" in source or "interrupt_state" in inspect.getsource(
@@ -168,7 +168,7 @@ def test_no_operation_calls_another_operation(name: str) -> None:
 
 
 def test_the_aggregate_never_reaches_the_queue_store() -> None:
-    """"No ``QueueStore`` participates" (A2.9(iv)) — checked as reachability.
+    """ "No ``QueueStore`` participates" (A2.9(iv)) — checked as reachability.
 
     The aggregate writes ``delivery_msg`` with its own SQL inside its own
     transaction.  Importing the queue store would make it possible to call a
@@ -198,7 +198,9 @@ def test_no_operation_performs_io_under_the_write_lock() -> None:
     offenders: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            offenders += [a.name.split(".")[0] for a in node.names if a.name.split(".")[0] in forbidden]
+            offenders += [
+                a.name.split(".")[0] for a in node.names if a.name.split(".")[0] in forbidden
+            ]
         elif isinstance(node, ast.ImportFrom):
             root = (node.module or "").split(".")[0]
             if root in forbidden:
@@ -240,7 +242,7 @@ def test_there_is_exactly_one_lifetime_law_authority() -> None:
 
 
 def test_the_active_turn_handle_carries_no_queue_identifier() -> None:
-    """"No queue ids in H" — asserted over the dataclass's own fields.
+    """ "No queue ids in H" — asserted over the dataclass's own fields.
 
     A2.9(iii) keeps receipt and active turn separate: the handle names a TURN.
     A ``msg_id`` on it would let an interrupt reach N's queue row, and A2.3/I3

@@ -161,9 +161,7 @@ def test_argv_beats_the_environment() -> None:
 
 
 def test_the_bare_set_is_exactly_d21s_five() -> None:
-    assert BARE_MODE_TOOLS == frozenset(
-        {"assign", "send_message", "handoff", "list", "load_skill"}
-    )
+    assert BARE_MODE_TOOLS == frozenset({"assign", "send_message", "handoff", "list", "load_skill"})
 
 
 def test_load_skill_is_in_bare_and_returns_text_not_tools() -> None:
@@ -223,8 +221,7 @@ def test_the_request_outranks_every_providers_toml_layer() -> None:
     profile_defaults = {"reasoning_effort": "low"}
     provider_defaults = {"reasoning_effort": "medium"}
     assert (
-        resolve_reasoning_effort("codex", profile_defaults, provider_defaults, None)
-        == "low"
+        resolve_reasoning_effort("codex", profile_defaults, provider_defaults, None) == "low"
     ), "the control: without a request, the toml chain decides"
     assert (
         resolve_reasoning_effort(
