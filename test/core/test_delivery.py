@@ -264,6 +264,11 @@ def test_legacy_other_is_the_only_retired_attempt_outcome() -> None:
         AttemptOutcome.WAKE_UNREACHABLE,
         AttemptOutcome.WAKE_UNRESOLVABLE,
         AttemptOutcome.PASTE_ATTEMPTED,
+        # WP-HERDR H2 (blueprint §4).  Listed for the same reason A1's four are:
+        # this test's job is that the LIVE vocabulary is closed and STATED, so a
+        # value that appears without a reader deciding what it means fails here
+        # rather than in production.
+        AttemptOutcome.SUBMISSION_UNCERTAIN,
     }
 
 
@@ -280,6 +285,7 @@ def test_legacy_other_is_the_only_retired_attempt_outcome() -> None:
 
 from cli_agent_orchestrator.core.delivery import (  # noqa: E402
     ATTEMPT_BUDGET_OUTCOMES,
+    NON_DELIVERY_OUTCOMES,
     UNVERIFIED_STREAK_LEASES,
     WAKE_ANNOTATION_REASONS,
     WAKE_EMITTED_UNVERIFIED_REASONS,
@@ -443,6 +449,56 @@ def test_emitted_outcomes_never_spend_an_attempt() -> None:
     assert not spends_attempt(AttemptOutcome.EMITTED_UNVERIFIED)
     assert not spends_attempt(AttemptOutcome.VETO_DIALOG)
     assert not spends_attempt(AttemptOutcome.WAKE_UNREACHABLE)
+
+
+# --------------------------------------------- WP-HERDR H2: the ninth outcome
+#
+# Three closed sets govern an ``AttemptOutcome``, and the entry audit's F2 is
+# that only two of them were ever written down in a blueprint.  A value added
+# without ruling on the third makes the choice by OMISSION, so H2-S1's ruling is
+# asserted here rather than left to the reader of a frozenset literal.
+# ---------------------------------------------------------------------------
+
+
+def test_an_uncertain_submission_never_spends_an_attempt() -> None:
+    """Blueprint §4: quarantined rather than re-offered, so ``dead_by`` bounds it.
+
+    The attempt budget is the wrong bound for a row whose prompt may ALREADY sit
+    in the agent's composer: re-offering is what would double-submit, and the
+    fast death at 325 s is reserved for conditions that cannot clear.  This one
+    clears the moment the runtime reports a state change.
+    """
+    assert AttemptOutcome.SUBMISSION_UNCERTAIN not in ATTEMPT_BUDGET_OUTCOMES
+    assert not spends_attempt(AttemptOutcome.SUBMISSION_UNCERTAIN)
+
+
+def test_an_uncertain_submission_retains_its_lease() -> None:
+    """H2-S1's explicit ruling on the THIRD closed set (audit F2).
+
+    ``NON_DELIVERY_OUTCOMES`` is what keeps the row leased so ``reclaim`` can
+    still see the outcome at all (#604).  Nothing acknowledged an uncertain
+    submission, so it is not in the company of the outcomes that COUNT AS SENT.
+    """
+    assert AttemptOutcome.SUBMISSION_UNCERTAIN in NON_DELIVERY_OUTCOMES
+
+
+def test_the_three_closed_sets_partition_the_live_vocabulary() -> None:
+    """Totality, in the shape the vocabulary test uses for the enum itself.
+
+    The complement of ``NON_DELIVERY_OUTCOMES`` inside the live vocabulary is
+    the set of outcomes that count as SENT, and it is enumerated as a literal so
+    that moving a value across the line fails HERE rather than changing lease
+    retention silently.  ``LEGACY_OTHER`` sits on neither side: it was a 3a
+    mirror value retired with shadow mode (#738) and no live claim records one.
+    """
+    live_vocabulary = set(AttemptOutcome) - {AttemptOutcome.LEGACY_OTHER}
+    counts_as_sent = live_vocabulary - NON_DELIVERY_OUTCOMES
+    assert counts_as_sent == {
+        AttemptOutcome.DELIVERED,
+        AttemptOutcome.EMITTED_UNVERIFIED,
+    }
+    assert NON_DELIVERY_OUTCOMES <= live_vocabulary
+    assert ATTEMPT_BUDGET_OUTCOMES <= NON_DELIVERY_OUTCOMES
 
 
 # ------------------------------------------------------------- the sender rule
