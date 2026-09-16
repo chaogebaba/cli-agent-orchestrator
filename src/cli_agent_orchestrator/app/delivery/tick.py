@@ -46,6 +46,11 @@ declines to let a wake path change the safety net.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.app.acp.receiver_task import ReceiverTaskRegistry
+
 import asyncio
 import contextlib
 import logging
@@ -138,6 +143,7 @@ class DeliveryTick:
         clock: Clock,
         interval_s: float = DELIVERY_TICK_S,
         adopter: LegacyInboxAdopter | None = None,
+        receiver_tasks: "ReceiverTaskRegistry | None" = None,
     ) -> None:
         self._store = store
         self._wake = wake
@@ -148,6 +154,12 @@ class DeliveryTick:
         self._interval_s = interval_s
         self._task: asyncio.Task[None] | None = None
         self._ticks = 0
+        # WP-ACP-PLANE D6b(3): the ACP half. ``None`` — the default, and what the
+        # composition root passes with ``CAO_SEAT_TRANSPORT`` native — means this
+        # tick has no ACP receivers and every branch below is inert, so the
+        # scheduler is byte-identical to the pre-S1 one.
+        self._receiver_tasks = receiver_tasks
+        self._acp_runs = 0
 
     @property
     def ticks(self) -> int:
@@ -209,8 +221,43 @@ class DeliveryTick:
         stamp = now if now is not None else self._clock.now()
         self.reclaim(stamp, report)
         self.serve(stamp, report)
+        self.signal_acp_receivers(report)
         self._ticks += 1
         return report
+
+    @property
+    def acp_runs(self) -> int:
+        """How many ACP receiver-task runs this tick has signalled.
+
+        Exposed so an isolation arm can assert the SCHEDULER kept scheduling
+        while one receiver was blocked, which is the thing a count can prove and
+        an elapsed-time allowance cannot.
+        """
+        return self._acp_runs
+
+    def signal_acp_receivers(self, report: TickReport) -> None:
+        """D6b(3)'s scheduler half: SIGNAL each ACP receiver, await nothing.
+
+        The whole decision is in what this does not do. It does not call
+        ``prepare_interrupt``, it does not submit, it does not await a cancel and
+        it does not tear a process group down — every one of those is a wire or
+        process wait, and a scheduler that performed one would hold every OTHER
+        receiver behind that agent's latency. It hands each receiver to its own
+        task and moves on.
+
+        Each receiver is guarded separately for the reason ``serve`` guards each
+        one: a fleet in which one agent's fault stops the others is a fleet with
+        one agent.
+        """
+        registry = self._receiver_tasks
+        if registry is None:
+            return
+        for receiver_id in registry.receivers():
+            try:
+                registry.signal(receiver_id)
+                self._acp_runs += 1
+            except Exception:  # noqa: BLE001 — one receiver must not stop the fleet
+                logger.exception("delivery tick: acp receiver %s failed", receiver_id)
 
     def adopt(self, report: TickReport) -> None:
         """Pull orphaned legacy ``inbox`` rows into the queue (WP-ARCH 3c).
