@@ -28,6 +28,7 @@ from cli_agent_orchestrator.clients.database import (
     TerminalModel,
     _inbox_message_from_row,
     _insert_routed_inbox_row,
+    _refresh_if_persistent,
     _stamp_enqueue_generation,
     _utcnow,
     resolve_inbox_receiver,
@@ -622,7 +623,17 @@ def _create_logical_inbox_message_inner(
                 _pre_commit_stash.clear()
 
                 db.commit()
-                db.refresh(row)
+                # F1003 (#851): at the 3b flip the choke point hands back a
+                # POPULATED but never-added InboxModel — §6 makes the legacy
+                # inbox read-only, so there is no INSERT to refresh from and a
+                # bare ``Session.refresh`` raises ``InvalidRequestError:
+                # not persistent within this Session``. That is a 500 on the
+                # mailbox send path, which is EVERY worker callback to the seat.
+                # The raw-terminal siblings already asked first
+                # (``_create_inbox_message_unfenced``, the park-warm notice);
+                # this third caller was missed, and it is the only one a fresh
+                # CAO home exercises first.
+                _refresh_if_persistent(db, row)
                 result = _inbox_message_from_row(row)
 
                 if result.barrier_id is not None and result.barrier_member_key is not None:
