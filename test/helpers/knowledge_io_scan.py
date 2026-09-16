@@ -32,11 +32,22 @@ from typing import Iterable
 # `routing.toml` is deliberately ABSENT: the copy inside CAO's own agent store
 # (`constants.routing_toml_path()`) is infrastructure, and only `<repo>/orchestrator/
 # routing.toml` is skill-owned — which the `orchestrator/` segment already catches.
-_DOMAIN = re.compile(
-    r"(?:^|[/\\])(?:orchestrator|doctrine|blueprints)(?:[/\\]|$)"
-    r"|(?:ORCH_MAP|HANDOFF|WP-BACKLOG|BUGS|MISTAKES|GOLDEN-TIPS|ROUTING)\.md"
-    r"|self[-_ ]?audit\.md",
+# Directory segments, case-insensitively.
+_DIR_DOMAIN = re.compile(
+    r"(?:^|[/\\])(?:orchestrator|doctrine|blueprints)(?:[/\\]|$)",
     re.IGNORECASE,
+)
+
+# The named files, case-SENSITIVELY, and only as a whole path component.
+#
+# Case matters here because A.2 clarifies that `docusaurus/docs/patterns/handoff.md` is a
+# generic product doc and "the word 'handoff' is not classification". The skill's own files
+# are SHOUTED by convention (HANDOFF.md, GOLDEN-TIPS.md, BUGS.md, ...), the product doc is
+# not, and that is the only signal available in the path. A case-insensitive match here
+# reported the docusaurus page as packaged knowledge — measured, not hypothesised.
+_FILE_DOMAIN = re.compile(
+    r"(?:^|[/\\])(?:ORCH_MAP|HANDOFF|WP-BACKLOG|BUGS|MISTAKES|GOLDEN-TIPS|ROUTING)\.md$"
+    r"|(?:^|[/\\])self-audit\.md$"
 )
 
 # Read, stat, glob and parent-walk surfaces. `find_workspace_file` is CAO's own
@@ -88,7 +99,8 @@ class Finding:
 
 def knowledge_domain(value: str) -> bool:
     """True when ``value`` names a path on the A.2 closed list."""
-    return bool(_DOMAIN.search(value.replace("\\", "/")))
+    normalized = value.replace("\\", "/")
+    return bool(_DIR_DOMAIN.search(normalized) or _FILE_DOMAIN.search(normalized))
 
 
 def _body(nodes: Iterable[ast.stmt]) -> list[ast.stmt]:
@@ -205,3 +217,85 @@ def scan_source_tree(root: Path, allowlist: Iterable[str] = SKILL_ALLOWLIST) -> 
             continue
         findings.extend(scan_python(path.read_text(encoding="utf-8"), location))
     return sorted(set(findings))
+
+
+# ---------------------------------------------------------------------------------------
+# Artifact scan (AC-LITE-5, slice 3). Retained from `cao/lite-boundary-slice1` @ eb1cf2c0
+# (`scan_members`/`scan_artifact`, :278-330).
+# ---------------------------------------------------------------------------------------
+
+# The prose scan. It is deliberately NOT applied to source or to test fixtures — there it
+# flags any file containing the string "GOLDEN-TIPS" (three `status_truth` fixtures,
+# `test/providers/fixtures/f568/spinner-ebbing-bare.txt`, `test/tier-census.json`) and is
+# pure noise. Inside a built artifact's PACKAGE DATA it earns its place: a packaged prompt
+# renamed to slip past a path check is a real way to ship doctrine in a wheel.
+_CONTENT_DOMAIN = re.compile(
+    r"self[-_ ]?audit|compliance[-_ ]auditor|orchestration[-_ ]knowledge"
+    r"|workflow[-_ ]ledger|golden[-_ ]tips|orchestrator doctrine",
+    re.IGNORECASE,
+)
+
+_DATA_SUFFIXES = (".md", ".txt", ".json", ".toml", ".sh")
+
+
+def scan_members(
+    members: Iterable[tuple[str, bytes]],
+    surface: str,
+    *,
+    content_roots: tuple[str, ...] = ("src/", "cli_agent_orchestrator/", "cao_workflow/"),
+) -> list[Finding]:
+    """Report packaged knowledge in an archive's members.
+
+    Two rules. ``packaged-knowledge`` is the path check over every member. ``knowledge-content``
+    is the prose check, restricted to package data under ``content_roots`` so that test
+    fixtures quoting a doctrine filename are not mistaken for shipped doctrine.
+    """
+    findings: list[Finding] = []
+    for name, content in members:
+        normalized = name.replace("\\", "/")
+        # Archive members are prefixed with `<project>-<version>/`; compare on the tail too.
+        tail = normalized.partition("/")[2] or normalized
+        if knowledge_domain(normalized) or knowledge_domain(tail):
+            findings.append(Finding(name, "packaged-knowledge", tail))
+        if normalized.endswith("-build-report.md"):
+            findings.append(Finding(name, "packaged-build-report", tail))
+        if tail.startswith(content_roots) and normalized.endswith(_DATA_SUFFIXES):
+            signature = _CONTENT_DOMAIN.search(content.decode("utf-8", errors="replace"))
+            if signature is not None:
+                findings.append(Finding(name, "knowledge-content", signature.group()))
+    return sorted(set(findings))
+
+
+def scan_artifact(path: Path) -> list[Finding]:
+    """Scan a built sdist (``.tar.gz``), a wheel (``.zip``), or an installed directory."""
+    import tarfile
+    import zipfile
+
+    if path.is_dir():
+        return scan_members(
+            (
+                (p.relative_to(path).as_posix(), p.read_bytes())
+                for p in sorted(path.rglob("*"))
+                if p.is_file()
+            ),
+            "installed",
+        )
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as archive:
+            return scan_members(
+                (
+                    (name, archive.read(name))
+                    for name in archive.namelist()
+                    if not name.endswith("/")
+                ),
+                "wheel",
+            )
+    with tarfile.open(path) as archive:
+        members: list[tuple[str, bytes]] = []
+        for member in archive.getmembers():
+            if not member.isfile():
+                continue
+            stream = archive.extractfile(member)
+            if stream is not None:
+                members.append((member.name, stream.read()))
+        return scan_members(members, "sdist")
