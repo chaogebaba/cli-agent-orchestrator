@@ -20,6 +20,7 @@ import pytest
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.main import cli as base_cli
+from cli_agent_orchestrator.cli.orchestrator_main import SKILL_MECHANISMS
 from cli_agent_orchestrator.cli.orchestrator_main import cli as orchestrator_cli
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -27,9 +28,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # The skill CLI's whole visible command set: the three commands A.4 moves, plus every verb
 # added since under the encode-by-default ruling. `fold` itself stays on base — only corpus
 # discovery left, so `cao fold FILE` is untouched and is asserted separately below.
-# `lint-doctrine` (F809 #666 A14/#681) is NEW here rather than moved, so base never carried
-# it and it gets no base stub; the disjointness assertion below still covers it.
-MOVED = ("ledger", "fold-corpus", "sync-routing", "lint-doctrine")
+# `lint-doctrine` (F809 #666 A14/#681) and `evidence` (F809 A06/#668) are NEW here rather
+# than moved, so base never carried them and they get no base stub; the disjointness
+# assertion below still covers them.
+MOVED = ("ledger", "fold-corpus", "sync-routing", "lint-doctrine", "evidence")
 
 POINTER = "cao-orchestrator"
 
@@ -189,3 +191,20 @@ def test_mutant_orchestrator_cli_growing_a_fourth_command_turns_red() -> None:
     mutant = click.Group("cao-orchestrator", commands=dict(orchestrator_cli.commands))
     mutant.add_command(click.Command("extra", callback=lambda: None))
     assert _visible_commands(mutant) != set(MOVED)
+
+
+def test_every_claimed_mechanism_id_is_a_visible_skill_command() -> None:
+    """F809 A06 (#668): a ledger row may claim a verb only while the verb exists.
+
+    ``lint-doctrine`` resolves ``mechanism EXISTS [evidence-verify]`` against the
+    registration dict in ``orchestrator_main``. If an id could sit there naming a
+    command nobody registers, the ledger would claim a mechanism the CLI does not
+    offer — the exact prose-only claim C3 exists to catch, reintroduced one layer
+    down.
+    """
+    visible = _visible_commands(orchestrator_cli)
+    for mechanism_id, command in SKILL_MECHANISMS.items():
+        assert command.name in visible, f"{mechanism_id} names an unregistered command"
+        assert mechanism_id.startswith(
+            command.name
+        ), f"{mechanism_id} does not name its command {command.name!r}"

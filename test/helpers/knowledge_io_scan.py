@@ -84,6 +84,7 @@ _IO = {
 SKILL_ALLOWLIST = (
     "src/cli_agent_orchestrator/cli/orchestrator_main.py",
     "src/cli_agent_orchestrator/cli/orchestrator_commands/__init__.py",
+    "src/cli_agent_orchestrator/cli/orchestrator_commands/evidence.py",
     "src/cli_agent_orchestrator/cli/orchestrator_commands/ledger.py",
     "src/cli_agent_orchestrator/cli/orchestrator_commands/lint_doctrine.py",
     "src/cli_agent_orchestrator/cli/orchestrator_commands/fold_corpus.py",
