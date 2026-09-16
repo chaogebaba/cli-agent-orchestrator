@@ -219,3 +219,31 @@ def test_the_block_is_per_terminal(wired) -> None:  # type: ignore[no-untyped-de
     other = injector.inject(terminal_id="t-other", line="two")
     assert other.outcome is AttemptOutcome.DELIVERED
     assert client.prompts == [("%3", "one"), ("%3", "two")]
+
+
+def test_a_submission_whose_sequence_was_never_learned_is_not_a_permanent_wedge(
+    wired,  # type: ignore[no-untyped-def]
+) -> None:
+    """An injection that TIMED OUT records no sequence, and must still recover.
+
+    With no baseline there is nothing to compare a later read against, so the
+    first successful read BECOMES the baseline and the block holds one more
+    round.  Without that adoption the terminal's deliveries would be wedged
+    until the process restarted — a worse failure than the double-submission the
+    rule exists to prevent, and one no lease or ``dead_by`` would clear.
+    """
+    client = FakeClient(
+        submissions=[_submission(AttemptOutcome.DELIVERED, "herdr:working", 22)],
+        states=[_state(20), _state(21)],
+    )
+    injector = wired(client)
+    injector._mark_unresolved("t-1", None)  # what the TimeoutError arm records
+
+    first = injector.inject(terminal_id="t-1", line="one")
+    assert first.outcome is AttemptOutcome.SUBMISSION_UNCERTAIN
+    assert first.detail == "herdr:unresolved_baseline"
+    assert client.prompts == []
+
+    second = injector.inject(terminal_id="t-1", line="two")
+    assert second.outcome is AttemptOutcome.DELIVERED
+    assert client.prompts == [("%3", "two")]
