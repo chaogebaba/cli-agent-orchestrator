@@ -621,11 +621,47 @@ def _preflight_disk_space(path: str, floor_gb: float = DISK_SPACE_FLOOR_GB) -> N
         )
 
 
-async def seed_resume_bootstrap(agent_profile: str, provider_name: str, cwd: str):
-    """Return an authoritative resume ForkContext for seed-capable providers."""
+async def seed_resume_bootstrap(
+    agent_profile: str,
+    provider_name: str,
+    cwd: str,
+    *,
+    request_class: str = "explicit",
+):
+    """Return an authoritative resume ForkContext for seed-capable providers.
+
+    F1007 #855 — the seed is a PROVIDER EXECUTION (``codex exec``), and every
+    create path calls it UPSTREAM of ``create_terminal``, i.e. upstream of the
+    F868 D4 cell-certification choke point. An uncertified cell therefore ran a
+    provider process (and its side effects) before it was refused, and a
+    provider failure on the way (a dead credential) MASKED the certification
+    refusal with a ``500 seed_exec_failed rc=1``. D4's contract is admission
+    "BEFORE any provider process starts", so the choke point runs HERE, in the
+    exec's own function, immediately before the spawn: the ordering cannot be
+    reintroduced by a new caller, only by deleting this call.
+
+    ``request_class`` is the D5 class the caller threads to ``create_terminal``
+    for the SAME cell; it defaults to ``"explicit"`` (the strictest arm) so an
+    unclassified seed fails closed, exactly like the shared seam's default. A
+    refusal is raised as the same ``ValueError`` carrying the typed code that
+    ``create_terminal`` raises, so every caller's HTTP/MCP mapping is unchanged
+    — only the ORDER moves. ``create_terminal`` still runs the guard: this is an
+    earlier copy of one pure, idempotent check, never a replacement for it.
+
+    A provider with no seed identity execs NOTHING here and returns before the
+    guard — its admission is the shared seam's, unchanged by this function.
+    """
     provider_class = get_provider_class(provider_name)
     if provider_class.supports_seed_resume_identity is not True:
         return None
+    from cli_agent_orchestrator.utils.cell_guard import CellGuardRefused, guard_cell_admission
+
+    try:
+        guard_cell_admission(agent_profile, provider_name, request_class=request_class)
+    except CellGuardRefused as _refusal:
+        # Same surface as the create_terminal seam: the typed code inside a
+        # ValueError, so each route's ValueError arm renders the identical 4xx.
+        raise ValueError(str(_refusal)) from _refusal
     try:
         from cli_agent_orchestrator.models.terminal import ForkContext
 

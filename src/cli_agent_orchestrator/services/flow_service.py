@@ -356,7 +356,11 @@ async def execute_flow(name: str) -> bool:
                 ts_mod._delete_terminal_core(terminal["id"])
         from cli_agent_orchestrator.services.terminal_service import seed_resume_bootstrap
 
-        fork_context = await seed_resume_bootstrap(flow.agent_profile, flow.provider, os.getcwd())
+        # F1007 #855: the seed runs the D4 admission before its provider exec;
+        # the class matches the create_terminal call below (its default).
+        fork_context = await seed_resume_bootstrap(
+            flow.agent_profile, flow.provider, os.getcwd(), request_class="explicit"
+        )
         terminal = await create_terminal(
             session_name=session_name,
             provider=flow.provider,

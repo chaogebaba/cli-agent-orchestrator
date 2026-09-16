@@ -305,8 +305,14 @@ async def create_session(
 
     from cli_agent_orchestrator.services.terminal_service import seed_resume_bootstrap
 
+    # F1007 #855: the seed EXECUTES a provider, so it runs the D4 cell admission
+    # internally — with the SAME class this create threads to create_terminal
+    # below, so an uncertified cell is refused with zero provider execs.
     fork_context = await seed_resume_bootstrap(
-        agent_profile, resolved_provider, working_directory or os.getcwd()
+        agent_profile,
+        resolved_provider,
+        working_directory or os.getcwd(),
+        request_class=cell_request_class,
     )
     terminal = await create_terminal(
         provider=resolved_provider,

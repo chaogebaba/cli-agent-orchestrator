@@ -567,8 +567,14 @@ async def run_agent_step(
 
         # create_terminal already runs provider.initialize() (which waits for
         # IDLE); a failure raises (ValueError/TimeoutError) and propagates.
+        # F1007 #855: the seed EXECUTES a provider, so it runs the D4 cell
+        # admission internally — with the SAME class threaded to create_terminal
+        # below, so an uncertified cell is refused with zero provider execs.
         fork_context = await terminal_service.seed_resume_bootstrap(
-            agent, provider, working_directory or os.getcwd()
+            agent,
+            provider,
+            working_directory or os.getcwd(),
+            request_class=cell_request_class,
         )
         terminal = await terminal_service.create_terminal(
             provider,

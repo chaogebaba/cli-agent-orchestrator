@@ -3919,8 +3919,14 @@ async def create_session(
                 try:
                     from cli_agent_orchestrator.services import terminal_service
 
+                    # F1007 #855: admission (D4) before the seed's provider
+                    # exec. The class matches the create_terminal call below,
+                    # which takes cell_request_class's "explicit" default.
                     sidecar_context = await terminal_service.seed_resume_bootstrap(
-                        "memory_manager", sidecar_provider, working_directory or os.getcwd()
+                        "memory_manager",
+                        sidecar_provider,
+                        working_directory or os.getcwd(),
+                        request_class="explicit",
                     )
                     await terminal_service.create_terminal(
                         provider=sidecar_provider,
@@ -4091,8 +4097,13 @@ async def start_session_endpoint(
 
         async def _spawn_start_sidecar() -> None:
             try:
+                # F1007 #855: admission (D4) before the seed's provider exec;
+                # same "explicit" class the create_terminal call below defaults to.
                 context = await terminal_service.seed_resume_bootstrap(
-                    "memory_manager", sidecar_provider, working_directory or os.getcwd()
+                    "memory_manager",
+                    sidecar_provider,
+                    working_directory or os.getcwd(),
+                    request_class="explicit",
                 )
                 await terminal_service.create_terminal(
                     provider=sidecar_provider,
@@ -4808,6 +4819,11 @@ async def create_terminal_in_session(
         _f829_link_admission = None
         _f829_claimed_key: Optional[str] = None
         _f829_resume_overrides: Dict[str, Any] = {}
+        # F1007 #855: the cold branch derives the cell class EARLY (it must, to
+        # admit before the seed exec below) and hands it to the reconcile block
+        # further down instead of recomputing — one derivation per request, so a
+        # routing.toml edit mid-request cannot make the two disagree.
+        _cold_cell_class: Optional[str] = None
 
         # F829 A2 (r4, codex EMPIRICAL): classify resume_from by PRESENCE, not
         # truthiness. A present-but-blank handle ({"resume_from": ""} or all
@@ -4887,8 +4903,27 @@ async def create_terminal_in_session(
                     },
                 )
             if fork_context is None:
+                # F1007 #855: seed_resume_bootstrap EXECUTES a provider
+                # (``codex exec``) to mint the resume identity, so the cell
+                # class derivation and the D4 admission choke point must run
+                # HERE, ahead of it — not only inside create_terminal below.
+                # Before this, an uncertified cell spawned a provider process
+                # and its failure (e.g. a dead credential) masked the
+                # certification refusal with a 500 seed_exec_failed.
+                _cold_cell_class = cell_guard_reconcile(
+                    _orig_agent_profile,
+                    provider_supplied=_orig_provider_supplied,
+                    is_resume=False,
+                    resume_override=False,
+                    supplied_class=cell_request_class,
+                    provider=resolved_provider,
+                    resolved_from_position=cell_request_origin,
+                )
                 fork_context = await terminal_service.seed_resume_bootstrap(
-                    agent_profile, resolved_provider, working_directory or os.getcwd()
+                    agent_profile,
+                    resolved_provider,
+                    working_directory or os.getcwd(),
+                    request_class=_cold_cell_class,
                 )
         # F868 r4 (codex Stage B r2 EMPIRICAL-NO): DERIVE the cell class from the
         # request shape the caller named and REFUSE a forged override. Before r4
@@ -4914,14 +4949,18 @@ async def create_terminal_in_session(
             # against the server's own routing composition before it counts.
             # A resume never carries provenance (the server re-resolves from
             # the reaped identity), so this is a no-op on that arm.
-            _cell_class = cell_guard_reconcile(
-                _orig_agent_profile,
-                provider_supplied=_orig_provider_supplied,
-                is_resume=_is_resume,
-                resume_override=_resume_override,
-                supplied_class=cell_request_class,
-                provider=resolved_provider,
-                resolved_from_position=None if _is_resume else cell_request_origin,
+            _cell_class = (
+                _cold_cell_class
+                if _cold_cell_class is not None
+                else cell_guard_reconcile(
+                    _orig_agent_profile,
+                    provider_supplied=_orig_provider_supplied,
+                    is_resume=_is_resume,
+                    resume_override=_resume_override,
+                    supplied_class=cell_request_class,
+                    provider=resolved_provider,
+                    resolved_from_position=None if _is_resume else cell_request_origin,
+                )
             )
         except CellClassForged:
             # Compensate a taken resume claim before surfacing the refusal — a
