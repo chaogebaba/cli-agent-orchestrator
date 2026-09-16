@@ -12,6 +12,7 @@ No browser: these run in the ordinary offline tier.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import Any
 
@@ -237,6 +238,30 @@ async def test_only_a_proved_abort_authorises_a_fresh_same_turn_mint(tmp_path):
     aborted = _held_log(tmp_path / "second")
     aborted.record_abandoned_pre_invoke(route_disposition="aborted", page_disposition="closed")
     assert aborted.can_fresh_same_turn_mint() is True
+
+
+async def test_restart_loaded_lost_row_still_refuses_a_fresh_mint(tmp_path):
+    """The predicate must re-check the disposition of a row it did not write.
+
+    ``record_abandoned_pre_invoke`` refuses ``lost`` at write time, so within
+    one process the two guards overlap. Across a RESTART they do not: the row
+    on disk is whatever is on disk. A row claiming ABANDONED_PRE_INVOKE with a
+    ``lost`` disposition -- an older format, a partially-migrated attempt, a
+    tampered file -- must not re-authorise a same-turn mint.
+    """
+    log = _held_log(tmp_path)
+    log.record_ack_unknown(route_disposition="lost", page_disposition="closed")
+
+    raw = json.loads(log.path.read_text(encoding="utf-8"))
+    raw["attempt_state"] = AttemptState.ABANDONED_PRE_INVOKE.value
+    raw["route_disposition"] = "lost"
+    log.path.write_text(json.dumps(raw, sort_keys=True), encoding="utf-8")
+
+    reloaded = SendIntentLog(log.attempt_dir)
+    reloaded.load()
+    assert reloaded.record.attempt_state == AttemptState.ABANDONED_PRE_INVOKE.value
+    assert reloaded.record.route_disposition == "lost"
+    assert reloaded.can_fresh_same_turn_mint() is False
 
 
 # ---------------------------------------------------------------------
