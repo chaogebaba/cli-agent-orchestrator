@@ -74,6 +74,35 @@ def frame_log_path(terminal_id: str, *, environ: dict[str, str] | None = None) -
     return Path(home) / "acp-frames" / f"{terminal_id}.jsonl"
 
 
+def _rotate_frame_log(path: Path) -> None:
+    """Move a previous session's frames aside before a new seat writes.
+
+    ``AcpFrameLog`` appends, which is right WITHIN a session — the log is the
+    evidence AC-S1.2, AC-S1.19 and AC-S1.21 are asserted from, and a truncating
+    writer would lose frames on a crash. It is wrong ACROSS sessions: a respawn
+    is a new subprocess and a new session id, and appending makes a per-session
+    count unreadable.
+
+    That is not a hypothetical. It has now cost this WP twice: once when two runs
+    shared an output directory and a count read four prompts where there were
+    two, and again when a re-run of the same terminal id read forty where there
+    were twenty. Both times the transport was fine and the evidence was not.
+
+    Rotated rather than deleted. The previous session's frames are exactly what
+    someone debugging a respawn wants, and the numbered suffix keeps them without
+    letting them contaminate the next count.
+    """
+    if not path.exists():
+        return
+    index = 1
+    while True:
+        rotated = path.with_suffix(f".{index}{path.suffix}")
+        if not rotated.exists():
+            path.rename(rotated)
+            return
+        index += 1
+
+
 def spawn_acp_seat(
     *,
     terminal_id: str,
@@ -108,6 +137,7 @@ def spawn_acp_seat(
         env["CAO_TERMINAL_TOKEN"] = auth_token
 
     log_path = frame_log_path(terminal_id, environ=env)
+    _rotate_frame_log(log_path)
     client = AcpClient(
         argv,
         frame_log=AcpFrameLog(log_path),

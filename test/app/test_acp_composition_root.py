@@ -261,3 +261,36 @@ def test_a_seat_spawn_exists_and_refuses_an_uncertified_provider() -> None:
     assert acp_adapter_for_provider("kiro_cli") is None
     with pytest.raises(SeatSpawnFailed, match="no certified ACP adapter"):
         spawn_acp_seat(terminal_id="t", provider="kiro_cli", cwd="/tmp")
+
+
+def test_a_respawn_rotates_the_frame_log_rather_than_appending(tmp_path: Path) -> None:
+    """A per-session count must be readable, and appending across sessions breaks it.
+
+    This has cost the WP twice — a count that read four prompts where there were
+    two, and one that read forty where there were twenty. Both times the
+    transport was correct and the EVIDENCE was not, which is the worse failure
+    because it looks like a defect in the thing being measured.
+
+    Appending WITHIN a session stays: a truncating writer would lose frames on a
+    crash, and the log is what the live ACs are asserted from.
+    """
+    from cli_agent_orchestrator.adapters.acp.spawn import _rotate_frame_log
+
+    log = tmp_path / "acp-frames" / "term.jsonl"
+    log.parent.mkdir(parents=True)
+    log.write_text('{"session": 1}\n')
+
+    _rotate_frame_log(log)
+    assert not log.exists(), "the previous session's log is still in the way"
+    assert (tmp_path / "acp-frames" / "term.1.jsonl").read_text() == '{"session": 1}\n'
+
+    log.write_text('{"session": 2}\n')
+    _rotate_frame_log(log)
+    assert (tmp_path / "acp-frames" / "term.2.jsonl").exists(), "rotation must not overwrite"
+    assert (tmp_path / "acp-frames" / "term.1.jsonl").exists(), "older frames are kept"
+
+
+def test_rotation_is_a_no_op_for_a_first_spawn(tmp_path: Path) -> None:
+    from cli_agent_orchestrator.adapters.acp.spawn import _rotate_frame_log
+
+    _rotate_frame_log(tmp_path / "nothing-here.jsonl")  # must not raise
