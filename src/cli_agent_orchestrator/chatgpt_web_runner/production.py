@@ -533,7 +533,10 @@ async def _drive_composed_turn(
     from cli_agent_orchestrator.chatgpt_web_runner.source_pull import (
         ConnectorListener,
         PairingCodeFile,
+        PairingExpired,
+        await_pairing_consumed,
         collect_pull_evidence,
+        connector_auth_dir,
         verify_source_correlation,
     )
     from cli_agent_orchestrator.chatgpt_web_runner.stream_relay import get_relay_hub
@@ -547,74 +550,124 @@ async def _drive_composed_turn(
     connector_listener: Optional[ConnectorListener] = None
     connector_server: Any = None
     pairing_file: Optional[PairingCodeFile] = None
-    if manifest and frozen_worktree:
-        from cli_agent_orchestrator.services.workspace_read import bind_attempt
-
-        # Resolve BOTH before binding anything: an unset public URL is a typed
-        # refusal, not a connector that comes up unreachable.
-        public_base_url = pull_public_base_url()
-        bind_port = pull_bind_port()
-
-        connector_server = bind_attempt(
-            attempt_id=attempt_id,
-            frozen_worktree=frozen_worktree,
-            manifest=manifest,
-            reviewed_commit=reviewed_commit,
-            base_commit=base_commit,
-            state_dir=_artifacts_dir() / "attempts" / attempt_id / "connector",
-            # D5/D7: this is what the OAuth metadata, the bearer challenge and
-            # the prompt advertise. Without it the connector announces a
-            # loopback issuer that ChatGPT can never reach.
-            public_base_url=public_base_url,
-        )
-        connector_listener = ConnectorListener(connector_server, port=bind_port)
-        await connector_listener.start()
-
-        # The single-use pairing gate. The operator types this into the ChatGPT
-        # UI once; it invalidates any previous session and expires on its own.
-        pairing = connector_server.pairing.create()
-        pairing_code = str(pairing["code"])
-        pairing_expires_at = float(pairing["expires_at"])
-        pairing_issued_at = time.time()
-
-        # The raw code goes to the pane and to ONE ephemeral 0600 file; the
-        # durable ledger gets only its digest and its timestamps. A later reader
-        # can still prove WHICH code was used by hashing the one they hold,
-        # without the record ever having held it (supervisor ruling, and the
-        # same policy that keeps the relay token out of create_locked_attempt).
-        pairing_file = PairingCodeFile(
-            _artifacts_dir() / "attempts" / attempt_id, connector_server.pairing
-        )
-        pairing_digest = pairing_file.write(pairing_code)
-        pairing_file.start_watch()
-
-        # Reachability is PROVED, not assumed, and proved to be THIS attempt.
-        await asyncio.to_thread(check_pull_plane_reachable, public_base_url, attempt_id)
-
-        intent_log.transition(
-            AttemptState.CONNECTOR_READY,
-            connector_public_base_url=public_base_url,
-            connector_pairing_code_sha256=pairing_digest,
-            connector_pairing_issued_at=pairing_issued_at,
-            connector_pairing_expires_at=pairing_expires_at,
-        )
-        _marker(f"PULL-PLANE {public_base_url} attempt={attempt_id}")
-        _marker(f"PULL-PAIRING-CODE {pairing_code} (single use, expires in ~5 min)")
-        _marker(f"PULL-PAIRING-FILE {pairing_file.path} (0600, removed once used or expired)")
-        logger.info("chatgpt_web pull plane reachable at %s for %s", public_base_url, attempt_id)
-    else:
-        intent_log.transition(AttemptState.CONNECTOR_READY)
-
-    # Everything from here on runs under ONE teardown. The pull plane is
-    # already up and the raw pairing code is already on disk, so every failure
-    # between here and the mint — profile resolution, the browser launch, the
-    # navigation, the 20s composer wait, the readback check — must still unlink
-    # the code and stop the listener. Before this the protecting `try` did not
-    # open until the mint block, so those five sites leaked a live single-use
-    # credential and a running listener, and the expiry watcher that would have
-    # cleaned up died with the event loop (B3 fixes-2 review, finding 1).
     context: Any = None
+    # THE TEARDOWN BOUNDARY, and it opens HERE — above the pull plane, not below
+    # it. fixes-3 moved it down to cover the browser; the D9.1 operator gate then
+    # added a raise (PAIRING_EXPIRED) ABOVE that point, which reintroduced
+    # exactly the leak fixes-3 had closed: an expired pairing left its live code
+    # on disk and the listener running. The expiry arm caught it. Anything that
+    # can raise after a resource exists must sit inside this try.
     try:
+        if manifest and frozen_worktree:
+            from cli_agent_orchestrator.services.workspace_read import bind_attempt
+
+            # Resolve BOTH before binding anything: an unset public URL is a
+            # typed refusal, not a connector that comes up unreachable.
+            public_base_url = pull_public_base_url()
+            bind_port = pull_bind_port()
+
+            connector_server = bind_attempt(
+                attempt_id=attempt_id,
+                frozen_worktree=frozen_worktree,
+                manifest=manifest,
+                reviewed_commit=reviewed_commit,
+                base_commit=base_commit,
+                # D9.1: the auth store is DURABLE and keyed by connector
+                # identity, not by attempt. It used to live under
+                # attempts/<id>/connector, so every attempt started empty and a
+                # refresh token ChatGPT had kept found no record and failed
+                # invalid_grant — pairing could never be done once and reused,
+                # which is what made the live turn unrunnable.
+                state_dir=connector_auth_dir(_artifacts_dir(), public_base_url),
+                # D5/D7: this is what the OAuth metadata, the bearer challenge
+                # and the prompt advertise. Without it the connector announces a
+                # loopback issuer that ChatGPT can never reach.
+                public_base_url=public_base_url,
+            )
+            connector_listener = ConnectorListener(connector_server, port=bind_port)
+            await connector_listener.start()
+
+            # Reachability is PROVED, not assumed, and proved to be THIS attempt.
+            await asyncio.to_thread(check_pull_plane_reachable, public_base_url, attempt_id)
+            _marker(f"PULL-PLANE {public_base_url} attempt={attempt_id}")
+
+            # D9.1: pair ONLY when there is nothing to reuse. Asked before a
+            # code is minted, so a reused authorization costs the operator
+            # nothing at all.
+            auth_reused = bool(connector_server.store.has_reusable_authorization())
+            pairing_digest: Optional[str] = None
+            pairing_issued_at: Optional[float] = None
+            pairing_expires_at: Optional[float] = None
+
+            if auth_reused:
+                _marker(f"PULL-AUTH-REUSED {public_base_url} (no pairing needed)")
+                logger.info("chatgpt_web reusing connector authorization for %s", public_base_url)
+            else:
+                pairing = connector_server.pairing.create()
+                pairing_code = str(pairing["code"])
+                pairing_expires_at = float(pairing["expires_at"])
+                pairing_issued_at = time.time()
+
+                # The raw code goes to the pane and to ONE ephemeral 0600 file;
+                # the durable ledger gets only its digest and its timestamps.
+                # Registered for teardown only AFTER the write succeeds. The
+                # O_EXCL refusal exists precisely so we never own a file someone
+                # else created; handing the unwritten handle to the finally would
+                # unlink that file on the way out, which is the opposite.
+                candidate = PairingCodeFile(
+                    _artifacts_dir() / "attempts" / attempt_id, connector_server.pairing
+                )
+                pairing_digest = candidate.write(pairing_code)
+                pairing_file = candidate
+                pairing_file.start_watch()
+                _marker(f"PULL-PAIRING-CODE {pairing_code} (single use, expires in ~5 min)")
+                _marker(
+                    f"PULL-PAIRING-FILE {pairing_file.path} " "(0600, removed once used or expired)"
+                )
+
+            intent_log.transition(
+                AttemptState.CONNECTOR_READY,
+                connector_public_base_url=public_base_url,
+                connector_pairing_code_sha256=pairing_digest,
+                connector_pairing_issued_at=pairing_issued_at,
+                connector_pairing_expires_at=pairing_expires_at,
+                connector_auth_reused=auth_reused,
+            )
+            logger.info("chatgpt_web pull plane reachable at %s", public_base_url)
+
+            # ── THE OPERATOR GATE (D9.1) ──────────────────────────────────
+            # Block here, BEFORE any profile touch, until the human has paired.
+            # Pairing needs a second tab — Settings, the connector, Connect, the
+            # code — and the old order spent the next 5-15 seconds launching the
+            # browser and navigating the very page the operator would have to
+            # leave. Nothing waited, so the authorization could not land and the
+            # audit came back empty. A turn the operator abandons now costs no
+            # browser launch and no mint.
+            if not auth_reused:
+                assert pairing_expires_at is not None
+                try:
+                    waited = await await_pairing_consumed(
+                        connector_server.pairing,
+                        expires_at=pairing_expires_at,
+                        announce=_marker,
+                    )
+                except PairingExpired as exc:
+                    intent_log.transition(
+                        AttemptState.ERROR,
+                        route_disposition="pairing_expired",
+                        page_disposition="closed",
+                    )
+                    _marker("PULL-PAIRING-EXPIRED no authorization arrived; nothing was sent")
+                    raise RunnerError(
+                        RunnerErrorCode.PAIRING_EXPIRED,
+                        f"{exc} — no browser was launched and no mint was spent; "
+                        "re-dispatch once you are ready to pair",
+                        delivery_state=DeliveryState.NOTHING_SENT,
+                    ) from exc
+                _marker(f"PULL-PAIRING-OK authorized after {waited:.0f}s")
+        else:
+            intent_log.transition(AttemptState.CONNECTOR_READY)
+
         profile = resolve_profile_dir()
         profile_epoch = pin_fingerprint_seed(profile)
         context = await launch(build_launch_options(profile, profile_epoch))

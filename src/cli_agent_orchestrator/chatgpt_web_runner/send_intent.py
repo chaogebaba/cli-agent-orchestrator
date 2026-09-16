@@ -199,6 +199,9 @@ class SendIntentRecord:
     connector_pairing_code_sha256: Optional[str] = None
     connector_pairing_issued_at: Optional[float] = None
     connector_pairing_expires_at: Optional[float] = None
+    #: D9.1: True when this attempt reused an authorization the operator had
+    #: already given for this connector identity, so no pairing was issued.
+    connector_auth_reused: Optional[bool] = None
     verified_node_id: Optional[str] = None
     conversation_digest: Optional[str] = None
     fulfilled_at: Optional[float] = None

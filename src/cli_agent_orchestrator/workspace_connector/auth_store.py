@@ -361,14 +361,27 @@ class AuthStore:
             if record.client_id != client_id:
                 return False, None, "invalid_client"
             del self._tokens[record.hash]
-            tokens = self.issue_tokens(
+            # D9.1: re-bind to the attempt THIS store is serving, not the one
+            # the refresh token was minted under. The refresh token proves that
+            # the operator authorised this connector identity; the access token
+            # it mints is what carries the attempt/manifest scope, and the
+            # bearer guard still refuses any access token whose binding does not
+            # match the live attempt. Without this, a durable store would hand
+            # out tokens bound to a dead attempt and every read would 403 —
+            # which is the same wall as re-pairing, reached more slowly.
+            return True, self.issue_tokens(
                 client_id=client_id,
                 scopes=record.scopes,
                 workspace_id=record.workspace_id,
-                attempt_id=record.attempt_id,
-                manifest_digest=record.manifest_digest,
-            )
-            return True, tokens, ""
+                attempt_id=(
+                    self.attempt_id if self.attempt_id is not None else record.attempt_id
+                ),
+                manifest_digest=(
+                    self.manifest_digest
+                    if self.manifest_digest is not None
+                    else record.manifest_digest
+                ),
+            ), ""
 
     def revoke_token(self, token: str) -> bool:
         with self._lock:
@@ -377,6 +390,22 @@ class AuthStore:
                 return False
             self._save()
             return True
+
+    def has_reusable_authorization(self) -> bool:
+        """True when a live refresh token could mint access for THIS attempt.
+
+        This is the question "must the operator pair again?", and it is asked
+        before a pairing code is ever minted. Access tokens are deliberately not
+        counted: they are attempt-bound and short-lived, so a surviving one from
+        a previous attempt proves nothing about the current one. A refresh token
+        is the durable evidence that the operator authorised this connector.
+        """
+        now = time.time()
+        with self._lock:
+            return any(
+                record.kind == "refresh" and not record.revoked and record.expires_at > now
+                for record in self._tokens.values()
+            )
 
     def token_count(self) -> int:
         with self._lock:
