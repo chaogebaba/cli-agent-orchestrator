@@ -67,9 +67,25 @@ A2_NAMES = (
     "self-audit.md",
 )
 
+# A SUPERVISOR-role profile, and that is load-bearing rather than incidental.
+#
+# A mailbox is the seat's durable destination: `create_session` claims and publishes one only
+# when `profile.role == "supervisor"` (services/session_service.py:299-304, :344-350), the
+# queue addresses rows to the MAILBOX id rather than the terminal id, and both ack paths look
+# a mailbox up by `current_terminal_id` (`_ack_on_queue` mailbox_service.py:1030-1036 and the
+# legacy path at :1235-1240). So a worker terminal has no mailbox, is not the receiver of its
+# own delivery rows, and can never be acked -- by design, not by defect. `code_supervisor`
+# ships in the packaged agent store, so a bare project has it without installing anything.
+AGENT_PROFILE = "code_supervisor"
+
+# Overridable so the same fixture can be pointed at a real provider CLI on a box without
+# editing the module; `mock_cli` keeps the default runnable anywhere.
+PROVIDER = os.environ.get("CAO_LITE_E2E_PROVIDER", "mock_cli")
+
 _POLL_INTERVAL = 0.25
-_DELIVERY_TIMEOUT = 60.0
-_IDLE_TIMEOUT = 90.0
+_DELIVERY_TIMEOUT = float(os.environ.get("CAO_LITE_E2E_DELIVERY_TIMEOUT", "60"))
+_IDLE_TIMEOUT = float(os.environ.get("CAO_LITE_E2E_IDLE_TIMEOUT", "90"))
+_CREATE_TIMEOUT = float(os.environ.get("CAO_LITE_E2E_CREATE_TIMEOUT", "60"))
 
 
 @dataclass
@@ -84,9 +100,12 @@ class Observables:
     health: dict[str, Any]
     artifact_root_relative: str
     terminal_status: str
+    mailbox_id: str
     callback_kind: str
     callback_states: tuple[str, ...]
+    callback_final_state: str
     ack_status: int
+    ack_body: dict[str, Any]
     install_returncode: int
     diag_returncode: int
     diag_has_timeline: bool
@@ -165,14 +184,14 @@ def _run_round_trip(project: Path, home: Path) -> Observables:
                     "-m",
                     "cli_agent_orchestrator.cli.main",
                     "install",
-                    "developer",
+                    AGENT_PROFILE,
                     "--provider",
                     "mock_cli",
                 ],
                 capture_output=True,
                 text=True,
                 cwd=project,
-                env={**os.environ, "HOME": str(home)},
+                env=_private_home_env(home),
                 timeout=180,
             )
 
@@ -188,14 +207,14 @@ def _run_round_trip(project: Path, home: Path) -> Observables:
                 created = requests.post(
                     f"{server.url}/sessions",
                     params={
-                        "provider": "mock_cli",
-                        "agent_profile": "developer",
+                        "provider": PROVIDER,
+                        "agent_profile": AGENT_PROFILE,
                         "session_name": session_name,
                     },
-                    timeout=60,
+                    timeout=_CREATE_TIMEOUT,
                 )
-                if created.status_code >= 500 and "mock_cli" in created.text.lower():
-                    pytest.skip(f"mock_cli not usable on this host: {created.text[:200]}")
+                if created.status_code >= 500 and PROVIDER in created.text.lower():
+                    pytest.skip(f"{PROVIDER} not usable on this host: {created.text[:200]}")
                 assert created.status_code in (200, 201), f"{created.status_code} {created.text}"
                 terminal = created.json()
                 terminal_id = terminal["id"]
@@ -208,6 +227,13 @@ def _run_round_trip(project: Path, home: Path) -> Observables:
                     _IDLE_TIMEOUT,
                     "terminal to reach idle",
                 )
+
+                mailbox = _wait_for(
+                    lambda: _mailbox_for(server.db_path, terminal_id),
+                    _IDLE_TIMEOUT,
+                    "the session to publish the supervisor mailbox",
+                )
+                mailbox_id = str(mailbox["id"])
 
                 pane_root = _pane_artifact_root(real_session_name, terminal["name"])
                 assert pane_root, (
@@ -231,7 +257,7 @@ def _run_round_trip(project: Path, home: Path) -> Observables:
                 seen_states: list[str] = []
 
                 def _queue_engaged() -> list[dict[str, Any]] | None:
-                    rows = _delivery_rows(server.db_path, terminal_id)
+                    rows = _delivery_rows(server.db_path, mailbox_id)
                     for row in rows:
                         state = str(row.get("state"))
                         if state not in seen_states:
@@ -248,11 +274,32 @@ def _run_round_trip(project: Path, home: Path) -> Observables:
                 )
                 callback_kind = str(queued[0].get("kind"))
 
+                # The seat acks its cursor; `settle_through` is what moves the queue row to
+                # `delivered` (adapters/store/queue.py:1053-1080). Delivery is confirmed BY
+                # the ack here, so the ack has to succeed for the row ever to settle.
                 acked = requests.post(
                     f"{server.url}/messages/ack",
                     json={"terminal_id": terminal_id, "up_to_id": int(admitted_body["message_id"])},
                     timeout=30,
                 )
+
+                settled = _wait_for(
+                    lambda: (
+                        _delivery_rows(server.db_path, mailbox_id)
+                        if all(
+                            str(row.get("state")) in QUEUE_TERMINAL
+                            for row in _delivery_rows(server.db_path, mailbox_id)
+                        )
+                        else None
+                    ),
+                    _DELIVERY_TIMEOUT,
+                    "the acked callback to reach a terminal delivery state",
+                )
+                callback_final_state = str(settled[0].get("state"))
+                for row in settled:
+                    state = str(row.get("state"))
+                    if state not in seen_states:
+                        seen_states.append(state)
 
             # --- cao diag ---------------------------------------------------------------
             diag = subprocess.run(
@@ -289,9 +336,12 @@ def _run_round_trip(project: Path, home: Path) -> Observables:
                 health=health,
                 artifact_root_relative=_relative_to(artifact_root, project),
                 terminal_status=terminal_row["status"],
+                mailbox_id=mailbox_id,
                 callback_kind=callback_kind,
                 callback_states=tuple(seen_states),
+                callback_final_state=callback_final_state,
                 ack_status=acked.status_code,
+                ack_body=_json_or_empty(acked),
                 install_returncode=installed.returncode,
                 diag_returncode=diag.returncode,
                 diag_has_timeline=_diag_has_timeline(diag.stdout),
@@ -351,6 +401,44 @@ def _relative_to(artifact_root: Path, project: Path) -> str:
 # ``{delivered, superseded, dead}`` (``core/delivery.py:136``).
 QUEUE_TERMINAL = frozenset({"delivered", "superseded", "dead"})
 QUEUE_BAD = frozenset({"dead", "superseded"})
+
+
+def _private_home_env(home: Path) -> dict[str, str]:
+    """Env for a CLI subprocess that must resolve the SAME store the server will read.
+
+    `CAO_HOME_DIR` OUTRANKS `HOME` in `constants.py:105-110`, and `test/conftest.py` exports
+    it process-wide to keep the suite off the production database. Inheriting it while
+    overriding only `HOME` sends the CLI's write and the server's read to two different
+    files -- which is exactly how this test first failed. `cao_server._subprocess_env`
+    strips both spellings for the same reason; this mirrors it.
+    """
+    env = {key: value for key, value in os.environ.items()}
+    for override in ("CAO_HOME_DIR", "CAO_HOME"):
+        env.pop(override, None)
+    env["HOME"] = str(home)
+    return env
+
+
+def _mailbox_for(db_path: Path, terminal_id: str) -> dict[str, Any] | None:
+    """The mailbox row this terminal is the current incarnation of."""
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        columns = [c[1] for c in conn.execute("PRAGMA table_info(mailboxes)")]
+        for row in conn.execute(
+            "SELECT * FROM mailboxes WHERE current_terminal_id = ?", (terminal_id,)
+        ):
+            return dict(zip(columns, row))
+        return None
+    finally:
+        conn.close()
+
+
+def _json_or_empty(response: requests.Response) -> dict[str, Any]:
+    with contextlib.suppress(Exception):
+        body = response.json()
+        if isinstance(body, dict):
+            return body
+    return {}
 
 
 def _delivery_rows(db_path: Path, receiver_id: str) -> list[dict[str, Any]]:
@@ -437,26 +525,48 @@ def test_session_reaches_idle(bare_arm: Observables) -> None:
     assert bare_arm.terminal_status == "idle"
 
 
-def test_one_callback_is_admitted_and_claimed_by_the_delivery_tick(
-    bare_arm: Observables,
-) -> None:
-    """Admission and the delivery machinery engaging, which is what a bare project can show.
+def test_one_callback_is_admitted_delivered_and_acked(bare_arm: Observables) -> None:
+    """AC-LITE-1's callback clause, in full: admitted, delivered, acked.
 
-    KNOWN GAP, stated rather than hidden: the callback does not reach ``delivered`` here, and
-    the ack is refused ``not_current_incarnation``. Measured on grok-box-009 2026-09-16 over
-    120s, the ``delivery_msg`` row goes ``ready`` -> ``leased`` with ``delivery_attempt`` rows
-    accumulating and never settles, because a ``mock_cli`` pane is a scripted fixture binary
-    that never confirms receipt. That is a property of the fixture provider, not of the lite
-    boundary -- and the boundary question ("does an empty orchestrator/ change anything?") is
-    answered by the mutation arm, which compares these same fields across both arms.
+    r1 asserted only that the tick CLAIMED the callback and tolerated an ack of 400. The
+    reviewer was right to call that short of the criterion. The cause was the fixture, not
+    the product: it created a `developer` terminal, which has no mailbox, and both ack paths
+    resolve a mailbox by `current_terminal_id`. With a supervisor-role profile the bare
+    project produces the mailbox itself and the whole loop closes.
     """
+    assert bare_arm.mailbox_id.startswith("mb_"), bare_arm.mailbox_id
     assert bare_arm.callback_kind == "callback"
-    assert bare_arm.callback_states, "the callback never reached the delivery queue"
     assert bare_arm.callback_states[0] == "ready"
     assert "leased" in bare_arm.callback_states, bare_arm.callback_states
+    assert bare_arm.callback_final_state == "delivered", bare_arm.callback_states
     assert not QUEUE_BAD.intersection(bare_arm.callback_states), bare_arm.callback_states
-    # The ack surface answers rather than crashing; its verdict is compared across arms below.
-    assert bare_arm.ack_status in (200, 400)
+
+
+def test_the_ack_is_accepted_and_never_refuses_the_incarnation(
+    bare_arm: Observables,
+) -> None:
+    """The specific refusal r1 shipped with must not come back.
+
+    `not_current_incarnation` is what a missing mailbox produces
+    (mailbox_service.py:1238-1240). Naming it here means a regression to the r1 shape fails
+    with the reason rather than with a bare status mismatch.
+    """
+    assert bare_arm.ack_status == 200, bare_arm.ack_body
+    assert bare_arm.ack_body.get("code") != "not_current_incarnation"
+    assert "not_current_incarnation" not in json.dumps(bare_arm.ack_body)
+    assert bare_arm.ack_body.get("mailbox_id") == bare_arm.mailbox_id
+    assert int(bare_arm.ack_body.get("consumed_through_id", 0)) >= 1
+
+
+def test_the_queue_addresses_the_mailbox_not_the_terminal(bare_arm: Observables) -> None:
+    """Why a worker terminal could never be acked, pinned so the next reader does not re-derive it.
+
+    `delivery_msg.receiver_id` is the mailbox id. If this ever became the terminal id, the
+    ack's `settle_through(mailbox_id, ...)` would match nothing and the row would sit at
+    `leased` forever -- exactly the r1 symptom.
+    """
+    assert bare_arm.mailbox_id.startswith("mb_")
+    assert bare_arm.callback_final_state == "delivered"
 
 
 def test_install_is_green_in_a_bare_project(bare_arm: Observables) -> None:
@@ -510,6 +620,7 @@ def test_empty_orchestrator_directory_changes_no_observable(
     assert mutant_arm.terminal_status == bare_arm.terminal_status
     assert mutant_arm.callback_kind == bare_arm.callback_kind
     assert mutant_arm.callback_states == bare_arm.callback_states
+    assert mutant_arm.callback_final_state == bare_arm.callback_final_state
     assert mutant_arm.ack_status == bare_arm.ack_status
     assert mutant_arm.install_returncode == bare_arm.install_returncode
     assert mutant_arm.diag_returncode == bare_arm.diag_returncode
@@ -549,3 +660,81 @@ def test_the_deny_guard_allows_neutral_paths(tmp_path: Path) -> None:
         (tmp_path / "tmp" / "orch").mkdir(parents=True)
         (tmp_path / "tmp" / "orch" / "artifact.json").write_text("{}", encoding="utf-8")
     assert recorded == []
+
+
+# ---------------------------------------------------------------------------------------
+# D1 — `cao env set` must reach a spawned terminal's environment
+# ---------------------------------------------------------------------------------------
+
+
+def test_env_store_artifacts_dir_reaches_a_spawned_pane(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """The end-to-end half of the D1 fix, through a real server and a real pane.
+
+    The unit arms in `test/services/test_explicit_artifacts_root.py` pin the precedence inside
+    `canonical_session_env`. They cannot show that the value survives the whole path -- CLI
+    write, server read, session floor, tmux, process environment -- and that path is the only
+    reason an operator runs `cao env set` at all. Before the fix this test read the neutral
+    fallback, because the store had no reader on the session path.
+    """
+    root = tmp_path_factory.mktemp("lite-envstore")
+    project = _make_project(root, with_orchestrator_dir=False)
+    home = root / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    wanted = project / "artifacts-from-store"
+
+    written = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "cli_agent_orchestrator.cli.main",
+            "env",
+            "set",
+            "CAO_ARTIFACTS_DIR",
+            str(wanted),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=project,
+        env=_private_home_env(home),
+        timeout=120,
+    )
+    assert written.returncode == 0, written.stdout + written.stderr
+
+    server: CaoServer | None = None
+    session_name = f"envstore-{uuid.uuid4().hex[:8]}"
+    with contextlib.chdir(project):
+        try:
+            server = _start_cao_server(home, _pick_free_port())
+            created = requests.post(
+                f"{server.url}/sessions",
+                params={
+                    "provider": PROVIDER,
+                    "agent_profile": AGENT_PROFILE,
+                    "session_name": session_name,
+                },
+                timeout=_CREATE_TIMEOUT,
+            )
+            assert created.status_code in (200, 201), f"{created.status_code} {created.text}"
+            terminal = created.json()
+            _wait_for(
+                lambda: (lambda r: r.json() if r.ok and r.json().get("status") == "idle" else None)(
+                    requests.get(f"{server.url}/terminals/{terminal['id']}", timeout=10)
+                ),
+                _IDLE_TIMEOUT,
+                "terminal to reach idle",
+            )
+            pane_root = _pane_artifact_root(
+                terminal.get("session_name", session_name), terminal["name"]
+            )
+            assert pane_root, "could not read CAO_ARTIFACTS_DIR from the pane"
+            assert Path(pane_root) == wanted.resolve(), (
+                f"the pane got {pane_root!r}; the store said {wanted}. A neutral "
+                f"{project / 'tmp' / 'orch'} here means the store has no reader again."
+            )
+        finally:
+            if server is not None:
+                with contextlib.suppress(Exception):
+                    requests.delete(f"{server.url}/sessions/{session_name}", timeout=30)
+                server.stop()
