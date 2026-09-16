@@ -14,7 +14,6 @@ from cli_agent_orchestrator.services.fold_service import (
     P9Report,
     P10Report,
     RepoMapping,
-    check_corpus,
     check_file,
     fold_file,
     parse_hunks_document,
@@ -140,7 +139,8 @@ def _flag_hunk(
 @click.option(
     "--corpus",
     is_flag=True,
-    help="Check the pinned bridge Markdown corpus from the current directory.",
+    hidden=True,
+    help="Moved to `cao-orchestrator fold-corpus`.",
 )
 @click.option(
     "--repo",
@@ -166,44 +166,14 @@ def fold(
         )
         repos = _repo_mappings(repo_specs)
         if corpus:
-            if not check_only:
-                raise click.UsageError("--corpus requires --check")
-            if file is not None:
-                raise click.UsageError("--corpus does not accept a FILE operand")
-            if flag_present:
-                raise click.UsageError("--check is mutually exclusive with an edit spec")
-            corpus_result = check_corpus(Path.cwd(), repos)
-            click.echo("skipped: P1, P2, P3 (no edit span under --check)")
-            if corpus_result.violations:
-                for violation in corpus_result.violations:
-                    click.echo(violation)
-            else:
-                click.echo("P5/P6: no violations")
-            p9_lines = [
-                line for report in corpus_result.p9_reports for line in report.render_lines()
-            ]
-            p9_lines.extend(corpus_result.p9_unused_mapping_lines)
-            if p9_lines:
-                for line in p9_lines:
-                    click.echo(line)
-            else:
-                click.echo("P9: no violations")
-            for line in corpus_result.p9_summary_lines:
-                click.echo(line)
-            p10_lines = [
-                line for report in corpus_result.p10_reports for line in report.render_lines()
-            ]
-            if p10_lines:
-                for line in p10_lines:
-                    click.echo(line)
-            else:
-                click.echo("P10: no violations")
-            for line in corpus_result.p10_summary_lines:
-                click.echo(line)
-            return
+            # Corpus discovery is skill knowledge (it globs orchestrator/ and
+            # doctrine/), so it left base with the rest of the seam — A.4.
+            raise click.UsageError(
+                "moved: run `cao-orchestrator fold-corpus` (orchestrator skill command)"
+            )
 
         if file is None:
-            raise click.UsageError("FILE is required unless --corpus is used")
+            raise click.UsageError("FILE is required")
         if check_only:
             if flag_present:
                 raise click.UsageError("--check is mutually exclusive with an edit spec")

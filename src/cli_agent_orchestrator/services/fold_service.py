@@ -440,43 +440,6 @@ def check_file(path: Path, repos: Sequence[RepoMapping] = ()) -> FoldResult:
     )
 
 
-def check_corpus(root: Path, repos: Sequence[RepoMapping] = ()) -> FoldCorpusResult:
-    """Run file-global checks over the pinned bridge-document corpus."""
-    paths = _p10_corpus_paths(root)
-    if not paths:
-        raise FoldUsageError(
-            f"{root}: corpus is empty; expected orchestrator/blueprints/ (or blueprints/), "
-            "doctrine/, and orchestrator/GOLDEN-TIPS.md (or GOLDEN-TIPS.md)"
-        )
-    violations: list[str] = []
-    p9_reports: list[P9Report] = []
-    reports: list[P10Report] = []
-    for path in paths:
-        data = _read_markdown(path)
-        structure = _parse_structure(data)
-        violations.extend(violation.message for violation in structure.violations)
-        p9_reports.append(_analyze_p9(data, path.relative_to(root.resolve()).as_posix(), repos))
-        reports.append(_analyze_p10(data, path.relative_to(root.resolve()).as_posix()))
-    used_mappings = set().union(*(report.used_mappings for report in p9_reports))
-    unused = tuple(mapping for mapping in repos if mapping.name not in used_mappings)
-    return FoldCorpusResult(tuple(violations), tuple(p9_reports), unused, tuple(reports))
-
-
-def _p10_corpus_paths(root: Path) -> tuple[Path, ...]:
-    # Prefer orchestrator/ sub-layout, fall back to legacy root locations.
-    bp_dir = root / "orchestrator" / "blueprints"
-    if not bp_dir.is_dir():
-        bp_dir = root / "blueprints"
-    candidates = list(bp_dir.glob("*.md")) if bp_dir.is_dir() else []
-    candidates.extend((root / "doctrine").rglob("*.md"))
-    tips = root / "orchestrator" / "GOLDEN-TIPS.md"
-    if not tips.is_file():
-        tips = root / "GOLDEN-TIPS.md"
-    if tips.is_file():
-        candidates.append(tips)
-    return tuple(sorted({path.resolve() for path in candidates}, key=lambda path: str(path)))
-
-
 def _analyze_p9(data: bytes, display_path: str, repos: Sequence[RepoMapping]) -> P9Report:
     text = data.decode("utf-8")
     citations = _p9_citations(text)

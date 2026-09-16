@@ -85,19 +85,17 @@ def _atomic_copy(src: Path, dst: Path) -> None:
 
 
 def _sync_composition_stores(workspace_root: Path) -> None:
-    """Mirror install.sh's F497 D3/D9 step: positions/, overlays/, routing.toml.
+    """Mirror install.sh's F497 D3/D9 step for the neutral stores: positions/, overlays/.
 
     Without this, ``cao redeploy`` reinstalled profiles against a STALE store
     (a new ``[budget]`` row or clause fragment in the repo never reached
     ``agent-store/positions``), so every composition-bearing profile failed the
     F497 lint on redeploy while ``./install.sh`` succeeded (2026-09-11).
+
+    ``orchestrator/routing.toml`` is skill-owned content and is no longer synced
+    here; it moved to ``cao-orchestrator sync-routing`` (wp-arch-modular-core A.4).
     """
-    from cli_agent_orchestrator.constants import (
-        local_agent_store_dir,
-        overlays_store_dir,
-        positions_store_dir,
-        routing_toml_path,
-    )
+    from cli_agent_orchestrator.constants import overlays_store_dir, positions_store_dir
 
     for sub, store_dir in (
         ("positions", positions_store_dir()),
@@ -114,10 +112,6 @@ def _sync_composition_stores(workspace_root: Path) -> None:
         clauses = src_dir / "_clauses.toml"
         if clauses.is_file():
             _atomic_copy(clauses, store_dir / clauses.name)
-    routing = workspace_root / "orchestrator" / "routing.toml"
-    if routing.is_file():
-        local_agent_store_dir().mkdir(parents=True, exist_ok=True)
-        _atomic_copy(routing, routing_toml_path())
 
 
 def _install_redeploy(source_root: Path, *, force_providers: bool = False) -> None:

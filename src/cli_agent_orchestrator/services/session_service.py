@@ -60,26 +60,59 @@ SESSION_TEARDOWN_VERIFY_DELAY_SECONDS = 0.2
 ARTIFACTS_DIR_ENV = "CAO_ARTIFACTS_DIR"
 
 
+def _managed_artifacts_dir() -> str | None:
+    """``CAO_ARTIFACTS_DIR`` from the managed env store, or None.
+
+    ONE key is read, never the whole store. ``cao env set`` writes a general-purpose file
+    (``~/.aws/cli-agent-orchestrator/.env``) that operators already use for unrelated values
+    such as ``API_TOKEN``; splatting it into every session's environment would turn a
+    substitution store into a process-environment injector. Only the key this function is
+    responsible for is consulted.
+    """
+    from cli_agent_orchestrator.utils.env import load_env_vars
+
+    value = load_env_vars().get(ARTIFACTS_DIR_ENV)
+    return value if value else None
+
+
 def canonical_session_env(
     working_directory: str | None,
     env_vars: dict[str, str] | None,
 ) -> dict[str, str]:
-    """Return the session floor with one absolute, immutable artifact root."""
+    """Return the session floor with one absolute, immutable artifact root.
+
+    Precedence, highest first (D1, 2026-09-16):
+
+    1. an explicit ``CAO_ARTIFACTS_DIR`` in ``env_vars`` — ``cao launch --env`` or
+       ``POST /sessions`` — so a per-launch override always wins;
+    2. the managed env store, which is what ``cao env set CAO_ARTIFACTS_DIR <abs>`` writes;
+    3. ``<working_directory>/tmp/orch``.
+
+    Step 2 is the defect fix. ``cao env set`` wrote a file that no code on the session path
+    ever read, so the documented persistent setter was inert and a project that relied on it
+    silently got the fallback instead. Nothing documents the store as exclusive to
+    ``${VAR}`` profile substitution; that is one use of it, not its charter.
+
+    There is still no directory sniffing at any level: the presence of a skill-owned
+    directory must not change where artifacts land (wp-arch-modular-core A.5 / AC-LITE-4).
+    """
     result = dict(env_vars or {})
     override = result.get(ARTIFACTS_DIR_ENV)
+    source = "env_vars"
+    if override is None:
+        override = _managed_artifacts_dir()
+        source = "env store"
     if override is not None:
         if not override or not Path(override).is_absolute():
+            # The store gets the SAME validation as --env. A relative value there is a
+            # misconfiguration to report, not something to silently resolve against cwd.
             raise ValueError(
-                "artifacts_dir_not_absolute: CAO_ARTIFACTS_DIR must be an absolute path"
+                "artifacts_dir_not_absolute: CAO_ARTIFACTS_DIR must be an absolute path "
+                f"(from {source})"
             )
         artifact_root = Path(override).resolve()
     else:
-        base = Path(working_directory or os.getcwd()).resolve()
-        orch_sub = base / "orchestrator"
-        if orch_sub.is_dir():
-            artifact_root = orch_sub / "tmp" / "orch"
-        else:
-            artifact_root = base / "tmp" / "orch"
+        artifact_root = Path(working_directory or os.getcwd()).resolve() / "tmp" / "orch"
     result[ARTIFACTS_DIR_ENV] = str(artifact_root)
     return result
 

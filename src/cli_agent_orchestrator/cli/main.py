@@ -81,6 +81,8 @@ cli.add_command(mailbox)
 cli.add_command(fold)
 cli.add_command(suite)
 cli.add_command(verify)
+# Hidden stub only: the real `ledger` moved to `cao-orchestrator`
+# (wp-arch-modular-core A.4 — it reads orchestrator/HANDOFF.md).
 cli.add_command(ledger)
 # WP-ARCH phase 1 (F725 #581), AC11 hook point 4 — the only line this file gains.
 cli.add_command(diag)
