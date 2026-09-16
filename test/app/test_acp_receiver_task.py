@@ -31,11 +31,11 @@ from cli_agent_orchestrator.app.acp.receiver_task import (
 )
 from cli_agent_orchestrator.core.interrupt import (
     ActiveTurnHandle,
-    CancelWindow,
     CallerPrincipal,
     CancelHandle,
     CancelRaceLost,
     CancelSettlement,
+    CancelWindow,
     InterruptAdmission,
     InterruptFence,
     InterruptPhase,

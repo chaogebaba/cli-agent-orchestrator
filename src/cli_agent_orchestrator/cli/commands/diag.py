@@ -106,6 +106,21 @@ def _sources(db_path: str | None) -> DiagSources:
     return build_readonly_diag_stores(db_path)
 
 
+def _queue_db_path() -> str | None:
+    """Where the delivery queue lives, or ``None`` to fall back.
+
+    The interrupt fold reads the QUEUE's database — D6b(3) puts the state row,
+    the queue row and the journal in one file precisely so a transition can span
+    them — so this must not guess at the legacy path.
+    """
+    try:
+        from cli_agent_orchestrator.bootstrap import _default_db_path
+
+        return str(_default_db_path())
+    except Exception:  # noqa: BLE001 — a diag read may not fail on a config lookup
+        return None
+
+
 def _emit(payload: Any, text: str, as_json: bool) -> None:
     click.echo(json.dumps(payload, indent=2, default=str) if as_json else text)
 
@@ -209,6 +224,37 @@ def diag_msg(msg_id: str, db_path: str | None, as_json: bool) -> None:
         render_message(sources, msg_id, now=now, ingest_on=ingest_on),
         as_json,
     )
+
+
+@diag.command("interrupt")
+@click.argument("interrupt_id")
+@click.option("--db", "db_path", default=None, help="Database path (defaults to the server's).")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
+def diag_interrupt(interrupt_id: str, db_path: str | None, as_json: bool) -> None:
+    """Fold one interrupt end to end: principal, terminal, cut, cancelled turn, phase.
+
+    D15/AC-S1.23. The interrupt id IS the callback id — there is no second
+    identifier — so this takes the id the caller already holds.
+
+    It reads the queue row, the dead-letter reason, the typed attempt detail and
+    the live phase row, and it does NOT read the frame log: the frames are the
+    adapter's evidence for what the wire did, and a diagnosis that needed them
+    could not answer after a restart, when the subprocess and its stream are gone.
+    """
+    import sqlite3
+    from dataclasses import asdict
+
+    from cli_agent_orchestrator.app.diag.interrupt_fold import fold_interrupt, render_interrupt
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    path = db_path or str(_queue_db_path() or DATABASE_FILE)
+    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        fold = fold_interrupt(connection, interrupt_id)
+    finally:
+        connection.close()
+    _emit(asdict(fold), render_interrupt(fold), as_json)
 
 
 @diag.command("why")
