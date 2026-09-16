@@ -269,6 +269,9 @@ def test_legacy_other_is_the_only_retired_attempt_outcome() -> None:
         # value that appears without a reader deciding what it means fails here
         # rather than in production.
         AttemptOutcome.SUBMISSION_UNCERTAIN,
+        # WP-ACP-PLANE S1's one addition (entry audit F1: this WP adds
+        # ACP_BUSY_RETRY only; WP-HERDR H2 owns SUBMISSION_UNCERTAIN).
+        AttemptOutcome.ACP_BUSY_RETRY,
     }
 
 
@@ -499,6 +502,20 @@ def test_the_three_closed_sets_partition_the_live_vocabulary() -> None:
     }
     assert NON_DELIVERY_OUTCOMES <= live_vocabulary
     assert ATTEMPT_BUDGET_OUTCOMES <= NON_DELIVERY_OUTCOMES
+def test_an_acp_busy_row_keeps_its_lease_and_spends_no_attempt() -> None:
+    """AC-S1.3's accounting, as the two set memberships that produce it.
+
+    The fails-if is "the attempt budget is burned" while an agent is merely
+    mid-turn.  Both halves matter and they are different sets: membership in
+    ``NON_DELIVERY_OUTCOMES`` is what keeps the lease, so ``reclaim`` can see
+    the row at all (#604's silent seat was the opposite), and absence from
+    ``ATTEMPT_BUDGET_OUTCOMES`` is what stops a 325-second budget from
+    dead-lettering a message to a healthy worker whose turn is simply longer
+    than that.
+    """
+    assert AttemptOutcome.ACP_BUSY_RETRY in NON_DELIVERY_OUTCOMES
+    assert AttemptOutcome.ACP_BUSY_RETRY not in ATTEMPT_BUDGET_OUTCOMES
+    assert not spends_attempt(AttemptOutcome.ACP_BUSY_RETRY)
 
 
 # ------------------------------------------------------------- the sender rule

@@ -13,6 +13,7 @@ from typing import Any
 from cli_agent_orchestrator.adapters.truth import legacy_egress as _wt_legacy_egress
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import list_terminals_by_session
+from cli_agent_orchestrator.core.transport import is_pane_terminal
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.utils.provider_plane import provider_home
@@ -424,9 +425,14 @@ def build_fleet(session_name: str) -> dict[str, Any]:
     for row in sorted(rows, key=lambda item: item["id"]):
         parent_id = row.get("caller_id")
         parent = by_id.get(parent_id) if parent_id else None
+        # WP-ACP-PLANE D20/AC-S1.10: the pane inventory is evidence about PANE
+        # terminals only.  An ACP parent has no window in it by construction, so
+        # testing its (NULL) coordinate against the inventory would orphan every
+        # child of an ACP seat.  The branch is on `transport`, never on NULL.
         parent_dead = bool(
             parent
             and has_native_inventory
+            and is_pane_terminal(parent)
             and parent["tmux_window"] not in windows
             and parent.get("recovery_state") != "fallback_ready"
         )
@@ -452,7 +458,18 @@ def build_fleet(session_name: str) -> dict[str, Any]:
         # teardown state as an additive sibling key (`teardown`, mirroring
         # `delegating`/`fusion_changed`) so the TUI can render `reaping`.
         in_teardown = row["id"] in teardown_scope_keys or (session_name in teardown_scope_keys)
-        if has_native_inventory and row["tmux_window"] not in windows and not in_teardown:
+        # WP-ACP-PLANE D20/AC-S1.10: `window_absent` is the pane plane's own
+        # liveness signal and means nothing on an ACP terminal, which never had a
+        # window to be absent.  Without this branch a healthy ACP seat renders
+        # ERROR from the instant it is created — AC-S1.10's named failure.  The
+        # ACP plane's liveness is a protocol fact (D19), delivered through the
+        # ordinary condition path, not inferred from a pane listing.
+        if (
+            has_native_inventory
+            and is_pane_terminal(row)
+            and row["tmux_window"] not in windows
+            and not in_teardown
+        ):
             status = TerminalStatus.ERROR
             _wt_legacy_egress.record_fleet_override(  # WP-ARCH F725 #581 hook 2b
                 row["id"], "window_absent", str(row["tmux_window"])

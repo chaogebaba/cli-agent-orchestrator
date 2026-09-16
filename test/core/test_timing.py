@@ -169,3 +169,116 @@ def test_herdr_s_gate_is_the_number_herdr_documents() -> None:
     Pinned here so a herdr bump that moves it cannot pass silently.
     """
     assert timing.HERDR_SUBMISSION_GATE_MS == 5000
+# ------------------------------------------ WP-ACP-PLANE S1: the nine frozen
+# literals (AC-S1.24) and the interrupt orderings, with one named mutant per
+# ordering.  The mutants are the point: an ordering nobody can break is
+# documentation, and r4's blocker on AC-S1.17 was exactly an assertion that
+# could not fail.
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        # AC-S1.24's nine, FROZEN 2026-09-16 against s0-round2.md.  Written out
+        # here so a retune has to edit a test that names the freeze, not just a
+        # constant.  "A constant is changed after the AC that uses it was
+        # signed" is AC-S1.24's fails-if, and this is the tripwire for it.
+        ("INTERRUPT_MIN_GAP_S", 30),
+        ("INTERRUPT_BUDGET_N", 5),
+        ("INTERRUPT_BUDGET_WINDOW_S", 600),
+        ("INTERRUPT_MAX_LATENCY_S", 10),
+        ("ACP_CANCEL_SETTLE_S", 20),
+        ("RECOVERY_DEADLINE_S", 120),
+        ("CANCEL_HOLD_MARGIN_S", 15),
+        ("ACP_WRITE_SETTLE_S", 1),
+        ("ACP_KILL_GRACE_S", 3),
+    ],
+)
+def test_the_nine_frozen_interrupt_literals(name: str, value: int) -> None:
+    assert getattr(timing, name) == value
+
+
+def test_exactly_nine_literals_were_frozen() -> None:
+    """AC-S1.24 says NINE.  A tenth added without a freeze is the drift."""
+    frozen = {
+        "INTERRUPT_MIN_GAP_S",
+        "INTERRUPT_BUDGET_N",
+        "INTERRUPT_BUDGET_WINDOW_S",
+        "INTERRUPT_MAX_LATENCY_S",
+        "ACP_CANCEL_SETTLE_S",
+        "RECOVERY_DEADLINE_S",
+        "CANCEL_HOLD_MARGIN_S",
+        "ACP_WRITE_SETTLE_S",
+        "ACP_KILL_GRACE_S",
+    }
+    assert len(frozen) == 9
+    assert frozen <= set(timing.__all__)
+
+
+def test_the_interrupt_orderings_hold() -> None:
+    timing.check_delivery_orderings()
+
+
+# Each row is (label, constant, replacement) — the replacement is the SMALLEST
+# change that violates that one ordering, so a mutant cannot pass by tripping a
+# neighbouring check first.
+_ORDERING_MUTANTS = [
+    # AC-S1.17 (1): move the legacy stall age without moving the credit.
+    ("I4-credit", "IDLE_STALL_AGE_S", 1801),
+    # AC-S1.17 (1) again, from the other side: a MAX_LIFETIME move.
+    ("I4-credit", "DELIVERY_MAX_LIFETIME_S", 1699),
+    # AC-S1.17 (2): a zero margin satisfies the equality and still ties.
+    ("I4-margin", "BUSY_CREDIT_MARGIN_S", 0),
+    ("I4-cap", "BUSY_CREDIT_CAP_S", 0),
+    # AC-S1.24's seven.
+    ("U1", "INTERRUPT_MAX_LATENCY_S", 21),
+    ("U2", "ACP_CANCEL_SETTLE_S", 60),
+    ("U3", "CANCEL_HOLD_MARGIN_S", 40),
+    ("U4", "INTERRUPT_MIN_GAP_S", 29),
+    ("U5", "INTERRUPT_BUDGET_WINDOW_S", 149),
+    ("U6", "ACP_WRITE_SETTLE_S", 10),
+    ("U7", "ACP_KILL_GRACE_S", 110),
+]
+
+
+@pytest.mark.parametrize(("label", "name", "bad"), _ORDERING_MUTANTS)
+def test_each_interrupt_ordering_has_a_mutant_that_reddens_it(
+    monkeypatch: pytest.MonkeyPatch, label: str, name: str, bad: int
+) -> None:
+    """One mutant per ordering, each naming the ordering it breaks.
+
+    ``I4-credit`` carries two rows because the equality is violable from either
+    side, and the derived form r4 rejected was violable from neither.
+    """
+    monkeypatch.setattr(timing, name, bad)
+    with pytest.raises(ValueError, match=label):
+        timing.check_delivery_orderings()
+
+
+def test_i4_credit_equality_is_not_a_tautology() -> None:
+    """The r4 blocker, as a test: the clause must be over LITERALS.
+
+    A derived cap — ``BUSY_CREDIT_CAP_S = IDLE_STALL_AGE_S -
+    DELIVERY_MAX_LIFETIME_S - BUSY_CREDIT_MARGIN_S`` — would make the equality
+    hold for every value of every term, so this asserts the three terms are
+    genuinely independent module-level literals rather than one expression.
+    """
+    source = Path(timing.__file__).read_text()
+    tree = ast.parse(source)
+    literals = {
+        target.id: node.value.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+        if isinstance(node.value, ast.Constant)
+    }
+    for name in ("BUSY_CREDIT_CAP_S", "BUSY_CREDIT_MARGIN_S", "DELIVERY_MAX_LIFETIME_S",
+                 "IDLE_STALL_AGE_S"):
+        assert name in literals, f"{name} must be a plain literal, not a derived expression"
+    assert (
+        literals["DELIVERY_MAX_LIFETIME_S"]
+        + literals["BUSY_CREDIT_CAP_S"]
+        + literals["BUSY_CREDIT_MARGIN_S"]
+        == literals["IDLE_STALL_AGE_S"]
+    )
