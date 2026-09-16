@@ -934,7 +934,7 @@ async def test_agent_prompt_stalled_is_an_uncertain_submission(socket_path: str)
         client = HerdrClient(socket_path)
         result = await client.prompt_agent(target="%3", text="hello")
         assert result.outcome is AttemptOutcome.SUBMISSION_UNCERTAIN
-        assert result.detail == HERDR_AGENT_PROMPT_STALLED
+        assert result.detail == "herdr:" + HERDR_AGENT_PROMPT_STALLED
         assert len(_prompts(server)) == 1
 
 
@@ -980,7 +980,7 @@ async def test_agent_blocked_is_a_dialog_veto_and_sends_no_second_prompt(
         client = HerdrClient(socket_path)
         result = await client.prompt_agent(target="%3", text="hello")
         assert result.outcome is AttemptOutcome.VETO_DIALOG
-        assert result.detail == HERDR_AGENT_BLOCKED
+        assert result.detail == "herdr:" + HERDR_AGENT_BLOCKED
         assert len(_prompts(server)) == 1
         assert result.outcome not in {
             AttemptOutcome.DELIVERED,
@@ -993,7 +993,7 @@ async def test_a_transport_failure_before_the_flush_is_retryable(socket_path: st
     client = HerdrClient(socket_path + "-absent")
     result = await client.prompt_agent(target="%3", text="hello")
     assert result.outcome is AttemptOutcome.VETO_UNVERIFIED
-    assert result.detail == "herdr_transport_before_submit"
+    assert result.detail == "herdr:transport_before_submit"
 
 
 async def test_a_transport_failure_after_the_flush_is_uncertain(socket_path: str) -> None:
@@ -1012,7 +1012,7 @@ async def test_a_transport_failure_after_the_flush_is_uncertain(socket_path: str
         client = HerdrClient(socket_path)
         result = await client.prompt_agent(target="%3", text="hello")
         assert result.outcome is AttemptOutcome.SUBMISSION_UNCERTAIN
-        assert result.detail == "herdr_transport_after_submit"
+        assert result.detail == "herdr:transport_after_submit"
         assert len(_prompts(server)) == 1
 
 
@@ -1036,7 +1036,7 @@ async def test_an_unmapped_error_code_dies_on_the_attempt_budget(socket_path: st
         client = HerdrClient(socket_path)
         result = await client.prompt_agent(target="nope", text="hello")
         assert result.outcome is AttemptOutcome.VETO_UNVERIFIED
-        assert result.detail == "herdr_error:no_such_agent"
+        assert result.detail == "herdr:error:no_such_agent"
 
 
 async def test_an_unexpected_success_shape_is_not_read_as_delivered(socket_path: str) -> None:
@@ -1056,7 +1056,7 @@ async def test_an_unexpected_success_shape_is_not_read_as_delivered(socket_path:
         client = HerdrClient(socket_path)
         result = await client.prompt_agent(target="%3", text="hello")
         assert result.outcome is AttemptOutcome.VETO_UNVERIFIED
-        assert result.detail.startswith("herdr_unexpected_result:")
+        assert result.detail.startswith("herdr:unexpected_result:")
 
 
 async def test_the_prompt_never_shares_the_streaming_connection(socket_path: str) -> None:
@@ -1166,7 +1166,7 @@ async def test_a_success_from_an_already_working_agent_is_uncertain(socket_path:
         client = HerdrClient(socket_path)
         result = await client.prompt_agent(target="%3", text="hello")
         assert result.outcome is AttemptOutcome.SUBMISSION_UNCERTAIN
-        assert result.detail == "submitted_while_working"
+        assert result.detail == "herdr:submitted_while_working"
         # It still SUBMITTED — the text is with the runtime, which is exactly
         # why the row may not simply be re-offered.
         assert len(_prompts(server)) == 1
@@ -1186,7 +1186,7 @@ async def test_a_success_from_a_blocked_agent_is_uncertain_too(socket_path: str)
         client = HerdrClient(socket_path)
         result = await client.prompt_agent(target="%3", text="hello")
         assert result.outcome is AttemptOutcome.SUBMISSION_UNCERTAIN
-        assert result.detail == "submitted_while_blocked"
+        assert result.detail == "herdr:submitted_while_blocked"
 
 
 async def test_a_success_whose_state_sequence_did_not_move_is_uncertain(
@@ -1209,7 +1209,7 @@ async def test_a_success_whose_state_sequence_did_not_move_is_uncertain(
         client = HerdrClient(socket_path)
         result = await client.prompt_agent(target="%3", text="hello")
         assert result.outcome is AttemptOutcome.SUBMISSION_UNCERTAIN
-        assert result.detail == "no_state_advance"
+        assert result.detail == "herdr:no_state_advance"
 
 
 async def test_a_success_from_idle_with_an_advanced_sequence_is_delivered(
@@ -1246,7 +1246,7 @@ async def test_an_unreadable_pre_state_is_not_a_delivery(socket_path: str) -> No
         client = HerdrClient(socket_path)
         result = await client.prompt_agent(target="%3", text="hello")
         assert result.outcome is AttemptOutcome.SUBMISSION_UNCERTAIN
-        assert result.detail == "no_pre_state"
+        assert result.detail == "herdr:no_pre_state"
 
 
 async def test_a_refusal_is_never_qualified(socket_path: str) -> None:
@@ -1288,4 +1288,4 @@ async def test_agent_not_found_is_a_pane_absent(socket_path: str) -> None:
         client = HerdrClient(socket_path)
         result = await client.prompt_agent(target="nope", text="hello")
         assert result.outcome is AttemptOutcome.PANE_ABSENT
-        assert result.detail == "agent_not_found"
+        assert result.detail == "herdr:agent_not_found"

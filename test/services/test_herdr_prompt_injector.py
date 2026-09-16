@@ -106,7 +106,7 @@ def test_an_unresolvable_pane_is_a_pane_absent(monkeypatch: pytest.MonkeyPatch) 
     )
     result = injector.inject(terminal_id="t-1", line="hello")
     assert result.outcome is AttemptOutcome.PANE_ABSENT
-    assert result.detail.startswith("herdr_no_target:")
+    assert result.detail.startswith("herdr:no_target:")
 
 
 # --------------------------------------------------- the happy projection
@@ -117,133 +117,79 @@ def test_a_delivered_submission_is_a_delivered_injection(wired) -> None:  # type
     injector = wired(client)
     result = injector.inject(terminal_id="t-1", line="digest")
     assert result.outcome is AttemptOutcome.DELIVERED
-    assert result.detail == "herdr:herdr:working"
+    # r1 wrote ``herdr:herdr:working`` — the client prefixes, and the injector
+    # prefixed again (review r1 §5).  One prefix, applied in the client only.
+    assert result.detail == "herdr:working"
     assert client.prompts == [("%3", "digest")]
 
 
-# -------------------------------------------- the no-second-submission rule
+# ------------------------------------------- the injector holds NO state now
 
 
-def test_an_uncertain_submission_blocks_the_next_one(wired) -> None:  # type: ignore[no-untyped-def]
-    """Blueprint §6, and the half ``NON_DELIVERY_OUTCOMES`` does NOT carry.
+def test_the_injector_keeps_nothing_between_injections(wired) -> None:  # type: ignore[no-untyped-def]
+    """r2: the no-second-submission rule moved to the store, per ID.
 
-    The queue retains the lease but nothing in the store stops a re-offer, so
-    the rule lives where the evidence lives.  An unmoved ``state_change_seq``
-    means the earlier text may still be sitting unconsumed in the composer, and
-    a second submission would concatenate onto it.
+    Review r1 §2 showed why it could not live here: this port is handed
+    ``(terminal_id, line)`` and never learns a ``msg_id``, the digest it submits
+    covers many ids at once, and r1's per-terminal marker cleared itself on the
+    very evidence that the first copy had LANDED.  Blueprint amendment (7) rules
+    the quarantine is per id and must hold through any path, so it belongs to
+    ``reclaim``.
+
+    Asserted as an absence, because an absence is what closes both wedges of
+    review r1 §4: no marker, no lock, no clearing condition, nothing to persist
+    and nothing a restart forgets.
+    """
+    injector = wired(FakeClient([]))
+    assert not [a for a in vars(injector) if not a.startswith("__")]
+    for name in ("_unresolved", "_blocked_by_unresolved", "_mark_unresolved", "_clear_unresolved"):
+        assert not hasattr(injector, name), f"{name} survived the r2 correction"
+
+
+def test_repeated_injections_each_submit_exactly_once(wired) -> None:  # type: ignore[no-untyped-def]
+    """The injector never suppresses a call; suppression is the store's job.
+
+    Stated so the division of labour is testable from this side too: whatever
+    the previous outcome was, an injection that reaches this class submits, and
+    the reason a duplicate cannot happen is that ``reclaim`` never offers the
+    row again.
     """
     client = FakeClient(
-        submissions=[
-            _submission(AttemptOutcome.SUBMISSION_UNCERTAIN, "submitted_while_working", 7)
-        ],
-        states=[_state(7)],
-    )
-    injector = wired(client)
-
-    first = injector.inject(terminal_id="t-1", line="one")
-    assert first.outcome is AttemptOutcome.SUBMISSION_UNCERTAIN
-
-    second = injector.inject(terminal_id="t-1", line="two")
-    assert second.outcome is AttemptOutcome.SUBMISSION_UNCERTAIN
-    assert second.detail == "herdr:unresolved_prior"
-    # The point of the rule: the SECOND text never went to the runtime.
-    assert client.prompts == [("%3", "one")]
-
-
-def test_an_advanced_state_sequence_releases_the_block(wired) -> None:  # type: ignore[no-untyped-def]
-    """The runtime observed the pane change, which resolves the question."""
-    client = FakeClient(
-        submissions=[
-            _submission(AttemptOutcome.SUBMISSION_UNCERTAIN, "agent_prompt_stalled", 7),
-            _submission(AttemptOutcome.DELIVERED, "herdr:working", 12),
-        ],
-        states=[_state(11)],
-    )
-    injector = wired(client)
-    injector.inject(terminal_id="t-1", line="one")
-    second = injector.inject(terminal_id="t-1", line="two")
-    assert second.outcome is AttemptOutcome.DELIVERED
-    assert client.prompts == [("%3", "one"), ("%3", "two")]
-
-
-def test_an_unreadable_state_keeps_the_block(wired) -> None:  # type: ignore[no-untyped-def]
-    """No evidence is not evidence of resolution, so it is not treated as one."""
-    client = FakeClient(
-        submissions=[_submission(AttemptOutcome.SUBMISSION_UNCERTAIN, "no_pre_state", 3)],
-        states=[None],
-    )
-    injector = wired(client)
-    injector.inject(terminal_id="t-1", line="one")
-    second = injector.inject(terminal_id="t-1", line="two")
-    assert second.outcome is AttemptOutcome.SUBMISSION_UNCERTAIN
-    assert second.detail == "herdr:unresolved_unreadable"
-    assert client.prompts == [("%3", "one")]
-
-
-def test_a_resolved_submission_leaves_no_marker(wired) -> None:  # type: ignore[no-untyped-def]
-    """A delivery, a veto and a pane-absent all CLEAR the block.
-
-    Only an uncertain submission leaves text whose fate is unknown; every other
-    outcome is a settled fact, and a marker that outlived one would wedge the
-    terminal's deliveries behind a question nobody was asking.
-    """
-    client = FakeClient(
-        submissions=[
-            _submission(AttemptOutcome.SUBMISSION_UNCERTAIN, "no_state_advance", 2),
+        [
+            _submission(AttemptOutcome.SUBMISSION_UNCERTAIN, "herdr:agent_prompt_stalled"),
             _submission(AttemptOutcome.DELIVERED, "herdr:working", 9),
-            _submission(AttemptOutcome.VETO_DIALOG, "agent_blocked"),
-            _submission(AttemptOutcome.DELIVERED, "herdr:working", 11),
-        ],
-        states=[_state(8)],
-    )
-    injector = wired(client)
-    injector.inject(terminal_id="t-1", line="one")
-    injector.inject(terminal_id="t-1", line="two")
-    injector.inject(terminal_id="t-1", line="three")
-    fourth = injector.inject(terminal_id="t-1", line="four")
-    assert fourth.outcome is AttemptOutcome.DELIVERED
-    # One state read only — the block was never re-armed after "two" delivered.
-    assert client.state_reads == ["%3"]
-
-
-def test_the_block_is_per_terminal(wired) -> None:  # type: ignore[no-untyped-def]
-    """One wedged worker must not stop the fleet's other deliveries."""
-    client = FakeClient(
-        submissions=[
-            _submission(AttemptOutcome.SUBMISSION_UNCERTAIN, "submitted_while_working", 4),
-            _submission(AttemptOutcome.DELIVERED, "herdr:working", 1),
         ]
     )
     injector = wired(client)
-    injector.inject(terminal_id="t-wedged", line="one")
-    other = injector.inject(terminal_id="t-other", line="two")
-    assert other.outcome is AttemptOutcome.DELIVERED
-    assert client.prompts == [("%3", "one"), ("%3", "two")]
-
-
-def test_a_submission_whose_sequence_was_never_learned_is_not_a_permanent_wedge(
-    wired,  # type: ignore[no-untyped-def]
-) -> None:
-    """An injection that TIMED OUT records no sequence, and must still recover.
-
-    With no baseline there is nothing to compare a later read against, so the
-    first successful read BECOMES the baseline and the block holds one more
-    round.  Without that adoption the terminal's deliveries would be wedged
-    until the process restarted — a worse failure than the double-submission the
-    rule exists to prevent, and one no lease or ``dead_by`` would clear.
-    """
-    client = FakeClient(
-        submissions=[_submission(AttemptOutcome.DELIVERED, "herdr:working", 22)],
-        states=[_state(20), _state(21)],
-    )
-    injector = wired(client)
-    injector._mark_unresolved("t-1", None)  # what the TimeoutError arm records
-
     first = injector.inject(terminal_id="t-1", line="one")
-    assert first.outcome is AttemptOutcome.SUBMISSION_UNCERTAIN
-    assert first.detail == "herdr:unresolved_baseline"
-    assert client.prompts == []
-
     second = injector.inject(terminal_id="t-1", line="two")
+    assert first.outcome is AttemptOutcome.SUBMISSION_UNCERTAIN
     assert second.outcome is AttemptOutcome.DELIVERED
-    assert client.prompts == [("%3", "two")]
+    assert client.prompts == [("%3", "one"), ("%3", "two")]
+    assert client.state_reads == []
+
+
+def test_an_injection_timeout_is_uncertain_and_leaves_no_marker(
+    monkeypatch: pytest.MonkeyPatch, wired  # type: ignore[no-untyped-def]
+) -> None:
+    """A submission that outlived its bound may have landed, so it is uncertain.
+
+    r1 additionally recorded a per-terminal marker here, with no sequence, and
+    that recording is what wedged the terminal (review r1 §4 and its sibling).
+    The outcome is unchanged; the bookkeeping is gone, and the store's per-id
+    quarantine covers the row.
+    """
+    import cli_agent_orchestrator.services.queue_carrier as qc
+
+    injector = wired(FakeClient([]))
+
+    def boom(coro: object, timeout_s: float) -> object:
+        if hasattr(coro, "close"):
+            coro.close()  # type: ignore[attr-defined]
+        raise TimeoutError("did not finish")
+
+    monkeypatch.setattr(qc, "_run_blocking", boom)
+    result = injector.inject(terminal_id="t-1", line="one")
+    assert result.outcome is AttemptOutcome.SUBMISSION_UNCERTAIN
+    assert result.detail == "herdr:inject_timeout"
+    assert not [a for a in vars(injector) if not a.startswith("__")]

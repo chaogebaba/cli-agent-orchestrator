@@ -719,21 +719,30 @@ class _CertifiedInjectorDispatch:
 
 
 def _seam_b_selected(terminal_id: str) -> bool:
-    """Is THIS terminal on Seam B?  Both halves must hold.
+    """Is THIS terminal on Seam B?
 
-    ``CAO_HERDR_DELIVERY`` is the process switch, and the terminal's cell must
-    carry a PASS ``herdr_certification`` row — the D9 predicate, resolved once at
-    terminal create and cached by ``utils/herdr_runtime_gate`` so a position file
-    edited mid-run cannot move a live occupant between carriers (§8: never switch
-    truth sources mid-occupant; the same rule applies to switching its CARRIER).
+    **The switch is NOT re-read here, and that is the r2 correction** (review r1
+    §1/§10.6).  r1 asked ``herdr_delivery_enabled()`` on every ``inject()``, an
+    ``os.environ`` lookup per injection, and the two readings disagreed about
+    what the position meant: unsetting the variable in a running process silently
+    moved every terminal back to paste, while setting it did nothing.
 
-    Fail-closed: an unbound terminal, an unreadable answer or an unset switch all
-    keep the composer paste, which is the pre-H2 behaviour.  Reading the gate
-    through a wrapped import rather than at module scope keeps a boot that cannot
-    import it on the paste path instead of failing.
+    The switch is STRUCTURAL.  ``_build_injector`` reads it once at boot and
+    returns the bare paste injector when it is off, so this function is only ever
+    reached from inside a dispatch that exists because the switch was on.  Asking
+    again could only contradict the object graph.
+
+    What is left is the per-terminal half: the cell must carry a PASS
+    ``herdr_certification`` row — the D9 predicate, resolved once at terminal
+    create and cached by ``utils/herdr_runtime_gate`` so a position file edited
+    mid-run cannot move a live occupant between carriers (§8: never switch truth
+    sources mid-occupant; the same rule applies to switching its CARRIER).
+
+    Fail-closed: an unbound terminal or an unreadable answer keeps the composer
+    paste, which is the pre-H2 behaviour.  Reading the gate through a wrapped
+    import rather than at module scope keeps a boot that cannot import it on the
+    paste path instead of failing.
     """
-    if not herdr_delivery_enabled():
-        return False
     try:
         from cli_agent_orchestrator.utils.herdr_runtime_gate import terminal_certified
 

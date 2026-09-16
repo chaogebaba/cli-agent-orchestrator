@@ -477,10 +477,18 @@ class ReclaimResult:
     only when the last recorded outcome was one of D12's attempt-budget
     outcomes, so a dialog-held row and a row whose seat carrier is refused are
     re-offered without moving the budget they are not on.
+
+    ``quarantined`` is DISJOINT from ``reoffered``: a row whose last outcome was
+    ``SUBMISSION_UNCERTAIN`` leaves its expired lease without becoming claimable
+    again (WP-HERDR, blueprint amendment (7)).  It is counted rather than
+    silently absent, because "the row stopped being delivered" and "the row was
+    never reached" look identical in a count of re-offers, and an operator
+    reading a tick report needs to tell them apart.
     """
 
     reoffered: int = 0
     incremented: int = 0
+    quarantined: int = 0
     dead: tuple[DeadRow, ...] = ()
 
     @property
