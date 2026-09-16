@@ -3759,6 +3759,7 @@ async def create_session(
     terminal_id: Optional[str] = None,
     is_box_hosted: bool = False,
     cell_request_class: Optional[str] = None,
+    cell_request_origin: Optional[str] = None,
     body: Optional[CreateSessionBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -3860,10 +3861,19 @@ async def create_session(
         # ``cell_request_class`` query value is accepted only when it AGREES with
         # the server-derived class; a disagreement (e.g. a POSITION name labelled
         # ``legacy`` to skip certification) is a typed refusal with zero spawn.
+        # F1006 #854: ``cell_request_origin`` is the bare position an upstream
+        # resolver composed ``agent_profile`` from (the MCP assign shim runs
+        # resolve_assignment_target client-side). The class follows that
+        # RESOLUTION PROVENANCE rather than the composed name's shape — but the
+        # declaration is VERIFIED here against the server's own routing
+        # composition, never trusted, so a routing claim for a name routing
+        # would not compose is still E-CELL-CLASS-FORGED.
         _cell_class = cell_guard_reconcile(
             agent_profile,
             provider_supplied=provider is not None,
             supplied_class=cell_request_class,
+            provider=resolved_provider,
+            resolved_from_position=cell_request_origin,
         )
 
         create_kwargs: Dict[str, Any] = dict(
@@ -4681,6 +4691,7 @@ async def create_terminal_in_session(
     terminal_id: Optional[str] = None,
     is_box_hosted: bool = False,
     cell_request_class: Optional[str] = None,
+    cell_request_origin: Optional[str] = None,
     body: Optional[CreateTerminalBody] = None,
     _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Terminal:
@@ -4898,12 +4909,19 @@ async def create_terminal_in_session(
 
         _resume_override = _is_resume and _ap._position_exists(_orig_agent_profile)
         try:
+            # F1006 #854: provenance (``cell_request_origin``) decides the
+            # class for a name an upstream resolver composed; it is verified
+            # against the server's own routing composition before it counts.
+            # A resume never carries provenance (the server re-resolves from
+            # the reaped identity), so this is a no-op on that arm.
             _cell_class = cell_guard_reconcile(
                 _orig_agent_profile,
                 provider_supplied=_orig_provider_supplied,
                 is_resume=_is_resume,
                 resume_override=_resume_override,
                 supplied_class=cell_request_class,
+                provider=resolved_provider,
+                resolved_from_position=None if _is_resume else cell_request_origin,
             )
         except CellClassForged:
             # Compensate a taken resume claim before surfacing the refusal — a
