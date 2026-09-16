@@ -745,7 +745,7 @@ def main() -> int:
     for db in (args.on_db, args.off_db):
         if not db.exists():
             print(f"FAIL arm-database — {db} does not exist")
-            print("FLIP-READY: NO")
+            print("FLIP-READY-BOX: NO")
             return 1
 
     # Loaded FIRST: it decides whether the scoped checks below are allowed to

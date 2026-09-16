@@ -2,7 +2,7 @@
 # live-round.sh — WP-ARCH 2b slices 3+4, the box live round (plan §3 recipe).
 #
 # Runs the same scripted workload twice on one grok box, once with the status
-# cutover OFF and once with it ON, and decides FLIP-READY: YES/NO from the two
+# cutover OFF and once with it ON, and decides FLIP-READY-BOX: YES/NO from the two
 # arms' coordination databases.
 #
 #   live-round.sh --box 007 --sha <fork-sha> [--out DIR] [--turns N] [--min-seconds S]
@@ -25,7 +25,7 @@
 #   on/{server.log,fleet.json,fleet-series.jsonl,db}
 #   report.txt                       one PASS/FAIL/SKIP line per check, verdict last
 #
-# Exit status is the verdict: 0 for FLIP-READY: YES, 1 for NO, 2 for a harness
+# Exit status is the verdict: 0 for FLIP-READY-BOX: YES, 1 for NO, 2 for a harness
 # failure (the round did not run).  A SKIP is never a pass — a criterion whose
 # workload did not happen has not been met, and the verdict says NO.
 #
@@ -41,6 +41,13 @@ MIN_SECONDS=1800
 SESSION="cao-2b-live"
 PROVIDERS="codex"
 LANE_PROVIDERS="codex claude_code kiro_cli"
+# D9: the position whose (position, provider) cells the certification rows
+# certify.  Only used when --certification-dir is given; the flat built-in
+# profiles have no position at all (see the launch comment below).
+POSITION="developer"
+CERT_DIR=""
+# How long a lane gets to answer ONE probe turn before the arm is abandoned.
+READY_SECONDS=300
 PORT=9889
 BOXHOME=/workspace/cao/home
 REMOTE_SCRATCH='/workspace/cao/home/box-scratch/2b-live'
@@ -59,6 +66,9 @@ while [ $# -gt 0 ]; do
     --min-seconds) MIN_SECONDS="${2:-}"; shift 2 ;;
     --providers) PROVIDERS="${2:-}"; shift 2 ;;
     --lanes) LANE_PROVIDERS="${2:-}"; shift 2 ;;
+    --position) POSITION="${2:-}"; shift 2 ;;
+    --certification-dir) CERT_DIR="${2:-}"; shift 2 ;;
+    --ready-seconds) READY_SECONDS="${2:-}"; shift 2 ;;
     -h|--help) usage ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -70,6 +80,64 @@ done
 [ -f "$ANALYSER" ] || die "analyser not found beside this script: $ANALYSER"
 findmnt /data >/dev/null 2>&1 || die "/data is not mounted; plug the SSD in before running a round"
 command -v grokfleet >/dev/null 2>&1 || die "grokfleet is not on PATH"
+
+# NO BACKTICK COMMAND SUBSTITUTION IN THIS FILE.  The remote payload is built by
+# an UNQUOTED heredoc, because it has to expand the box paths and the sha on the
+# laptop.  An unquoted heredoc also expands backquotes, so a single backtick in a
+# COMMENT inside that heredoc is not punctuation: it is a command, and it runs
+# HERE, on the laptop, every time a payload is built.  One did.  An RST comment
+# reading "cao launch" in single backticks executed ``cao launch`` with no
+# arguments on the laptop during the 2026-09-16 round 3, which is where that
+# round's unexplained "Error: Missing option '--agents'" came from.  A doubled
+# backtick is an empty substitution and is safe; a lone one is not, and the next
+# one may not be a command that merely prints a usage message.  Refuse to run.
+_tick=$(printf '\140')
+if grep -qP "(?<!$_tick)$_tick(?!$_tick)" "$0" 2>/dev/null; then
+  die "$0 contains a backtick that is not part of a doubled pair; it would EXECUTE when the payload heredoc expands. Use \$(...) for substitution and double backticks in prose."
+fi
+
+# THE CERTIFIED COHORT (D9).  Without this directory the round cannot observe
+# the projected path at all, and that is not a tuning detail — it is the whole
+# criterion.  Publication happens only for a terminal whose source the herdr
+# backend registered authoritative (backends/herdr_backend.py:188), which needs
+# ``terminal_certified``, which needs BOTH of the things this option supplies:
+#
+#   * a spawn name the D9 resolver can split into <position>-<provider>
+#     (utils/agent_profiles.py:split_effective_name) — the built-in flat
+#     ``developer`` / ``code_supervisor`` names split to None and are therefore
+#     never certified, which is correct and is why round 3 (2026-09-16) recorded
+#     an ON arm identical to its OFF arm, producer=pane in both; and
+#   * a positions store carrying a PASS ``herdr_certification:`` row for that cell
+#     at the CURRENT position_sha/overlay_sha, pinned to the sha256 of the herdr
+#     binary on the box (utils/routing.py:herdr_cell_certified).
+#
+# The rows are written from a certification probe's evidence, never by this
+# script: a round that certified its own cells in order to observe the certified
+# path would be certifying by fiat, and its YES would mean nothing.
+COMPOSED=""
+if [ -n "$CERT_DIR" ]; then
+  [ -d "$CERT_DIR" ] || die "--certification-dir $CERT_DIR is not a directory"
+  [ -d "$CERT_DIR/positions" ] || die "--certification-dir $CERT_DIR has no positions/ subdirectory"
+  [ -f "$CERT_DIR/positions/$POSITION.md" ] ||
+    die "--certification-dir $CERT_DIR has no positions/$POSITION.md for --position $POSITION"
+  grep -q 'herdr_certification' "$CERT_DIR/positions/$POSITION.md" ||
+    die "positions/$POSITION.md carries no herdr_certification rows; the round would run uncertified"
+  COMPOSED=1
+else
+  echo "NOTE: no --certification-dir given. No lane can be herdr-certified, so the" >&2
+  echo "      ON arm cannot publish through the projection and every projected" >&2
+  echo "      criterion will SKIP. This round cannot answer FLIP-READY-BOX: YES." >&2
+fi
+
+# The spawn names each arm will use, decided ONCE here so the payload, the Kiro
+# manifest seeding and the composed-profile materialisation cannot disagree.
+if [ -n "$COMPOSED" ]; then
+  SUPERVISOR_PROFILE="$POSITION-claude_code"
+  KIRO_PROFILE="$POSITION-kiro_cli"
+else
+  SUPERVISOR_PROFILE="code_supervisor"
+  KIRO_PROFILE="developer"
+fi
 
 OUT="${OUT:-/data/claude-scratch/cli-subagents/2b/live-round-$SHA}"
 mkdir -p "$OUT/on" "$OUT/off" || die "cannot create $OUT"
@@ -92,6 +160,17 @@ remote_arm() {
 set -uo pipefail
 ARM=$arm
 ARM_SESSION=$SESSION-$arm
+# Decided on the laptop (see the --certification-dir block) and carried in, so
+# the manifest seeding, the launch and the lane POSTs cannot drift apart.
+COMPOSED_NAMES=$COMPOSED
+POSITION=$POSITION
+SUPERVISOR_PROFILE=$SUPERVISOR_PROFILE
+# The profile a lane spawns under.  A composed <position>-<provider> name is the
+# ONLY shape D9 can certify; the flat built-in name is the uncertified fallback
+# for a round run without a certification store.
+lane_profile() {
+  if [ -n "\$COMPOSED_NAMES" ]; then printf '%s-%s' "\$POSITION" "\$1"; else printf 'developer'; fi
+}
 ROUND=$REMOTE_SCRATCH/\$ARM
 rm -rf "\$ROUND"; mkdir -p "\$ROUND"
 export CAO_HOME_DIR="\$ROUND/home"
@@ -128,10 +207,14 @@ export PATH="\$HOME/.bun/bin:\$HOME/.local/bin:\$HOME/.grok/bin:/home/box/.local
 # The built-in CAO ``developer`` profile is enough for most providers, but
 # Kiro also requires a matching base agent manifest.  Provisioned boxes carry
 # the repo's kiro_dev manifest; seed the generic name used by this harness.
-if [ ! -f "\$HOME/.kiro/agents/developer.json" ] &&
+# The manifest is looked up by the AGENT PROFILE NAME the provider was spawned
+# under (providers/kiro_cli.py:602 falls back to kiro_default and says so), so a
+# composed spawn name needs a manifest under the COMPOSED name.  Seeding only
+# "developer" here is how a composed kiro lane would quietly run as kiro_default.
+if [ ! -f "\$HOME/.kiro/agents/$KIRO_PROFILE.json" ] &&
    [ -f "\$HOME/.kiro/agents/kiro_dev.json" ]; then
   mkdir -p "\$HOME/.kiro/agents"
-  cp "\$HOME/.kiro/agents/kiro_dev.json" "\$HOME/.kiro/agents/developer.json"
+  cp "\$HOME/.kiro/agents/kiro_dev.json" "\$HOME/.kiro/agents/$KIRO_PROFILE.json"
 fi
 
 cd $BOXHOME/cli-subagents/cli-agent-orchestrator || exit 2
@@ -158,7 +241,7 @@ fi
 
 # Herdr has persistent workspaces rather than tmux sessions.  Killing
 # cao-server does not remove one, so an aborted arm otherwise makes the next
-# `cao launch` answer "Session already exists" even though its port is clean.
+# ``cao launch`` answer "Session already exists" even though its port is clean.
 # Close only this harness arm's exact label; never sweep another workspace.
 python3 - "\$ARM_SESSION" <<'CLEAN_HERDR'
 import json
@@ -190,6 +273,63 @@ CLEAN_HERDR
 # rather than whatever a bare home implies.
 if [ ! -f "\$CAO_HOME_DIR/providers.toml" ] && [ -f "$BOXHOME/cli-subagents/providers.toml.default" ]; then
   cp "$BOXHOME/cli-subagents/providers.toml.default" "\$CAO_HOME_DIR/providers.toml"
+fi
+
+# The certified cohort's inputs, into THIS arm's fresh home: positions/ and
+# overlays/ under the agent store, exactly where positions_store_dir() and
+# herdr_cell_certified() read them (constants.py:413-437).  Both arms install
+# the same bytes, so the two arms differ only in the two switch variables.
+if [ -n "\$COMPOSED_NAMES" ]; then
+  [ -d "$REMOTE_SCRATCH-certification/positions" ] || {
+    echo "HARNESS: the certification store is missing on the box"; exit 2; }
+  mkdir -p "\$CAO_HOME_DIR/agent-store"
+  cp -R "$REMOTE_SCRATCH-certification/." "\$CAO_HOME_DIR/agent-store/" || {
+    echo "HARNESS: could not install the certification store"; exit 2; }
+
+  # A composed name resolves through the composed STORE first
+  # (utils/agent_profiles.py:748-762), and that store is written by the D8
+  # materialiser at assign time.  This round passes the composed name straight
+  # to the API, so nothing would materialise it and every spawn would 404 on a
+  # profile that "exists" only as a position plus an overlay.  Build them with
+  # the product's OWN writer rather than by hand: the composed body has to be
+  # the one the certification shas were computed over, and a second composer
+  # here is exactly how that drifts.
+  : > "\$ROUND/composed-names.txt"
+  printf '%s %s\n' "\$SUPERVISOR_PROFILE" "claude_code" >> "\$ROUND/composed-names.txt"
+  for provider in $LANE_PROVIDERS; do
+    printf '%s %s\n' "\$(lane_profile \$provider)" "\$provider" >> "\$ROUND/composed-names.txt"
+  done
+  sort -u "\$ROUND/composed-names.txt" -o "\$ROUND/composed-names.txt"
+  uv run python - "\$ROUND/composed-names.txt" <<'MATERIALISE' >> "\$ROUND/launch.log" 2>&1
+import sys
+from pathlib import Path
+
+from cli_agent_orchestrator.utils.agent_profiles import materialise_composed_profile
+
+built, failed = [], []
+for line in Path(sys.argv[1]).read_text().splitlines():
+    parts = line.split()
+    if len(parts) != 2:
+        continue
+    spawn_name, provider = parts
+    try:
+        target = materialise_composed_profile(spawn_name, provider)
+    except Exception as exc:
+        failed.append(f"{spawn_name}: {type(exc).__name__}: {exc}")
+        continue
+    if target is None:
+        failed.append(f"{spawn_name}: no composed profile could be built from the store")
+    else:
+        built.append(f"{spawn_name} -> {target}")
+print("composed profiles: " + ("; ".join(built) if built else "none"))
+if failed:
+    print("COMPOSE-FAIL: " + "; ".join(failed))
+    raise SystemExit(1)
+MATERIALISE
+  if [ \$? -ne 0 ]; then
+    echo "HARNESS: composed profiles could not be materialised; see \$ROUND/launch.log"
+    exit 2
+  fi
 fi
 
 # The server, without systemd (boxes have none).  ``cao-server`` is the console
@@ -228,7 +368,7 @@ echo "backend: herdr" >> "\$ROUND/server.log"
 # probe a running server for resolver support — a bring-up of its own.  The
 # built-ins ship inside the package and resolve with nothing installed, which is
 # all this round needs: the lanes exist to produce transitions, not to work.
-cao launch --agents code_supervisor --provider claude_code \\
+cao launch --agents "\$SUPERVISOR_PROFILE" --provider claude_code \\
   --session-name \$ARM_SESSION --headless --yolo >>"\$ROUND/launch.log" 2>&1
 
 # The launch must actually have produced the session's first terminal.  It
@@ -249,7 +389,7 @@ for provider in $LANE_PROVIDERS; do
   # created.  ``POST /sessions`` creates a session and answers
   # "Session already exists" here, which is what the first attempt hit.
   curl -s --max-time 420 -o "\$ROUND/lane-\$provider.json" -w "%{http_code}" -X POST \\
-    "http://127.0.0.1:$PORT/sessions/\$ARM_SESSION/terminals?agent_profile=developer&provider=\$provider&working_directory=$BOXHOME/cli-subagents/cli-agent-orchestrator" \\
+    "http://127.0.0.1:$PORT/sessions/\$ARM_SESSION/terminals?agent_profile=\$(lane_profile \$provider)&provider=\$provider&working_directory=$BOXHOME/cli-subagents/cli-agent-orchestrator" \\
     -H 'content-type: application/json' -d '{}' >>"\$ROUND/launch.log" 2>&1
   echo " <- \$provider lane" >>"\$ROUND/launch.log"
 done
@@ -339,6 +479,68 @@ send() {
   esac
 }
 
+# LANE READINESS.  A lane that exists is not a lane that works, and the round
+# had no gate between the two: in round 3 (box 010, 2026-09-16) the kiro lane
+# was created, accepted 43 sends, and produced ONE turn end against the claude
+# lanes' 42 each — its pane had no kiro process in it at all
+# (cao.log: detected_agent=<none>).  The arm ran its full hour anyway and
+# ``capped-parity`` FAILed at the end on a lane that was never alive.  So: one
+# probe turn per lane, first, and an arm whose lanes cannot answer it is
+# abandoned in minutes instead of failing a criterion in an hour.
+#
+# The signal is an INCREASE in that terminal's own ``turn.ended`` count, not a
+# non-zero count: a lane can accrue a stray server-produced turn end without
+# ever running its provider, which is exactly what the broken kiro lane did.
+# Read-only, on the live database — a torn COPY is the hazard this harness
+# guards against, and a ``count(*)`` is not a copy.
+READY_DB="\$CAO_HOME_DIR/db/cli-agent-orchestrator.db"
+turns_ended() {
+  _te=\$(sqlite3 "file:\$READY_DB?mode=ro" \
+    "select count(*) from worker_event where terminal_id='\$1' and kind='turn.ended';" 2>/dev/null)
+  case "\$_te" in
+    ''|*[!0-9]*) printf '0' ;;
+    *) printf '%s' "\$_te" ;;
+  esac
+}
+: > "\$ROUND/lane-readiness.txt"
+ready_baseline=""
+for id in \$LANES; do
+  ready_baseline="\$ready_baseline \$id:\$(turns_ended \$id)"
+done
+for id in \$LANES; do
+  send "\$id" "say only: ready"
+done
+ready_failures=""
+for id in \$LANES; do
+  _base=0
+  for _pair in \$ready_baseline; do
+    case "\$_pair" in "\$id:"*) _base=\${_pair#*:} ;; esac
+  done
+  _deadline=\$(( \$(date +%s) + $READY_SECONDS ))
+  _now=\$(turns_ended \$id)
+  while [ "\$_now" -le "\$_base" ] && [ \$(date +%s) -lt \$_deadline ]; do
+    sleep 5
+    _now=\$(turns_ended \$id)
+  done
+  if [ "\$_now" -gt "\$_base" ]; then
+    echo "ready \$id turn.ended \$_base -> \$_now" >> "\$ROUND/lane-readiness.txt"
+  else
+    echo "NOT-READY \$id turn.ended stuck at \$_base" >> "\$ROUND/lane-readiness.txt"
+    ready_failures="\$ready_failures \$id"
+  fi
+done
+cat "\$ROUND/lane-readiness.txt"
+if [ -n "\$ready_failures" ]; then
+  echo "HARNESS: lane(s)\$ready_failures never completed a probe turn in ${READY_SECONDS}s;"
+  echo "HARNESS: abandoning this arm rather than measuring lanes that are not alive."
+  exit 2
+fi
+
+# The floor starts when the WORKLOAD does.  Readiness can take minutes, and
+# counting it against the floor shortens the window the condition label's
+# lifetime is measured in.
+ARM_STARTED=\$(date +%s)
+
 # ROUND-ROBIN, not lane-by-lane: every lane makes progress on every turn, so the
 # arm's wall clock is one lane's rather than the sum, and the fleet holds several
 # terminals in flight at once — which is the shape the sweep and the probe see in
@@ -416,10 +618,11 @@ sleep 60
 # shape.  So the arm RECORDS what it actually set up, and the analyser reads the
 # record instead of guessing from absence.  An empty result whose precondition
 # says the workload SHOULD have produced something is a FAIL.
-python3 - "\$ROUND" "\$cappable_lanes" <<'PRECONDITIONS'
+python3 - "\$ROUND" "\$cappable_lanes" "\$CAO_HOME_DIR" <<'PRECONDITIONS'
 import json, os, sys
 
 round_dir, cappable = sys.argv[1], sys.argv[2].split()
+arm_home = sys.argv[3] if len(sys.argv) > 3 else ""
 providers = {}
 for line in open(os.path.join(round_dir, "lane-providers.txt")):
     parts = line.split()
@@ -446,7 +649,45 @@ SKIP_FLAGS = (
     "--full-auto",             # codex
     "--trust-all-tools",       # kiro
 )
+# ...and scoped to THIS ARM's own lanes.  The first version matched every
+# provider-shaped process on the box, and a box is shared and long-lived: a
+# cline hub daemon and a stray pi that had been running for days were counted
+# as lanes of this round, neither carried a permissions-skip flag, and
+# ``prompt-awaiting`` FAILed on processes the round did not create and could not
+# have raised a card in (measured, box 010, round 3 2026-09-16).  The same scan
+# also swept in the OTHER arm's surviving panes, so an off-arm process decided
+# an on-arm criterion.
+#
+# Two ownership tests, either of which is sufficient, because the two spawn
+# shapes leave different fingerprints: a provider the server launches with
+# per-terminal files carries THIS arm's round directory in its command line,
+# while anything the server started as a child inherits this arm's
+# ``CAO_HOME_DIR``.  A herdr pane is created by the long-lived herdr session
+# server rather than by cao-server, so the environment test alone would miss it
+# and the command-line test alone would miss a bare pane; both are checked.
+arm_paths = {p for p in (round_dir, os.path.realpath(round_dir)) if p}
+arm_homes = {p for p in (arm_home, os.path.realpath(arm_home) if arm_home else "") if p}
+
+
+def _owned_by_this_arm(pid, command):
+    if any(path in command for path in arm_paths):
+        return True
+    if not arm_homes:
+        return False
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as handle:
+            entries = handle.read().split(b"\x00")
+    except OSError:
+        return False
+    for entry in entries:
+        if entry.startswith(b"CAO_HOME_DIR="):
+            value = entry.split(b"=", 1)[1].decode("utf-8", "replace")
+            return value in arm_homes or os.path.realpath(value) in arm_homes
+    return False
+
+
 processes = []
+foreign = []
 for pid in os.listdir("/proc"):
     if not pid.isdigit():
         continue
@@ -461,18 +702,27 @@ for pid in os.listdir("/proc"):
         os.path.basename(token) in PROVIDER_BASENAMES for token in command.split()
     ):
         continue
-    processes.append(command[:200])
+    if _owned_by_this_arm(pid, command):
+        processes.append(command[:200])
+    else:
+        # Kept rather than dropped: "we excluded these and why" is evidence, and
+        # a silently shorter list is how the first version's defect hid.
+        foreign.append(command[:200])
 
 unguarded = [c for c in processes if not any(flag in c for flag in SKIP_FLAGS)]
 unreadable = []
 if not processes:
-    # No provider process visible at all: capability is UNKNOWN, not absent.
-    unreadable.append("no provider process found in /proc")
+    # No provider process of THIS ARM visible: capability is UNKNOWN, not absent.
+    unreadable.append("no provider process of this arm found in /proc")
 
 json.dump(
     {
         "lane_providers": providers,
         "provider_processes": processes,
+        # Provider-shaped processes on the box that are NOT this arm's, and so
+        # cannot bear on any criterion here.  Recorded for the report, never read
+        # by a check.
+        "foreign_provider_processes": foreign,
         "spawn_unreadable": unreadable,
         # Lanes the cap drive actually targeted, i.e. whose provider has a
         # banner the CAPPED classifier knows.
@@ -593,6 +843,26 @@ esac
 
 grokfleet ssh --lease "$LEASE_ID" "mkdir -p $REMOTE_SCRATCH" >/dev/null 2>&1
 
+# The certification store travels as one base64 tar, for the same reason the
+# payload does: ``grokfleet ssh`` is a single-command transport and a multi-file
+# copy through it loses quoting.  It lands OUTSIDE $REMOTE_SCRATCH/<arm>, which
+# each arm deletes on entry, so both arms install the same bytes.
+if [ -n "$CERT_DIR" ]; then
+  cert_b64="$(tar -C "$CERT_DIR" -czf - . | base64 -w0)" ||
+    die "could not pack --certification-dir $CERT_DIR"
+  grokfleet ssh --lease "$LEASE_ID" "
+    rm -rf $REMOTE_SCRATCH-certification
+    mkdir -p $REMOTE_SCRATCH-certification
+    echo $cert_b64 | base64 -d | tar -C $REMOTE_SCRATCH-certification -xzf -
+  " >/dev/null 2>&1 || die "could not ship the certification store to grok-box-$BOX"
+  shipped="$(grokfleet ssh --lease "$LEASE_ID" \
+    "ls $REMOTE_SCRATCH-certification/positions/$POSITION.md 2>/dev/null" 2>/dev/null || true)"
+  case "$shipped" in
+    *"$POSITION.md") : ;;
+    *) die "the certification store did not arrive on grok-box-$BOX" ;;
+  esac
+fi
+
 for arm in off on; do
   if [ "$arm" = off ]; then
     payload="$(remote_arm off off '')"
@@ -610,7 +880,7 @@ for arm in off on; do
   if ! grokfleet ssh --lease "$LEASE_ID" "echo $payload_b64 | base64 -d > $REMOTE_SCRATCH-payload.sh && bash $REMOTE_SCRATCH-payload.sh" >>"$OUT/round.log" 2>&1; then
     die "arm $arm did not complete; see $OUT/round.log"
   fi
-  for artefact in db fleet.json fleet-series.jsonl read-path.jsonl server.log cao.log launch.log preconditions.json lane-providers.txt send.log; do
+  for artefact in db fleet.json fleet-series.jsonl read-path.jsonl server.log cao.log launch.log preconditions.json lane-providers.txt lane-readiness.txt composed-names.txt send.log; do
     grokfleet ssh --lease "$LEASE_ID" "cat $REMOTE_SCRATCH/$arm/$artefact 2>/dev/null | base64 -w0" \
       2>/dev/null | base64 -d > "$OUT/$arm/$artefact" 2>/dev/null || true
   done
@@ -636,5 +906,10 @@ grokfleet ssh --lease "$LEASE_ID" "
 verdict_status=${PIPESTATUS[0]}
 
 echo "report: $OUT/report.txt" | tee -a "$OUT/round.log"
-grep -q 'FLIP-READY: YES' "$OUT/report.txt" 2>/dev/null || verdict_status=1
+# The analyser prints FLIP-READY-BOX, renamed in 38d335cc when the criteria a
+# box cannot reach moved to the laptop acceptance.  This grep still read the OLD
+# name, which no longer appears anywhere in its output, so verdict_status was
+# forced to 1 on EVERY round including a clean one and the exit status could not
+# say YES.  Match the line the analyser actually prints.
+grep -q 'FLIP-READY-BOX: YES' "$OUT/report.txt" 2>/dev/null || verdict_status=1
 exit "$verdict_status"
