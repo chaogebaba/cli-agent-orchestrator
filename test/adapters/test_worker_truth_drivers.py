@@ -234,9 +234,14 @@ class _Retained:
 class _Monitor:
     def __init__(self) -> None:
         self.resyncs: list[str] = []
+        self.classifications: list[str] = []
 
     def resync_from_pane_tail(self, terminal_id: str, tail: str, *, now: float | None = None):
         self.resyncs.append(terminal_id)
+
+    def classify_pane_sample(self, terminal_id: str, tail: str) -> bool:
+        self.classifications.append(terminal_id)
+        return True
 
 
 def _install_sampler(
@@ -282,15 +287,20 @@ def test_a_stale_sample_is_taken_once_per_terminal(monkeypatch: pytest.MonkeyPat
     assert sampler.observed == ["t1", "t2"]
 
 
-def test_the_tick_drives_all_three_consumers_of_one_sample(
+def test_the_tick_drives_every_consumer_of_one_sample(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """S3: the watchdog tick fed three consumers, not one.
+    """S3: the watchdog tick fed several consumers, not one.
 
-    ``resync_from_pane_tail`` (F521 D15) and the F507 question-marker reconcile
-    ride the same sample as ``observe``.  A re-drive that carried only the first
-    would take the other two dark the moment 3c deletes the watchdog, with no
-    finding anywhere to say so.
+    ``resync_from_pane_tail`` (F521 D15), ``classify_pane_sample`` (WP-ARCH 2b)
+    and the F507 question-marker reconcile all ride the same sample as
+    ``observe``.  A re-drive that carried only the first would take the others
+    dark the moment 3c deletes the watchdog, with no finding anywhere to say so.
+
+    ``classify_pane_sample`` joined the list because it is the herdr path's ONLY
+    driver of ``status.pane_classified``: an event-inbox backend starts no FIFO
+    reader, so ``_apply_detection`` — the producer's only other call site — never
+    runs there at all.
     """
     sampler = _Sampler(fresh=False)
     monitor = _install_sampler(monkeypatch, sampler)
@@ -301,7 +311,39 @@ def test_the_tick_drives_all_three_consumers_of_one_sample(
 
     assert sampler.observed == ["t1"]
     assert monitor.resyncs == ["t1"]
+    assert monitor.classifications == ["t1"]
     assert reconciled == ["t1"]
+
+
+def test_the_tick_classifies_a_certified_terminal_but_does_not_resync_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WP-HERDR §6, as amended: lifecycle kinds ONLY.
+
+    ``resync_from_pane_tail`` publishes a pane-derived LIFECYCLE status and is
+    therefore disabled for a certified terminal.  The classification pass is not
+    a lifecycle kind — ``status.pane_classified`` is deliberately absent from
+    ``mapping.STATE_ASSERTING_KINDS`` — and it carries the vendor cap and the
+    dialog card, which the blueprint says "keep applying" for that cohort.  The
+    herdr source maps ``blocked`` to nothing at all, so for a certified lane the
+    pane is the only producer either fact has.
+    """
+    from cli_agent_orchestrator.utils import herdr_runtime_gate
+
+    monkeypatch.setenv(herdr_runtime_gate.HERDR_RUNTIME_ENV_VAR, "1")
+    herdr_runtime_gate.reset_gate()
+    herdr_runtime_gate.bind_terminal("t1", True)
+    try:
+        sampler = _Sampler(fresh=False)
+        monitor = _install_sampler(monkeypatch, sampler)
+
+        bootstrap._build_sampler_tick()(_fleet(("t1", "s1", "w1")))
+
+        assert sampler.observed == ["t1"]
+        assert monitor.resyncs == []
+        assert monitor.classifications == ["t1"]
+    finally:
+        herdr_runtime_gate.reset_gate()
 
 
 def test_a_tick_that_takes_no_sample_drives_nothing_at_all(
