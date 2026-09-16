@@ -606,6 +606,19 @@ def _run_blocking(coro: Any, timeout_s: float) -> Any:
 
     Blocking the loop for the duration is the pre-existing shape, not a new cost:
     ``PaneWorkerInjector._send`` blocks it on ``send_prepared_input`` today.
+
+    **On the timeout path this LEAKS the thread, deliberately** (review r1
+    §10.7).  ``asyncio.run`` cannot be interrupted from outside, and the socket
+    work it is doing belongs to a loop this thread does not own, so the only ways
+    to reclaim it are to thread a cancellation token through every awaited call
+    or to kill the loop from under it.  Both are more machinery than the
+    condition deserves: the thread is a daemon, it holds one unix socket and one
+    reply buffer, it ends on its own as soon as herdr answers or its own socket
+    timeout fires (bounded by ``request_timeout_s``, which is well under this
+    join), and the process is the outer bound in the worst case.  What it must
+    NOT do is come back and write anything — it cannot: its result is dropped on
+    the floor by the join above, and the injector has held no per-terminal state
+    since r2, so a late thread has nothing to race with.
     """
     import asyncio
 
@@ -640,31 +653,26 @@ class HerdrPromptInjector:
     must be loud.  A herdr submission into a human's own pane would be worse than
     a paste, not better, because the runtime would press Enter.
 
-    **An unresolved earlier submission blocks later ones** (blueprint §6).  This
-    is the half of D4's quarantine that ``NON_DELIVERY_OUTCOMES`` membership does
-    NOT carry: the queue retains the lease, but nothing in the store stops a
-    later re-offer, so the rule has to live where the evidence lives.  When a
-    submission comes back ``SUBMISSION_UNCERTAIN`` the terminal's
-    ``state_change_seq`` at that moment is recorded; the next injection for that
-    terminal asks the runtime for the current sequence and submits only if it has
-    ADVANCED — i.e. the runtime has since observed the pane change, which is the
-    only evidence that resolves the question either way.  A sequence that has not
-    moved means the earlier text may still be sitting unconsumed in the composer,
-    and a second submission would concatenate onto it.
+    **The no-second-submission rule is NOT here, and that is the r2 correction.**
+    r1 implemented it as a per-TERMINAL block that cleared itself once the pane's
+    ``state_change_seq`` advanced, and review r1 §2 showed the property does not
+    hold: this injector is handed ``(terminal_id, line)`` and never learns a
+    ``msg_id``, the digest it submits covers MANY ids at once, and the clearing
+    condition — the pane moved — is the condition under which the first copy most
+    likely LANDED.  A stalled submission was therefore re-offered by ``reclaim``
+    and submitted a second time, journalled ``delivered``.
 
-    The marker is process-local and deliberately not persisted, for the reason
-    ``utils/herdr_runtime_gate`` gives for the certification answer: a durable
-    row would survive into a process whose runtime, binary and pane are all new,
-    and the safe direction on restart is to forget.  A forgotten marker costs one
-    possible double-submission after a server restart; a stale one would block a
-    terminal's deliveries forever.
+    Blueprint amendment (7) rules the quarantine is PER ID and must hold through
+    ANY path, so it lives where ids exist: ``SqliteQueueStore.reclaim`` does not
+    return a row whose last outcome was ``SUBMISSION_UNCERTAIN`` to the claimable
+    pool at all.  That is strictly stronger than anything expressible here, and
+    it removes this class's marker, its lock and both of the wedges the marker
+    produced (review r1 §4) by construction rather than by another rule.
+
+    What remains here is a pure function of one call: resolve the pane, submit
+    once, project the answer.  No state between injections, so there is nothing
+    to wedge, nothing to persist, and nothing that a server restart forgets.
     """
-
-    def __init__(self) -> None:
-        self._lock = threading.RLock()
-        #: CAO terminal id -> the herdr ``state_change_seq`` observed when a
-        #: submission to it was last left UNRESOLVED.
-        self._unresolved: dict[str, int | None] = {}
 
     # -- the port -----------------------------------------------------------
 
@@ -682,24 +690,23 @@ class HerdrPromptInjector:
             logger.debug("herdr inject: no target for %s", terminal_id, exc_info=True)
             return InjectionResult(
                 outcome=AttemptOutcome.PANE_ABSENT,
-                detail=f"herdr_no_target:{exc.__class__.__name__}",
+                detail=f"herdr:no_target:{exc.__class__.__name__}",
             )
 
         try:
-            return self._submit(terminal_id, target, socket_path, line)
+            return self._submit(target, socket_path, line)
         except TimeoutError:
-            # The submission outlived its own bound.  It may have landed, so it
-            # is uncertain rather than failed, and it is recorded as unresolved
-            # with no sequence — which blocks the next one until a read succeeds.
-            self._mark_unresolved(terminal_id, None)
+            # The submission outlived its own bound AFTER the request went out,
+            # so it may have landed: uncertain, not failed.  The store's
+            # quarantine is what stops the row being offered again.
             return InjectionResult(
-                outcome=AttemptOutcome.SUBMISSION_UNCERTAIN, detail="herdr_inject_timeout"
+                outcome=AttemptOutcome.SUBMISSION_UNCERTAIN, detail="herdr:inject_timeout"
             )
         except Exception as exc:  # noqa: BLE001 — a carrier may not raise into the tick
             logger.debug("herdr inject failed for %s", terminal_id, exc_info=True)
             return InjectionResult(
                 outcome=AttemptOutcome.VETO_UNVERIFIED,
-                detail=f"herdr_unverified:{exc.__class__.__name__}",
+                detail=f"herdr:unverified:{exc.__class__.__name__}",
             )
 
     # -- internals ----------------------------------------------------------
@@ -734,76 +741,26 @@ class HerdrPromptInjector:
             raise ValueError(f"terminal {terminal_id} has no herdr pane")
         return pane_id, default_socket_path(session)
 
-    def _submit(
-        self, terminal_id: str, target: str, socket_path: str, line: str
-    ) -> InjectionResult:
+    @staticmethod
+    def _submit(target: str, socket_path: str, line: str) -> InjectionResult:
+        """One submission, and the detail string passed through unchanged.
+
+        r1 wrote ``f"herdr:{submission.detail}"`` onto a detail the client had
+        already prefixed, so every live row read ``herdr:herdr:working`` (review
+        r1 §5/§10.4).  The client is now the single place the prefix is applied
+        — every detail it returns carries exactly one — which also makes
+        ``detail LIKE 'herdr:%'`` the exact predicate for "this row went through
+        Seam B", the observability the shared ``carrier=pane`` value costs.
+        """
         from cli_agent_orchestrator.core.timing import (
             DELIVERY_INJECT_BUDGET_S,
             HERDR_PROMPT_WAIT_MS,
         )
 
-        client = _herdr_client(socket_path)
-
-        blocked = self._blocked_by_unresolved(client, terminal_id, target)
-        if blocked is not None:
-            return blocked
-
         submission = _run_blocking(
-            client.prompt_agent(target=target, text=line, wait_timeout_ms=HERDR_PROMPT_WAIT_MS),
+            _herdr_client(socket_path).prompt_agent(
+                target=target, text=line, wait_timeout_ms=HERDR_PROMPT_WAIT_MS
+            ),
             DELIVERY_INJECT_BUDGET_S,
         )
-        if submission.outcome is AttemptOutcome.SUBMISSION_UNCERTAIN:
-            self._mark_unresolved(terminal_id, submission.state_change_seq)
-        else:
-            self._clear_unresolved(terminal_id)
-        return InjectionResult(outcome=submission.outcome, detail=f"herdr:{submission.detail}")
-
-    def _blocked_by_unresolved(
-        self, client: Any, terminal_id: str, target: str
-    ) -> InjectionResult | None:
-        """``None`` to proceed, or the refusal that blocks a second submission.
-
-        The marker is keyed by CAO ``terminal_id`` (that is what the port is
-        given and what survives a pane id being re-resolved), but the READ is by
-        the herdr ``target`` — the two are different namespaces and asking the
-        runtime about a CAO uuid would answer nothing for every terminal.
-        """
-        from cli_agent_orchestrator.core.timing import DELIVERY_INJECT_BUDGET_S
-
-        with self._lock:
-            if terminal_id not in self._unresolved:
-                return None
-            recorded = self._unresolved[terminal_id]
-
-        state = _run_blocking(client.agent_state(target=target), DELIVERY_INJECT_BUDGET_S)
-        if state is None:
-            return InjectionResult(
-                outcome=AttemptOutcome.SUBMISSION_UNCERTAIN, detail="herdr:unresolved_unreadable"
-            )
-        if recorded is None:
-            # A submission whose SEQUENCE was never learned — the injection
-            # timed out after the text had gone.  With no baseline there is
-            # nothing to compare, so this read BECOMES the baseline and the
-            # block holds for one more round.  Adopting it is what keeps the
-            # rule bounded: without it, ``recorded is None`` could never be
-            # satisfied by any later read and the terminal's deliveries would be
-            # wedged until the process restarted, which is a worse failure than
-            # the double-submission the rule exists to prevent.
-            self._mark_unresolved(terminal_id, state.state_change_seq)
-            return InjectionResult(
-                outcome=AttemptOutcome.SUBMISSION_UNCERTAIN, detail="herdr:unresolved_baseline"
-            )
-        if state.state_change_seq is not None and state.state_change_seq > recorded:
-            self._clear_unresolved(terminal_id)
-            return None
-        return InjectionResult(
-            outcome=AttemptOutcome.SUBMISSION_UNCERTAIN, detail="herdr:unresolved_prior"
-        )
-
-    def _mark_unresolved(self, terminal_id: str, seq: int | None) -> None:
-        with self._lock:
-            self._unresolved[terminal_id] = seq
-
-    def _clear_unresolved(self, terminal_id: str) -> None:
-        with self._lock:
-            self._unresolved.pop(terminal_id, None)
+        return InjectionResult(outcome=submission.outcome, detail=submission.detail)

@@ -56,6 +56,8 @@ import json
 import logging
 import os
 from collections import deque
+from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -67,6 +69,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "HERDR_AGENT_BLOCKED",
+    "HERDR_DETAIL_PREFIX",
     "HERDR_AGENT_NOT_FOUND",
     "HERDR_AGENT_PROMPT_STALLED",
     "HERDR_PROMPT_ACK_STATES",
@@ -180,6 +183,22 @@ class HerdrProtocolMismatch(HerdrError):
         self.got_schema = got_schema
 
 
+#: The one prefix every Seam B ``detail`` carries, applied HERE and nowhere else.
+#:
+#: r1 applied it in two places — this module and ``HerdrPromptInjector._submit``
+#: — so every live journal row read ``herdr:herdr:working`` (review r1 §5).  One
+#: prefix, applied once, also makes ``detail LIKE 'herdr:%'`` the exact predicate
+#: for "this attempt went through Seam B", which is the observability the shared
+#: ``carrier=pane`` value costs (review r1 §5 accepts the shared carrier name on
+#: condition the detail stays legible).
+HERDR_DETAIL_PREFIX = "herdr:"
+
+
+def _detail(word: str) -> str:
+    """``word`` under the single Seam B prefix, idempotently."""
+    return word if word.startswith(HERDR_DETAIL_PREFIX) else HERDR_DETAIL_PREFIX + word
+
+
 @dataclass(frozen=True)
 class PromptSubmission:
     """What ONE ``agent.prompt`` did, in the delivery vocabulary (H2-S2).
@@ -277,16 +296,47 @@ def _submission_from_result(result: dict[str, Any]) -> PromptSubmission:
     if result.get("type") != "agent_prompted":
         return PromptSubmission(
             outcome=AttemptOutcome.VETO_UNVERIFIED,
-            detail=f"herdr_unexpected_result:{result.get('type')!r}",
+            detail=_detail(f"unexpected_result:{result.get('type')!r}"),
         )
     agent = result.get("agent")
     agent_dict: dict[str, Any] = agent if isinstance(agent, dict) else {}
     status = _as_status(agent_dict.get("agent_status"))
     return PromptSubmission(
         outcome=AttemptOutcome.DELIVERED,
-        detail=f"herdr:{status or 'unknown'}",
+        detail=_detail(status or "unknown"),
         agent_status=status,
         state_change_seq=_as_seq(agent_dict.get("state_change_seq")),
+    )
+
+
+async def _read_state(
+    send: Callable[..., Awaitable[dict[str, Any]]], target: str, timeout_s: float
+) -> PromptSubmission | None:
+    """The pre-submission state read, on the caller's already-open connection.
+
+    Its own, SHORTER bound, and its own swallowed failure — review r1 §10.5.
+    Two distinct things were conflated in r1: a read that cannot be answered and
+    a submission whose fate is unknown.  They differ in what was written to the
+    agent (nothing, versus a whole prompt), so they must not share a deadline and
+    must not share an outcome.  A read that fails here returns ``None``, the
+    submission goes ahead regardless, and ``_qualify_success`` reports
+    ``no_pre_state`` — which is honest, because by then the text HAS gone.
+
+    Never raises: a failed read is a missing input, not a failed delivery.
+    """
+    try:
+        result = await send("agent.get", {"target": target}, timeout_s=timeout_s)
+    except HerdrError:
+        logger.debug("herdr pre-submission state read failed for %s", target, exc_info=True)
+        return None
+    agent = result.get("agent")
+    if not isinstance(agent, dict):
+        return None
+    return PromptSubmission(
+        outcome=AttemptOutcome.DELIVERED,
+        detail=_detail("agent_state"),
+        agent_status=_as_status(agent.get("agent_status")),
+        state_change_seq=_as_seq(agent.get("state_change_seq")),
     )
 
 
@@ -308,23 +358,31 @@ def _qualify_success(
       by a different measure, and it catches the case where the pre-read raced.
 
     Both become ``SUBMISSION_UNCERTAIN``: the text HAS been handed to the
-    runtime (so it may not be re-offered blindly) and nothing acknowledged it
-    (so it is not a delivery).  A non-success submission is returned untouched —
-    a refusal needs no qualifying.
+    runtime (so the row must never be offered again — the store's per-id
+    quarantine is what enforces that) and nothing acknowledged it (so it is not
+    a delivery).  A non-success submission is returned untouched — a refusal
+    needs no qualifying.
+
+    **What this does NOT catch**, stated here and not only in
+    :meth:`HerdrClient.prompt_agent`: an agent that flips into an ack state in
+    the window between the read and the submission passes both arms and is
+    reported ``DELIVERED``.  herdr "does not track turns" and exposes no
+    submission identity, so this function has nothing left to compare.  Review
+    r1 §3 executed that case; it is open.
     """
     if submission.outcome is not AttemptOutcome.DELIVERED:
         return submission
     if before is None:
         return PromptSubmission(
             outcome=AttemptOutcome.SUBMISSION_UNCERTAIN,
-            detail="no_pre_state",
+            detail=_detail("no_pre_state"),
             agent_status=submission.agent_status,
             state_change_seq=submission.state_change_seq,
         )
     if before.agent_status in HERDR_PROMPT_ACK_STATES:
         return PromptSubmission(
             outcome=AttemptOutcome.SUBMISSION_UNCERTAIN,
-            detail=f"submitted_while_{before.agent_status}",
+            detail=_detail(f"submitted_while_{before.agent_status}"),
             agent_status=submission.agent_status,
             state_change_seq=submission.state_change_seq,
         )
@@ -335,7 +393,7 @@ def _qualify_success(
     ):
         return PromptSubmission(
             outcome=AttemptOutcome.SUBMISSION_UNCERTAIN,
-            detail="no_state_advance",
+            detail=_detail("no_state_advance"),
             agent_status=submission.agent_status,
             state_change_seq=submission.state_change_seq,
         )
@@ -348,15 +406,17 @@ def _submission_from_error_code(code: str, message: str) -> PromptSubmission:
     if code == HERDR_AGENT_PROMPT_STALLED:
         return PromptSubmission(
             outcome=AttemptOutcome.SUBMISSION_UNCERTAIN,
-            detail=HERDR_AGENT_PROMPT_STALLED,
+            detail=_detail(HERDR_AGENT_PROMPT_STALLED),
         )
     if code == HERDR_TIMEOUT:
         return PromptSubmission(
             outcome=AttemptOutcome.SUBMISSION_UNCERTAIN,
-            detail=HERDR_TIMEOUT,
+            detail=_detail(HERDR_TIMEOUT),
         )
     if code == HERDR_AGENT_BLOCKED:
-        return PromptSubmission(outcome=AttemptOutcome.VETO_DIALOG, detail=HERDR_AGENT_BLOCKED)
+        return PromptSubmission(
+            outcome=AttemptOutcome.VETO_DIALOG, detail=_detail(HERDR_AGENT_BLOCKED)
+        )
     if code == HERDR_AGENT_NOT_FOUND:
         # The live arm on grok-box-005 (2026-09-16) is where this code came
         # from: a prompt to a name herdr does not hold answers
@@ -364,9 +424,11 @@ def _submission_from_error_code(code: str, message: str) -> PromptSubmission:
         # the attempt budget — but the pane injector already has a word for "no
         # pane to write to" and using a different one for the same fact would
         # make two carriers' journals disagree about one condition.
-        return PromptSubmission(outcome=AttemptOutcome.PANE_ABSENT, detail=HERDR_AGENT_NOT_FOUND)
+        return PromptSubmission(
+            outcome=AttemptOutcome.PANE_ABSENT, detail=_detail(HERDR_AGENT_NOT_FOUND)
+        )
     logger.debug("unmapped herdr agent.prompt error code %s: %s", code, message)
-    return PromptSubmission(outcome=AttemptOutcome.VETO_UNVERIFIED, detail=f"herdr_error:{code}")
+    return PromptSubmission(outcome=AttemptOutcome.VETO_UNVERIFIED, detail=_detail(f"error:{code}"))
 
 
 class HerdrClient:
@@ -397,10 +459,16 @@ class HerdrClient:
         *,
         connect_timeout_s: float = 5.0,
         request_timeout_s: float = 10.0,
+        state_read_timeout_s: float = 3.0,
     ) -> None:
         self._socket_path = socket_path
         self._connect_timeout_s = connect_timeout_s
         self._request_timeout_s = request_timeout_s
+        #: SEPARATE from the request bound, and shorter, because a state read is
+        #: an OPTIONAL input to the mapping while a submission is the delivery
+        #: itself.  A slow read must not spend the submission's budget, and it
+        #: must never be reported as a submission that may have landed.
+        self._state_read_timeout_s = state_read_timeout_s
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._id_counter = 0
@@ -538,6 +606,92 @@ class HerdrClient:
                     self._event_buffer.append(reply)
                 # else: a stray line for another id — skip; see docstring.
 
+    @asynccontextmanager
+    async def _one_shot(self) -> AsyncIterator[Callable[..., Awaitable[dict[str, Any]]]]:
+        """One short-lived connection, over which SEVERAL requests may be issued.
+
+        r1 had only :meth:`request_once`, one connection per request.  That is
+        correct for an isolated call and wrong for a pair of calls whose ORDER
+        and CLOSENESS is the point: Seam B reads the agent's state and then
+        submits, and everything that happens between the two is a race it cannot
+        see (review r1 §3).  A second connect, DNS-free though it is, is still a
+        socket setup, a scheduler hop and a teardown between them.
+
+        This does not CLOSE that race — nothing available in herdr 0.9.0 does,
+        and the docstring of :meth:`prompt_agent` says so plainly — it narrows
+        the window from two connection lifetimes to one message gap on a socket
+        that is already open.
+
+        The connection still carries no subscription, so the single-subscribe
+        rule :meth:`request_once` documents is untouched.
+        """
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_unix_connection(self._socket_path),
+                timeout=self._connect_timeout_s,
+            )
+        except (OSError, asyncio.TimeoutError) as exc:
+            raise HerdrTransportError(
+                f"could not connect to herdr socket {self._socket_path}: {exc}",
+                submitted=False,
+            ) from exc
+
+        async def send(
+            method: str,
+            params: dict[str, Any] | None = None,
+            *,
+            timeout_s: float | None = None,
+        ) -> dict[str, Any]:
+            # H2: whether THIS request's bytes reached herdr is the difference
+            # between "retry this" and "we do not know what happened", so it is
+            # tracked per request rather than inferred from the exception type.
+            flushed = False
+            try:
+                request_id = self._next_id()
+                payload = (
+                    json.dumps(
+                        {"id": request_id, "method": method, "params": params or {}}
+                    ).encode()
+                    + b"\n"
+                )
+                writer.write(payload)
+                await writer.drain()
+                flushed = True
+                deadline = self._request_timeout_s if timeout_s is None else timeout_s
+                while True:
+                    line = await asyncio.wait_for(reader.readline(), timeout=deadline)
+                    if not line:
+                        raise HerdrTransportError("herdr socket closed")
+                    body = line.strip()
+                    if not body:
+                        continue
+                    obj = json.loads(body)
+                    if not isinstance(obj, dict):
+                        raise HerdrTransportError(f"herdr sent a non-object line: {obj!r}")
+                    if obj.get("id") == request_id:
+                        return _envelope_result(obj)
+                    # A one-shot connection carries no subscription, so anything
+                    # else on it is noise; keep reading for our reply.
+            except HerdrTransportError as exc:
+                # Raised inside the loop (a closed socket, a non-object line, a
+                # reply carrying neither result nor error) — all of them AFTER
+                # the flush.  Re-raised carrying that fact rather than swallowed
+                # into the generic arm, which would lose it.
+                raise HerdrTransportError(str(exc), submitted=flushed) from exc
+            except (OSError, asyncio.TimeoutError, json.JSONDecodeError, ValueError) as exc:
+                raise HerdrTransportError(
+                    f"herdr one-shot request {method} failed: {exc}", submitted=flushed
+                ) from exc
+
+        try:
+            yield send
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except (OSError, RuntimeError):
+                logger.debug("herdr one-shot close raced a broken transport", exc_info=True)
+
     async def request_once(
         self, method: str, params: dict[str, Any] | None = None
     ) -> dict[str, Any]:
@@ -559,65 +713,11 @@ class HerdrClient:
         protocol read on the streaming connection, ``subscribe`` failed with
         "Connection lost" on every attempt and the source never received an
         event.
+
+        A one-request case of :meth:`_one_shot`.
         """
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_unix_connection(self._socket_path),
-                timeout=self._connect_timeout_s,
-            )
-        except (OSError, asyncio.TimeoutError) as exc:
-            # H2: the connect was OUTSIDE the try below, so an absent or dead
-            # socket escaped as a raw ``OSError`` — past every caller that
-            # catches this leaf's own hierarchy.  It is wrapped here, with
-            # ``submitted=False``: nothing can have been written on a connection
-            # that was never opened.
-            raise HerdrTransportError(
-                f"could not connect to herdr socket {self._socket_path}: {exc}",
-                submitted=False,
-            ) from exc
-        # H2: whether the request bytes reached herdr is the difference between
-        # "retry this" and "we do not know what happened", so it is TRACKED
-        # rather than inferred from the exception type.
-        flushed = False
-        try:
-            request_id = self._next_id()
-            payload = (
-                json.dumps({"id": request_id, "method": method, "params": params or {}}).encode()
-                + b"\n"
-            )
-            writer.write(payload)
-            await writer.drain()
-            flushed = True
-            while True:
-                line = await asyncio.wait_for(reader.readline(), timeout=self._request_timeout_s)
-                if not line:
-                    raise HerdrTransportError("herdr socket closed")
-                text = line.strip()
-                if not text:
-                    continue
-                obj = json.loads(text)
-                if not isinstance(obj, dict):
-                    raise HerdrTransportError(f"herdr sent a non-object line: {obj!r}")
-                if obj.get("id") == request_id:
-                    return _envelope_result(obj)
-                # A one-shot connection carries no subscription, so anything else
-                # on it is noise; keep reading for our reply.
-        except HerdrTransportError as exc:
-            # Raised inside the loop (a closed socket, a non-object line, a reply
-            # carrying neither result nor error) — all of them AFTER the flush.
-            # Re-raised carrying that fact rather than swallowed into the generic
-            # arm, which would lose it.
-            raise HerdrTransportError(str(exc), submitted=flushed) from exc
-        except (OSError, asyncio.TimeoutError, json.JSONDecodeError, ValueError) as exc:
-            raise HerdrTransportError(
-                f"herdr one-shot request {method} failed: {exc}", submitted=flushed
-            ) from exc
-        finally:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except (OSError, RuntimeError):
-                logger.debug("herdr one-shot close raced a broken transport", exc_info=True)
+        async with self._one_shot() as send:
+            return await send(method, params)
 
     async def prompt_agent(
         self,
@@ -639,19 +739,45 @@ class HerdrClient:
         connection.  So Seam B never shares a socket with Seam A and cannot
         poison it.
 
-        **A success is QUALIFIED against the state the agent was in before.**
-        This is not defensive tidiness; it is the live arm's finding.  On
-        grok-box-005 (2026-09-16), a prompt issued while the pi pane was already
-        ``working`` came back successful in 302 ms — because ``wait`` matches
-        *the first state observed after submission* and ``working`` was already
-        true, and because herdr's own five-second submission gate is documented
-        to run only "when an accepted submission starts from another non-working
-        state".  So on a busy agent the reply proves the agent was busy, not that
-        it took the text.  Reporting ``DELIVERED`` there would be the exact
-        false receipt this seam exists to stop, so the pre-state is read first
-        and a success from an ack state is projected to
-        ``SUBMISSION_UNCERTAIN``.  The extra round-trip cost about 0.3 s on that
-        box, against a 20-second injection budget.
+        **A success is QUALIFIED against the state the agent was in before —
+        and that does NOT close the race.**  Say the open part first, because r1
+        claimed closure and review r1 §3 disproved it.
+
+        herdr 0.9.0's own ``agent prompt --help`` ends:
+
+            "It does not track turns: if the agent is already working, that
+            active turn's completion may match."
+
+        A reply therefore carries no identity of its own.  ``--wait`` matches the
+        first state observed after submission, and herdr's five-second
+        submission gate runs only "when an accepted submission starts from
+        another non-working state".  Two consequences, and only the first is
+        fixed here:
+
+        * **Closed:** the agent was ALREADY in an ack state when we read it.  The
+          reply is then evidence of nothing, and the pre-state read catches it —
+          on grok-box-005 (2026-09-16) a prompt to an already-``working`` pi pane
+          came back successful in 302 ms, and now projects to
+          ``SUBMISSION_UNCERTAIN``.
+        * **OPEN:** the agent flips ``idle -> working`` in the window BETWEEN the
+          read and the submission — it self-started, or another writer prompted
+          it.  Its own transition advances ``state_change_seq``, both qualifier
+          arms pass, and the outcome is ``DELIVERED`` while our text sits
+          unconsumed in a mid-turn composer.  herdr exposes no submission id and
+          no per-submission event, so no comparison available to this client
+          separates that from a true delivery.
+
+        What is done about the open case is narrowing, not closing: the read and
+        the submission share ONE connection (:meth:`_one_shot`), so the window is
+        a message gap rather than two connection lifetimes.  The residual belongs
+        in the cohort's certification row as reduced assurance (blueprint
+        amendment (7)) and is never to be described as closed.
+
+        The mirror race — the pane finishing its turn in the window, so a genuine
+        delivery is downgraded — is left conservative on purpose.  Since the
+        quarantine became per-id and lives in the store, a spurious
+        ``SUBMISSION_UNCERTAIN`` costs one row held to ``dead_by`` and can no
+        longer seed a duplicate, which is what made it worth arguing about in r1.
 
         **Exactly one submission per call, in every arm.**  There is no internal
         retry and no second ``agent.prompt`` on any path, including the arms
@@ -692,7 +818,6 @@ class HerdrClient:
         configuration fault that should die on the budget rather than sit open
         until ``dead_by``.
         """
-        before = await self.agent_state(target=target)
         params: dict[str, Any] = {
             "target": target,
             "text": text,
@@ -702,18 +827,20 @@ class HerdrClient:
             },
         }
         try:
-            result = await self.request_once("agent.prompt", params)
+            async with self._one_shot() as send:
+                before = await _read_state(send, target, self._state_read_timeout_s)
+                result = await send("agent.prompt", params)
         except HerdrRequestError as exc:
             return _submission_from_error_code(exc.code, exc.message)
         except HerdrTransportError as exc:
             if exc.submitted:
                 return PromptSubmission(
                     outcome=AttemptOutcome.SUBMISSION_UNCERTAIN,
-                    detail="herdr_transport_after_submit",
+                    detail=_detail("transport_after_submit"),
                 )
             return PromptSubmission(
                 outcome=AttemptOutcome.VETO_UNVERIFIED,
-                detail="herdr_transport_before_submit",
+                detail=_detail("transport_before_submit"),
             )
         return _qualify_success(_submission_from_result(result), before)
 

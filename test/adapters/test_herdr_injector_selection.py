@@ -139,20 +139,45 @@ def test_the_two_cohorts_are_decided_per_terminal_not_per_process(
 # ------------------------------------------------------------ the predicate
 
 
-def test_the_predicate_needs_both_halves(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The switch AND a PASS certification row; either alone is not enough."""
+def test_the_switch_is_structural_and_the_predicate_is_per_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r2: the switch is answered ONCE, by which object the tick holds.
+
+    Review r1 §1/§10.6: r1 read ``os.environ`` again inside every ``inject()``,
+    so the two readings could disagree — unsetting the variable in a running
+    process silently moved every terminal back to paste, while setting it did
+    nothing. The switch decides whether a dispatch EXISTS; the predicate only
+    answers the per-terminal half, and is never reached when the switch is off.
+    """
     from cli_agent_orchestrator.utils import herdr_runtime_gate
 
     herdr_runtime_gate.reset_gate()
-    monkeypatch.delenv(bootstrap.HERDR_DELIVERY_ENV_VAR, raising=False)
     herdr_runtime_gate.bind_terminal("t-1", True)
-    assert bootstrap._seam_b_selected("t-1") is False
 
+    # Off: no dispatch at all, so the predicate is structurally unreachable.
+    monkeypatch.delenv(bootstrap.HERDR_DELIVERY_ENV_VAR, raising=False)
+    pane = RecordingInjector("pane")
+    assert bootstrap._build_injector(pane, lambda: RecordingInjector("herdr")) is pane
+
+    # On: the dispatch exists, and the predicate answers the certification half
+    # alone — no second environment read.
     monkeypatch.setenv(bootstrap.HERDR_DELIVERY_ENV_VAR, "1")
     assert bootstrap._seam_b_selected("t-1") is True
-
     herdr_runtime_gate.reset_gate()
     assert bootstrap._seam_b_selected("t-1") is False
+
+
+def test_the_predicate_does_not_read_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pinned as an absence, because the cost r1 paid was a lookup per injection."""
+    from cli_agent_orchestrator.utils import herdr_runtime_gate
+
+    herdr_runtime_gate.reset_gate()
+    herdr_runtime_gate.bind_terminal("t-1", True)
+    monkeypatch.delenv(bootstrap.HERDR_DELIVERY_ENV_VAR, raising=False)
+    # The variable is UNSET and the answer is still True: the predicate's job is
+    # the certification row, not the switch.
+    assert bootstrap._seam_b_selected("t-1") is True
 
 
 def test_an_unbound_terminal_is_never_on_seam_b(monkeypatch: pytest.MonkeyPatch) -> None:
