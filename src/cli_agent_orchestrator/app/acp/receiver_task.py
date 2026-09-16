@@ -186,14 +186,31 @@ class ReceiverDeliveryTask:
         self._fault(TaskStep.PREPARED)
 
         if preparation.kind is PreparationKind.IDLE:
-            return self._submit(claimed, cut=None)
+            # D6b(3)'s IDLE branch: the dispatch INTENT is durable BEFORE the one
+            # write, so a crash between them leaves a ``prompting`` row the
+            # restart oracle can resolve honestly.
+            if not self._store.begin_prompt(claimed.fence):
+                self._store.fail_interrupt(claimed.fence, _DEAD_REASON_WINDOW_LOST, "window_lost")
+                return TaskReport(
+                    outcome=TaskOutcome.WINDOW_LOST,
+                    step=TaskStep.PREPARED,
+                    fence=claimed.fence,
+                )
+            return self._submit(claimed, self._advanced(claimed.fence), cut=None)
         handle = preparation.active_turn
         assert handle is not None  # PreparationKind.CANCEL_REQUIRED guarantees it
         return self._cancel_then_submit(claimed, handle)
 
     # -- the idle path -------------------------------------------------------
 
-    def _submit(self, claimed: ClaimedRow, *, cut: CancelSettlement | None) -> TaskReport:
+    def _submit(
+        self,
+        claimed: ClaimedRow,
+        fence: InterruptFence,
+        *,
+        cut: CancelSettlement | None,
+        window: CancelWindow | None = None,
+    ) -> TaskReport:
         """Exactly ONE prompt write, then the durable receipt.
 
         ``complete_prompt``'s commit IS the receipt — there is no separate marker
@@ -201,9 +218,7 @@ class ReceiverDeliveryTask:
         ``SUBMISSION_UNCERTAIN`` on restart, honestly, because the ACP subprocess
         did not survive the restart and the turn is gone either way.
         """
-        receipt = self._transport.submit(
-            terminal_id=self._receiver_id, envelope=claimed.envelope
-        )
+        receipt = self._transport.submit(terminal_id=self._receiver_id, envelope=claimed.envelope)
         self._fault(TaskStep.SUBMITTED)
 
         if receipt.ambiguous or not receipt.accepted:
@@ -211,48 +226,53 @@ class ReceiverDeliveryTask:
             # Whether the agent saw it is unknowable from here, so the attempt
             # resolves uncertain rather than guessing in either direction.
             self._store.fail_interrupt(
-                claimed.fence,
+                fence,
                 _DEAD_REASON_UNCERTAIN,
                 "prompt_ambiguous" if receipt.ambiguous else "window_lost",
             )
             return TaskReport(
                 outcome=TaskOutcome.SUBMISSION_UNCERTAIN,
                 step=TaskStep.SUBMITTED,
-                fence=claimed.fence,
+                fence=fence,
                 receipt=receipt,
                 settle=cut,
+                window=window,
             )
 
-        self._store.complete_prompt(claimed.fence, receipt)
+        self._store.complete_prompt(fence, receipt)
         self._fault(TaskStep.COMPLETED)
         return TaskReport(
             outcome=TaskOutcome.DELIVERED,
             step=TaskStep.COMPLETED,
-            fence=claimed.fence,
+            fence=fence,
             receipt=receipt,
             settle=cut,
+            # Carried through so ``cao diag`` can fold the cancel window onto the
+            # delivery it made room for: an interrupt that succeeded and one that
+            # was never blocked look identical without it.
+            window=window,
         )
 
     # -- the cancel path -----------------------------------------------------
 
-    def _cancel_then_submit(
-        self, claimed: ClaimedRow, handle: ActiveTurnHandle
-    ) -> TaskReport:
+    def _cancel_then_submit(self, claimed: ClaimedRow, handle: ActiveTurnHandle) -> TaskReport:
         """Open the exact cancel window, cut the turn, then submit into the gap."""
         # THE ONE CLOCK SAMPLE. Taken immediately before the store call and
         # passed in; everything downstream consumes what the aggregate persisted
         # from it, including after a restart.
         now = self._clock.now()
-        window = self._store.begin_cancel(claimed.fence, handle, now)
+        fence = claimed.fence
+        window = self._store.begin_cancel(fence, handle, now)
         self._fault(TaskStep.CANCEL_BEGUN)
         if isinstance(window, WindowLost):
             # Atomic: N and the session actor are untouched.
-            self._store.fail_interrupt(claimed.fence, _DEAD_REASON_WINDOW_LOST, "window_lost")
+            self._store.fail_interrupt(fence, _DEAD_REASON_WINDOW_LOST, "window_lost")
             return TaskReport(
                 outcome=TaskOutcome.WINDOW_LOST,
                 step=TaskStep.CANCEL_BEGUN,
-                fence=claimed.fence,
+                fence=fence,
             )
+        fence = self._advanced(fence)
 
         outcome = self._session.cancel_if_current(handle)
         if isinstance(outcome, CancelRaceLost):
@@ -260,15 +280,15 @@ class ReceiverDeliveryTask:
             # written. Back to pending under the same reservation, and the loop
             # that follows is bounded by ``pending_deadline`` — never by a retry
             # count invented here.
-            self._store.race_lost(claimed.fence)
+            self._store.race_lost(fence)
             return TaskReport(
                 outcome=TaskOutcome.RACE_LOST,
                 step=TaskStep.CANCEL_BEGUN,
-                fence=claimed.fence,
+                fence=fence,
                 window=window,
             )
 
-        self._store.mark_cancel_sent(claimed.fence, outcome.sent_at)
+        self._store.mark_cancel_sent(fence, outcome.sent_at)
         self._fault(TaskStep.CANCEL_SENT)
 
         # Against the PERSISTED deadline, never a recomputed one. After a restart
@@ -277,24 +297,52 @@ class ReceiverDeliveryTask:
         self._fault(TaskStep.CANCEL_SETTLED)
 
         if settle.kind is not SettleKind.CANCELLED:
-            return self._recover(claimed, window, settle)
+            return self._recover(claimed, fence, window, settle)
 
-        if not self._store.settle_to_prompt(claimed.fence, settle):
-            self._store.fail_interrupt(claimed.fence, _DEAD_REASON_WINDOW_LOST, "window_lost")
+        if not self._store.settle_to_prompt(fence, settle):
+            self._store.fail_interrupt(fence, _DEAD_REASON_WINDOW_LOST, "window_lost")
             return TaskReport(
                 outcome=TaskOutcome.WINDOW_LOST,
                 step=TaskStep.SETTLED_TO_PROMPT,
-                fence=claimed.fence,
+                fence=fence,
                 window=window,
                 settle=settle,
             )
         self._fault(TaskStep.SETTLED_TO_PROMPT)
-        return self._submit(claimed, cut=settle)
+        return self._submit(claimed, self._advanced(fence), cut=settle, window=window)
+
+    def _advanced(self, fence: InterruptFence) -> InterruptFence:
+        """The same fence with its GENERATION re-read, after a transition bumped it.
+
+        Every aggregate transition bumps ``generation`` — that is what makes the
+        CAS a fence rather than a hope — so a task that kept its original fence
+        would present a stale generation to the NEXT transition and be refused by
+        its own success. Called after each one; one short read, holding nothing.
+
+        The QUEUE half (``msg_id``, ``claim_id``, ``owner``) is deliberately NOT
+        re-read. That half fences the lease, and refreshing it would let a row
+        whose lease was lost keep working under a fence it no longer owns — the
+        opposite of what a fence is for.
+        """
+        state = self._store.read_state(self._receiver_id)
+        if state is None:
+            return fence
+        return InterruptFence(
+            terminal_id=fence.terminal_id,
+            msg_id=fence.msg_id,
+            claim_id=fence.claim_id,
+            owner=fence.owner,
+            generation=state.generation,
+        )
 
     # -- recovery ------------------------------------------------------------
 
     def _recover(
-        self, claimed: ClaimedRow, window: CancelWindow, settle: CancelSettlement
+        self,
+        claimed: ClaimedRow,
+        fence: InterruptFence,
+        window: CancelWindow,
+        settle: CancelSettlement,
     ) -> TaskReport:
         """The cancel did not settle inside its persisted deadline.
 
@@ -304,13 +352,13 @@ class ReceiverDeliveryTask:
         recovery is durable, so a second interrupt cannot be admitted into the
         gap.
         """
-        recovery = self._store.begin_recovery(claimed.fence, self._clock.now())
+        recovery = self._store.begin_recovery(fence, self._clock.now())
         self._fault(TaskStep.RECOVERING)
         if recovery is None:
             return TaskReport(
                 outcome=TaskOutcome.CANCEL_TIMEOUT,
                 step=TaskStep.RECOVERING,
-                fence=claimed.fence,
+                fence=fence,
                 window=window,
                 settle=settle,
             )
@@ -324,7 +372,7 @@ class ReceiverDeliveryTask:
                 return TaskReport(
                     outcome=TaskOutcome.RECOVERED,
                     step=TaskStep.FINALIZED,
-                    fence=claimed.fence,
+                    fence=fence,
                     window=window,
                     settle=settle,
                 )
@@ -335,14 +383,12 @@ class ReceiverDeliveryTask:
         # adapter that never exits on SIGTERM.
         gone = self._session.terminate_process_group(grace_s=ACP_KILL_GRACE_S)
         if gone:
-            self._store.expire_recovery(
-                self._receiver_id, generation, recovery.recovery_deadline
-            )
+            self._store.expire_recovery(self._receiver_id, generation, recovery.recovery_deadline)
             self._fault(TaskStep.FINALIZED)
         return TaskReport(
             outcome=TaskOutcome.RECOVERY_FAILED,
             step=TaskStep.FINALIZED if gone else TaskStep.RECOVERING,
-            fence=claimed.fence,
+            fence=fence,
             window=window,
             settle=settle,
             detail="process_group_gone" if gone else "process_group_alive",

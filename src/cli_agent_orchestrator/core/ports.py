@@ -1383,6 +1383,16 @@ class InterruptStore(Protocol):
         """
         ...
 
+    def begin_prompt(self, fence: InterruptFence) -> bool:
+        """CAS ``pending -> prompting`` — the IDLE branch's durable dispatch intent.
+
+        Its own operation because A2.3 puts the intent immediately BEFORE the one
+        adapter write: a crash between them must leave a ``prompting`` row, which
+        the restart oracle resolves ``SUBMISSION_UNCERTAIN`` because the bytes may
+        have left. Folded into ``complete_prompt`` that window would be invisible.
+        """
+        ...
+
     def complete_prompt(self, fence: InterruptFence, receipt: SubmitReceipt) -> bool:
         """CAS ``prompting -> none``, append I's ``presented``, close I's attempt.
 
