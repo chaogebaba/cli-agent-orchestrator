@@ -409,18 +409,28 @@ def _build_sampler_tick() -> Callable[[Sequence[TerminalRef]], None]:
        rules 3a/3b read through ``peek``;
     2. ``status_monitor.resync_from_pane_tail`` (F521 D15) — the forced re-derive
        after a signalled stream drop, plus the low-frequency PROCESSING/ERROR
-       backstop, read off the tail the sample already retained;
-    3. the F507 question-marker reconcile — level-triggered, cheap, and
+       backstop, read off the tail the sample already retained.  Skipped for a
+       terminal whose lifecycle is authoritative from herdr (§6): it is the
+       pane's lifecycle move, and that cohort takes lifecycle from the source;
+    3. ``status_monitor.classify_pane_sample`` (WP-ARCH 2b) — D1c/D1f on a
+       backend that feeds no chunk pipeline.  Inert on tmux, where
+       ``_apply_detection`` already classifies on every chunk; on herdr it is the
+       ONLY driver of ``status.pane_classified``, ``usage.capped`` and
+       ``prompt.awaiting``/``prompt.answered``.  NOT gated on the herdr
+       predicate — none of those three is a lifecycle kind, and the amendment
+       keeps dialog cards and vendor conditions coming from the pane even for a
+       certified terminal;
+    4. the F507 question-marker reconcile — level-triggered, cheap, and
        sampler-independent.
 
-    (3) still lives on the watchdog object as a private method, so it is called
+    (4) still lives on the watchdog object as a private method, so it is called
     defensively through ``getattr`` and skipped if it is gone.  Duplicating it
     here would mean a second copy of a transcript-walking heal in the composition
     root; the honest alternative is for 3c slice 4 to lift it to a service and
     for this call to follow it there.  Named to that lane.
 
     The ``peek`` guard is what makes this a hand-off rather than a second
-    sampler, and it gates ALL THREE consumers rather than only the capture.  A
+    sampler, and it gates ALL the riders rather than only the capture.  A
     fresh sample means another driver took it and is driving its riders; this
     tick then does nothing at all.  Only the tick that actually TAKES a sample
     drives the three things that read it — which is the watchdog's own shape,
@@ -448,6 +458,9 @@ def _build_sampler_tick() -> Callable[[Sequence[TerminalRef]], None]:
 
         from cli_agent_orchestrator.services.pane_liveness import pane_liveness
         from cli_agent_orchestrator.services.status_monitor import status_monitor
+        from cli_agent_orchestrator.utils.herdr_runtime_gate import (
+            herdr_lifecycle_authoritative,
+        )
 
         now = time.monotonic()
         for member in fleet:
@@ -464,9 +477,11 @@ def _build_sampler_tick() -> Callable[[Sequence[TerminalRef]], None]:
                     continue
                 retained = pane_liveness.peek(terminal_id, now=now)
                 if retained is not None:
-                    status_monitor.resync_from_pane_tail(
-                        terminal_id, retained.filtered_tail, now=now
-                    )
+                    if not herdr_lifecycle_authoritative(terminal_id):
+                        status_monitor.resync_from_pane_tail(
+                            terminal_id, retained.filtered_tail, now=now
+                        )
+                    status_monitor.classify_pane_sample(terminal_id, retained.filtered_tail)
                 _reconcile_question_marker(terminal_id)
             except Exception:
                 logger.debug("worker-truth: pane sample failed for %s", terminal_id, exc_info=True)
