@@ -127,3 +127,45 @@ def test_the_sample_cadence_covers_the_staleness_window() -> None:
     assert timing.PANE_SAMPLE_S * 2 <= timing.PANE_LIVENESS_STALENESS_S
     assert timing.PANE_SAMPLE_S < timing.PANE_HEARTBEAT_S
     assert timing.PANE_HEARTBEAT_S % timing.PANE_SAMPLE_S == 0
+
+
+# ------------------------------------- Seam B's submission wait (WP-HERDR H2)
+
+
+def test_the_seam_b_wait_is_bracketed_by_herdr_s_gate_and_the_inject_budget() -> None:
+    """B1/B2 as a statement, not only as a checker arm.
+
+    Both bounds change what a delivery OUTCOME means.  Under the lower one every
+    stall is reported as the coarser ``timeout``; over the upper one a single
+    submission outlives the round-trip its lease was sized for.
+    """
+    assert timing.HERDR_SUBMISSION_GATE_MS < timing.HERDR_PROMPT_WAIT_MS
+    assert timing.HERDR_PROMPT_WAIT_MS <= timing.DELIVERY_INJECT_BUDGET_S * 1000
+
+
+def test_check_delivery_orderings_rejects_a_wait_below_herdr_s_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The B1 arm is real: drop the wait under the gate and it raises."""
+    monkeypatch.setattr(timing, "HERDR_PROMPT_WAIT_MS", timing.HERDR_SUBMISSION_GATE_MS)
+    with pytest.raises(ValueError, match="B1"):
+        timing.check_delivery_orderings()
+
+
+def test_check_delivery_orderings_rejects_a_wait_over_the_inject_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """And the B2 arm."""
+    monkeypatch.setattr(timing, "HERDR_PROMPT_WAIT_MS", timing.DELIVERY_INJECT_BUDGET_S * 1000 + 1)
+    with pytest.raises(ValueError, match="B2"):
+        timing.check_delivery_orderings()
+
+
+def test_herdr_s_gate_is_the_number_herdr_documents() -> None:
+    """A MIRRORED herdr fact, re-certified with the protocol pin.
+
+    ``herdr agent prompt --help`` on 0.9.0: "--wait requires an observed working
+    or blocked state within 5000ms; otherwise it returns agent_prompt_stalled".
+    Pinned here so a herdr bump that moves it cannot pass silently.
+    """
+    assert timing.HERDR_SUBMISSION_GATE_MS == 5000

@@ -40,6 +40,8 @@ __all__ = [
     "DELIVERY_TICK_S",
     "DELIVERY_VETO_CEILING_S",
     "GATE_QUESTION_EXPIRY_S",
+    "HERDR_PROMPT_WAIT_MS",
+    "HERDR_SUBMISSION_GATE_MS",
     "IDLE_STALL_AGE_S",
     "WAKE_MAX_RECORD_AGE_S",
     "NO_SIGNAL_S",
@@ -261,6 +263,26 @@ DELIVERY_RETENTION_DAYS = 30
 #: duration and a second declaration is how two numbers come to disagree.
 GATE_QUESTION_EXPIRY_S = 3600
 
+#: herdr's OWN submission gate, MIRRORED here rather than measured (WP-HERDR H2).
+#:
+#: A herdr fact, not ours: ``herdr agent prompt --help`` on 0.9.0 states that an
+#: accepted submission starting from a non-working state "requires an observed
+#: working or blocked state within 5000ms; otherwise it returns
+#: agent_prompt_stalled".  It is mirrored for the same reason
+#: ``IDLE_STALL_AGE_S`` is — the number has to be raisable at import to bound the
+#: constant below, and ``core`` may not read a help text — and it is re-certified
+#: with the protocol pin, never drifted.
+HERDR_SUBMISSION_GATE_MS = 5000
+
+#: The caller-side bound on Seam B's ``agent.prompt`` wait (WP-HERDR H2).
+#:
+#: Sits BETWEEN two numbers, and both bounds are real failure modes rather than
+#: taste — see B1 and B2 in :func:`check_delivery_orderings`.  Below herdr's own
+#: gate it would convert every stall into the coarser ``timeout`` code and throw
+#: away the distinction the gate exists to draw; above the injection budget one
+#: submission could outlive the round-trip the lease was sized for.
+HERDR_PROMPT_WAIT_MS = 8000
+
 #: The legacy stalled-notice age, MIRRORED here rather than imported.
 #:
 #: The real definition is ``IDLE_STALL_AGE`` at ``services/inbox_service.py:146``
@@ -304,6 +326,9 @@ def check_delivery_orderings() -> None:
       R1's no-delayed-enqueue rule.
     * **I5** an injection that cannot finish inside its own lease has already
       lost the row.
+    * **B1/B2** Seam B's submission wait is bracketed by herdr's own gate below
+      and the injection budget above; either bound crossed makes a delivery
+      outcome mean something other than what it says.
 
     I3 is conservative by one backoff: a row dies on the fifth increment and the
     true span is 320 s rather than 325 s.  The stated form bounds ABOVE the true
@@ -338,6 +363,24 @@ def check_delivery_orderings() -> None:
         raise ValueError(
             f"I5: DELIVERY_INJECT_BUDGET_S ({DELIVERY_INJECT_BUDGET_S}) must be < "
             f"DELIVERY_LEASE_S ({DELIVERY_LEASE_S})"
+        )
+    if HERDR_PROMPT_WAIT_MS <= HERDR_SUBMISSION_GATE_MS:
+        # B1 (WP-HERDR Seam B).  A caller bound that expires first answers every
+        # stalled submission with the coarser ``timeout`` code, which collapses
+        # "herdr watched and saw nothing" into "we stopped watching" — the same
+        # AttemptOutcome either way, but the evidence a live round needs to tell
+        # a composer-eating provider from a slow one is gone.
+        raise ValueError(
+            f"B1: HERDR_PROMPT_WAIT_MS ({HERDR_PROMPT_WAIT_MS}) must be > "
+            f"HERDR_SUBMISSION_GATE_MS ({HERDR_SUBMISSION_GATE_MS})"
+        )
+    if HERDR_PROMPT_WAIT_MS > DELIVERY_INJECT_BUDGET_S * 1000:
+        # B2.  The injection budget is what the lease was sized to accommodate
+        # (I5); a submission wait allowed to exceed it puts one injection outside
+        # the bound its own lease was chosen for, and the tick blocks on it.
+        raise ValueError(
+            f"B2: HERDR_PROMPT_WAIT_MS ({HERDR_PROMPT_WAIT_MS}) must be <= "
+            f"DELIVERY_INJECT_BUDGET_S * 1000 ({DELIVERY_INJECT_BUDGET_S * 1000})"
         )
     if DELIVERY_MAX_ATTEMPTS < 1:
         raise ValueError(f"DELIVERY_MAX_ATTEMPTS ({DELIVERY_MAX_ATTEMPTS}) must be >= 1")
