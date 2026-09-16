@@ -82,6 +82,22 @@ AGENT_PROFILE = "code_supervisor"
 # editing the module; `mock_cli` keeps the default runnable anywhere.
 PROVIDER = os.environ.get("CAO_LITE_E2E_PROVIDER", "mock_cli")
 
+# Pin the model when running against a real provider, so a box run cannot silently
+# pick up whatever that box's providers.toml happens to default to.
+MODEL = os.environ.get("CAO_LITE_E2E_MODEL", "")
+
+
+def _session_params(session_name: str) -> dict[str, str]:
+    params = {
+        "provider": PROVIDER,
+        "agent_profile": AGENT_PROFILE,
+        "session_name": session_name,
+    }
+    if MODEL:
+        params["model"] = MODEL
+    return params
+
+
 _POLL_INTERVAL = 0.25
 _DELIVERY_TIMEOUT = float(os.environ.get("CAO_LITE_E2E_DELIVERY_TIMEOUT", "60"))
 _IDLE_TIMEOUT = float(os.environ.get("CAO_LITE_E2E_IDLE_TIMEOUT", "90"))
@@ -206,11 +222,7 @@ def _run_round_trip(project: Path, home: Path) -> Observables:
                 session_name = f"lite-{uuid.uuid4().hex[:8]}"
                 created = requests.post(
                     f"{server.url}/sessions",
-                    params={
-                        "provider": PROVIDER,
-                        "agent_profile": AGENT_PROFILE,
-                        "session_name": session_name,
-                    },
+                    params=_session_params(session_name),
                     timeout=_CREATE_TIMEOUT,
                 )
                 if created.status_code >= 500 and PROVIDER in created.text.lower():
@@ -709,11 +721,7 @@ def test_env_store_artifacts_dir_reaches_a_spawned_pane(
             server = _start_cao_server(home, _pick_free_port())
             created = requests.post(
                 f"{server.url}/sessions",
-                params={
-                    "provider": PROVIDER,
-                    "agent_profile": AGENT_PROFILE,
-                    "session_name": session_name,
-                },
+                params=_session_params(session_name),
                 timeout=_CREATE_TIMEOUT,
             )
             assert created.status_code in (200, 201), f"{created.status_code} {created.text}"
