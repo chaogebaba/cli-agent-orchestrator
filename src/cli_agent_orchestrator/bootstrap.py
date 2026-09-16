@@ -69,10 +69,12 @@ from cli_agent_orchestrator.app.worker_truth.health import SourceHealth
 from cli_agent_orchestrator.app.worker_truth.projector import Projector, StaticSourceRegistry
 from cli_agent_orchestrator.app.worker_truth.publisher import StatusPublisher
 from cli_agent_orchestrator.app.worker_truth.sweep import ProjectorSweep
+from cli_agent_orchestrator.core.delivery import InjectionResult
 from cli_agent_orchestrator.core.ports import (
     Clock,
     EventStore,
     FindingStore,
+    PaneInjector,
     QueueStore,
     StateStore,
 )
@@ -671,6 +673,94 @@ def _start_delivery(
     return True, store, tick
 
 
+class _CertifiedInjectorDispatch:
+    """One :class:`~core.ports.PaneInjector` that picks a carrier per terminal.
+
+    WP-HERDR §4 says Seam B's injector is "selected per certified terminal in the
+    one place adapters are named".  That place is this module — but
+    :class:`~app.delivery.wake.WakeService` holds ONE injector for ALL terminals
+    (``wake.py:117``/``:123``), so "per terminal" is not expressible by handing it
+    a different object.  The 2026-09-16 amendment (3) resolves it here: a
+    dispatching implementation of the SAME port, built in the composition root,
+    that answers the certification question inside ``inject()`` and delegates.
+
+    Three properties this shape has that the rejected alternative does not.  The
+    alternative was widening ``WakeService.__init__`` to take a factory:
+
+    * the port is unchanged, so ``app`` learns nothing new about terminals;
+    * ``app/delivery/wake.py`` is not edited at all, so H2 does not collide with
+      the ACP plane's own edit to that file (audit F4);
+    * both carriers are still NAMED only here, which is what
+      ``adapters-only-via-composition-root`` and this module's own rule are for.
+
+    **The herdr injector is built LAZILY and only once**, on the first certified
+    terminal.  With the switch off — the default — ``factory`` is never called
+    and no herdr object exists in the process, so the delivery path is what it
+    was before H2 down to the object graph, not merely in behaviour.
+    """
+
+    def __init__(
+        self,
+        pane: PaneInjector,
+        factory: Callable[[], PaneInjector],
+        predicate: Callable[[str], bool],
+    ) -> None:
+        self._pane = pane
+        self._factory = factory
+        self._predicate = predicate
+        self._herdr: PaneInjector | None = None
+
+    def inject(self, *, terminal_id: str, line: str) -> InjectionResult:
+        if not self._predicate(terminal_id):
+            return self._pane.inject(terminal_id=terminal_id, line=line)
+        if self._herdr is None:
+            self._herdr = self._factory()
+        return self._herdr.inject(terminal_id=terminal_id, line=line)
+
+
+def _seam_b_selected(terminal_id: str) -> bool:
+    """Is THIS terminal on Seam B?  Both halves must hold.
+
+    ``CAO_HERDR_DELIVERY`` is the process switch, and the terminal's cell must
+    carry a PASS ``herdr_certification`` row — the D9 predicate, resolved once at
+    terminal create and cached by ``utils/herdr_runtime_gate`` so a position file
+    edited mid-run cannot move a live occupant between carriers (§8: never switch
+    truth sources mid-occupant; the same rule applies to switching its CARRIER).
+
+    Fail-closed: an unbound terminal, an unreadable answer or an unset switch all
+    keep the composer paste, which is the pre-H2 behaviour.  Reading the gate
+    through a wrapped import rather than at module scope keeps a boot that cannot
+    import it on the paste path instead of failing.
+    """
+    if not herdr_delivery_enabled():
+        return False
+    try:
+        from cli_agent_orchestrator.utils.herdr_runtime_gate import terminal_certified
+
+        return terminal_certified(terminal_id)
+    except Exception:  # noqa: BLE001 — an unanswerable predicate is "not certified"
+        logger.debug("herdr delivery: certification unreadable for %s", terminal_id, exc_info=True)
+        return False
+
+
+def _build_injector(
+    pane: PaneInjector,
+    herdr_factory: Callable[[], PaneInjector],
+    *,
+    predicate: Callable[[str], bool] | None = None,
+) -> PaneInjector:
+    """The injector the tick gets: the bare paste, or the dispatch.
+
+    With ``CAO_HERDR_DELIVERY`` unset this returns the SAME object
+    ``_build_delivery_tick`` passed before H2 — not a wrapper around it.  That is
+    the rollback property stated as code: switch off is not "the dispatch chooses
+    paste every time", it is that no dispatch exists.
+    """
+    if not herdr_delivery_enabled():
+        return pane
+    return _CertifiedInjectorDispatch(pane, herdr_factory, predicate or _seam_b_selected)
+
+
 def _build_delivery_tick(
     store: QueueStore,
     clock: Clock,
@@ -694,6 +784,7 @@ def _build_delivery_tick(
     """
     try:
         from cli_agent_orchestrator.services.queue_carrier import (
+            HerdrPromptInjector,
             LegacyInboxAdoption,
             LegacyReceiverDirectory,
             NativeSeatCarrier,
@@ -705,7 +796,7 @@ def _build_delivery_tick(
             store=store,
             directory=directory,
             carrier=NativeSeatCarrier(),
-            injector=PaneWorkerInjector(),
+            injector=_build_injector(PaneWorkerInjector(), HerdrPromptInjector),
             clock=clock,
         )
         return DeliveryTick(
