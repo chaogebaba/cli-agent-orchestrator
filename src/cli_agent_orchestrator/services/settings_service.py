@@ -243,15 +243,11 @@ def requested_effort_for_terminal(terminal_id: Optional[str]) -> Optional[str]:
     if not terminal_id:
         return None
     try:
-        from cli_agent_orchestrator.clients.database import get_terminal_metadata
+        from cli_agent_orchestrator.clients.database import get_terminal_requested_effort
 
-        row = get_terminal_metadata(terminal_id)
+        return get_terminal_requested_effort(terminal_id)
     except Exception:  # noqa: BLE001 — a diagnosability read may not fail a launch
         return None
-    if not row:
-        return None
-    value = row.get("requested_effort")
-    return value if isinstance(value, str) else None
 
 
 def resolve_reasoning_effort(

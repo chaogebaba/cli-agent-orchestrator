@@ -32,6 +32,12 @@ from cli_agent_orchestrator.core.transport import (
 
 # A pre-D20 terminals table: the two coordinates NOT NULL, no ``transport``
 # column, and one trigger plus one index, so the rebuild has to preserve both.
+# A pre-D20 terminals table that mirrors the SHAPE of the real one, not a
+# convenient toy.  Two properties matter and an earlier fixture had neither:
+# the statement ends in TABLE-LEVEL CHECK constraints, so it closes with several
+# ``)`` in a row; and one column carries its own inline CHECK.  A rebuild that
+# strips trailing parens to append something destroys both, which is precisely
+# the defect the production-upgrade test caught and this fixture now reproduces.
 _LEGACY_TERMINALS_DDL = """
 CREATE TABLE terminals (
     id TEXT PRIMARY KEY,
@@ -40,10 +46,16 @@ CREATE TABLE terminals (
     provider TEXT NOT NULL,
     agent_profile TEXT,
     worktree_info TEXT,
+    init_state TEXT NOT NULL DEFAULT 'ready'
+        CHECK (init_state IN ('init_pending','ready','init_failed_notified')),
+    init_owner_epoch TEXT,
+    init_deadline_s REAL,
     lifecycle TEXT NOT NULL DEFAULT 'ephemeral'
         CHECK (lifecycle IN ('ephemeral','sticky')),
-    lifecycle_generation INTEGER NOT NULL DEFAULT 0
-)
+    lifecycle_generation INTEGER NOT NULL DEFAULT 0,
+    CHECK (init_state != 'init_pending' OR
+           (init_owner_epoch IS NOT NULL AND init_deadline_s IS NOT NULL AND
+            init_deadline_s >= 1.0 AND init_deadline_s <= 600.0)))
 """
 
 _LEGACY_INDEX = "CREATE INDEX ix_terminals_provider ON terminals (provider)"
@@ -127,6 +139,34 @@ def test_the_pre_d20_row_is_backfilled_as_a_pane_terminal(legacy_db: Path) -> No
     assert row["tmux_session"] == "cao-demo"
     assert row["tmux_window"] == "w0"
     assert is_pane_terminal(dict(row))
+
+
+def test_the_rebuild_preserves_the_tables_own_check_constraints(legacy_db: Path) -> None:
+    """The rebuild must not destroy a constraint on its way past it.
+
+    The real ``terminals`` DDL ends in table-level CHECKs, so it closes with
+    several ``)`` in a row.  An earlier draft appended its own constraints after
+    ``rstrip(")")``, which ate all of them and produced ``near "TEXT": syntax
+    error`` on the first real database it met — green against a one-column
+    fixture, fatal against production.
+    """
+    db_mod._migrate_d20_acp_transport()
+    conn = sqlite3.connect(str(legacy_db), isolation_level=None)
+    try:
+        ddl = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='terminals'"
+        ).fetchone()[0]
+        assert "init_state IN" in ddl, "the inline column CHECK survived"
+        assert "init_state != 'init_pending'" in ddl, "the table-level CHECK survived"
+        assert "ck_terminals_transport" in ddl
+        # And it is still a LIVE constraint, not merely text.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO terminals (id, tmux_session, tmux_window, provider, init_state) "
+                "VALUES ('eeee9999','s','w','claude_code','init_pending')"
+            )
+    finally:
+        conn.close()
 
 
 def test_the_rebuild_preserves_the_index_and_the_trigger(legacy_db: Path) -> None:
@@ -345,7 +385,7 @@ _NAMED_CONSUMERS = (
     "services/fleet_service.py",
     "services/terminal_service.py",
     "backends/registry.py",
-)
+)  # registry.py stays on the list: it must not grow a NULL check either
 
 _FORBIDDEN = (
     "tmux_session is none",
@@ -428,10 +468,16 @@ def test_the_grep_does_not_fire_on_a_transport_branch() -> None:
 
 
 def test_an_acp_terminal_has_no_pane_backend(monkeypatch: pytest.MonkeyPatch) -> None:
-    from cli_agent_orchestrator.backends import registry
+    """The helper lives in ``fleet_service``, not ``backends/registry``.
+
+    ``registry.py`` is legacy, and the AC11 hook-point contract is an EQUALITY
+    over which legacy files may reach the new tree; adding it there would claim
+    it is a phase-1 hook point, which it is not.
+    """
+    import cli_agent_orchestrator.services.fleet_service as fs
 
     sentinel = object()
-    monkeypatch.setattr(registry, "get_backend", lambda: sentinel)
-    assert registry.backend_for_terminal({"transport": "acp"}) is None
-    assert registry.backend_for_terminal({"transport": "pane"}) is sentinel
-    assert registry.backend_for_terminal({}) is sentinel
+    monkeypatch.setattr(fs, "get_backend", lambda: sentinel)
+    assert fs.backend_for_terminal({"transport": "acp"}) is None
+    assert fs.backend_for_terminal({"transport": "pane"}) is sentinel
+    assert fs.backend_for_terminal({}) is sentinel

@@ -168,6 +168,13 @@ class TestCoverageMatrix:
             # obligation of their own.
             "assign_elastic",
             "complete_assignment",
+            # WP-ACP-PLANE D21: the BARE surface's only read tool (exposed as
+            # ``list``). Infrastructure, like ``load_skill`` two entries up and
+            # for the same reason — it answers "what is unfinished on this
+            # terminal", not a subagent-orchestration interaction. The roster is
+            # frozen at 13 surfaces by the assertions below, so a tool with no UX
+            # obligation belongs here rather than as a fourteenth row.
+            "list_outstanding",
         }
 
         # Check: every extracted tool (minus known exclusions) must be rostered

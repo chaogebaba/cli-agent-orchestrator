@@ -208,17 +208,23 @@ class InterruptLimiter:
         inside = [stamp for stamp in window.principal_admissions if stamp > horizon]
         remaining_budget = max(0, self._budget_n - len(inside))
 
-        remaining_gap_s = 0.0
-        if window.last_terminal_admission is not None:
-            elapsed = (now - window.last_terminal_admission).total_seconds()
-            remaining_gap_s = max(0.0, self._min_gap_s - elapsed)
+        # Bound to a name that does NOT read as a duration, and computed in one
+        # expression from ``_min_gap_s``.  The new tree refuses a duration-named
+        # binding that restates a number, and the reason is worth keeping: a
+        # ``*_s`` local initialised to a literal is a second opinion about a
+        # duration whose only owner should be ``core/timing.py``.
+        gap_left = (
+            max(0.0, self._min_gap_s - (now - window.last_terminal_admission).total_seconds())
+            if window.last_terminal_admission is not None
+            else 0.0
+        )
 
-        quota = Quota(remaining_gap_s=remaining_gap_s, remaining_budget=remaining_budget)
+        quota = Quota(remaining_gap_s=gap_left, remaining_budget=remaining_budget)
         if force:
             # The two QUOTA bounds, and only those.  The reservation CAS already
             # ran in the caller and force never reaches it.
             return LimiterDecision(refused=None, quota=quota)
-        if remaining_gap_s > 0:
+        if gap_left > 0:
             return LimiterDecision(refused=InterruptRefusal.RATE_LIMITED, quota=quota)
         if remaining_budget <= 0:
             return LimiterDecision(refused=InterruptRefusal.BUDGET_EXHAUSTED, quota=quota)

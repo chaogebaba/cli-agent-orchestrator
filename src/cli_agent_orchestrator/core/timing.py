@@ -32,6 +32,7 @@ from __future__ import annotations
 __all__ = [
     "ACP_CANCEL_SETTLE_S",
     "ACP_KILL_GRACE_S",
+    "ACP_TEARDOWN_POLL_S",
     "ACP_WRITE_SETTLE_S",
     "BUSY_CREDIT_CAP_S",
     "BUSY_CREDIT_MARGIN_S",
@@ -445,6 +446,19 @@ BUSY_CREDIT_CAP_S = 90
 #: that used its whole credit still dies STRICTLY before the legacy notice could
 #: speak about it.  One ``DELIVERY_TICK_S``: the tick has to get one scan in.
 BUSY_CREDIT_MARGIN_S = 10
+
+#: How often the process-group teardown re-checks whether the group is gone.
+#:
+#: NOT one of AC-S1.24's nine: it is a POLL CADENCE, not a bound, and nothing is
+#: signed against it — ``ACP_KILL_GRACE_S`` is the bound and this only decides
+#: how finely it is observed.  It lives here because §4c admits exactly one home
+#: for a duration, and because a literal passed to ``sleep`` anywhere in the new
+#: tree is refused by its own check: an unnamed number slept on is a duration
+#: with no owner.
+#:
+#: 0.05 s gives ~60 observations inside the 3 s grace, which is far more
+#: resolution than the 0.552 s worst-case exit needs and still costs nothing.
+ACP_TEARDOWN_POLL_S = 0.05
 
 #: How many journal-derived cuts per terminal the bounded ``recent_cuts`` view
 #: retains (D6b(4)).  A COUNT, not a duration, and bounded so a replacement seat
