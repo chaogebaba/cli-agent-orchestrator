@@ -65,6 +65,20 @@ _VALID_CLASSES = (CLASS_ROUTING, CLASS_EXPLICIT, CLASS_RESUME, CLASS_LEGACY)
 # certification check (same on a resume create). r4 derives the class here and
 # REFUSES any caller-supplied class that disagrees with the derived one — a
 # forged class can never enter the ``legacy`` (or any weaker) passthrough.
+# F1006 #854 — ...and r4's derivation read the WRONG name. The MCP ``assign``
+# resolver composes a bare position into ``<position>-<provider>`` CLIENT-side
+# (``resolve_assignment_target``) and POSTs that composed literal with
+# ``cell_request_class=routing``; the route then re-derived EXPLICIT from the
+# composed SHAPE and refused its own resolver's request, so on f0de2020 EVERY
+# routing-driven assign of a position 403'd regardless of certification. The
+# class is a property of RESOLUTION PROVENANCE — who composed the name — not of
+# the name's shape. A caller may therefore declare the bare position it was
+# resolved FROM (``cell_request_origin`` on the wire,
+# ``resolved_from_position`` here); the server does NOT trust that declaration,
+# it RE-RUNS the same routing composition and accepts the ROUTING class only
+# when routing itself would compose exactly this (agent_profile, provider) pair
+# from that position. A claim the resolver could not have produced falls back to
+# shape derivation and is still refused E-CELL-CLASS-FORGED.
 E_CELL_CLASS_FORGED = "E-CELL-CLASS-FORGED"
 
 # F862 (#718) D14 r6 — the findings-only provider's own typed refusal, raised
@@ -386,12 +400,69 @@ def _provider_not_in_allowlist(position: str, provider: str, positions_dir: Path
     return isinstance(allow, list) and bool(allow) and provider not in allow
 
 
+def routing_provenance_holds(
+    agent_profile: str,
+    provider: Optional[str],
+    resolved_from_position: Optional[str],
+    *,
+    routing_toml_path_override: Optional[Path] = None,
+) -> bool:
+    """F1006 #854 — True when the ROUTING resolver itself would compose exactly
+    ``(agent_profile, provider)`` from the bare position ``resolved_from_position``.
+
+    This is the VERIFICATION of a caller's provenance declaration, never a trust
+    of it. It re-runs the two steps ``resolve_assignment_target`` takes for a
+    bare position with NO caller-supplied provider — the routing.toml binding
+    (``kind="cao"``) and the ``<position>-<provider>`` synthesis — and compares
+    the result to what the request actually carries. All three must agree:
+
+    * ``resolved_from_position`` names a real position file;
+    * routing.toml binds that position to ``provider``;
+    * the composed name for that cell is ``agent_profile``.
+
+    Anything else (an unbound position, a different provider than the binding
+    chose, a name the synthesis does not produce, a malformed/absent routing
+    store) is False, and the caller's ROUTING claim is discarded — the class
+    then falls back to shape derivation, which refuses the disagreement. So a
+    request claiming ``routing`` for a name the resolver did NOT compose is
+    still ``E-CELL-CLASS-FORGED``, while the resolver's own request is admitted.
+    """
+    from cli_agent_orchestrator.constants import routing_toml_path
+    from cli_agent_orchestrator.utils.agent_profiles import (
+        _position_exists,
+        _synthesise_position_profile_name,
+    )
+    from cli_agent_orchestrator.utils.routing import load_routing_table
+
+    if not resolved_from_position or not isinstance(resolved_from_position, str):
+        return False
+    if not provider or not isinstance(agent_profile, str) or not agent_profile:
+        return False
+    if not _position_exists(resolved_from_position):
+        return False
+
+    rt_path = routing_toml_path_override or routing_toml_path()
+    try:
+        binding = load_routing_table(rt_path).binding_for(resolved_from_position, None)
+    except Exception:
+        return False
+    if binding is None or binding.kind != "cao" or not binding.provider:
+        return False
+    if binding.provider != provider:
+        return False
+
+    return _synthesise_position_profile_name(resolved_from_position, provider) == agent_profile
+
+
 def classify_request(
     agent_profile: str,
     *,
     provider_supplied: bool,
     is_resume: bool = False,
     resume_override: bool = False,
+    provider: Optional[str] = None,
+    resolved_from_position: Optional[str] = None,
+    routing_toml_path_override: Optional[Path] = None,
 ) -> str:
     """D5 classification from what an ENTRY POINT (MCP tool or HTTP route) got.
 
@@ -406,6 +477,14 @@ def classify_request(
     * a bare position file, no provider → ``ROUTING`` (routing binding chooses).
     * anything else (a non-position, non-composed-literal name) → ``LEGACY``.
 
+    F1006 #854 — ``resolved_from_position`` is PROVENANCE: the bare position an
+    upstream resolver composed ``agent_profile`` from. It is VERIFIED against
+    the server's own routing composition (:func:`routing_provenance_holds`) and,
+    when it holds, yields ``ROUTING`` even though the name now LOOKS composed —
+    because it looks composed only as a result of that routing resolution. A
+    declaration that does not verify is discarded, and the shape rules below
+    apply unchanged (so it cannot buy a weaker class).
+
     Fail-closed bias: an ambiguous position-shaped input defaults toward
     EXPLICIT (the strictest arm) rather than LEGACY.
     """
@@ -416,6 +495,17 @@ def classify_request(
 
     if is_resume:
         return CLASS_EXPLICIT if resume_override else CLASS_RESUME
+
+    # PROVENANCE before shape (F1006): the name's composed shape is the OUTPUT
+    # of the routing resolution being declared here, so deriving from the shape
+    # would refuse the resolver's own request. Verified, never trusted.
+    if resolved_from_position and routing_provenance_holds(
+        agent_profile,
+        provider,
+        resolved_from_position,
+        routing_toml_path_override=routing_toml_path_override,
+    ):
+        return CLASS_ROUTING
 
     if _position_exists(agent_profile):
         return CLASS_EXPLICIT if provider_supplied else CLASS_ROUTING
@@ -434,9 +524,12 @@ def reconcile_request_class(
     is_resume: bool = False,
     resume_override: bool = False,
     supplied_class: Optional[str] = None,
+    provider: Optional[str] = None,
+    resolved_from_position: Optional[str] = None,
+    routing_toml_path_override: Optional[Path] = None,
 ) -> str:
     """Derive the D5 request class SERVER-SIDE and refuse a forged override
-    (F868 #724 r4).
+    (F868 #724 r4, provenance F1006 #854).
 
     Computes the authoritative class from the request SHAPE via
     :func:`classify_request`, then:
@@ -457,12 +550,23 @@ def reconcile_request_class(
 
     The refusal is raised BEFORE any create call or resume claim, so a forged
     class yields a typed error and zero spawn.
+
+    F1006 #854 — ``resolved_from_position`` (wire name ``cell_request_origin``)
+    is the caller's PROVENANCE declaration and ``provider`` the resolved
+    provider it arrived with. Both feed :func:`classify_request`, which verifies
+    the declaration against the server's own routing composition before letting
+    it decide the class. The declaration can only ever produce the class the
+    server would itself derive for that resolution, so it is not a trust
+    channel: an unverifiable claim changes nothing and is still refused.
     """
     derived = classify_request(
         agent_profile,
         provider_supplied=provider_supplied,
         is_resume=is_resume,
         resume_override=resume_override,
+        provider=provider,
+        resolved_from_position=resolved_from_position,
+        routing_toml_path_override=routing_toml_path_override,
     )
     if supplied_class is None or supplied_class == derived:
         return derived

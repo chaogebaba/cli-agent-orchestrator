@@ -29,11 +29,13 @@ exercises the same code path the arms do.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import socket
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from cli_agent_orchestrator.chatgpt_web_runner.errors import (
@@ -320,3 +322,186 @@ def call_tool(
         return dict(json.loads(text))
     except json.JSONDecodeError:
         return {"error": {"message": "connector returned a non-JSON body"}}
+
+
+#: The ephemeral pairing-code file's name inside the attempt directory.
+PAIRING_CODE_FILENAME = "pairing.code"
+
+
+class PairingCodeFile:
+    """The raw pairing code's only on-disk home: 0600, and short-lived.
+
+    The durable ledger refuses raw secrets, so the operator's copy lives here
+    instead — next to the attempt, owner-only, and removed as soon as it stops
+    being useful. "Stops being useful" is not a timer: the file is unlinked when
+    the pairing session is no longer active, which is either because a client
+    consumed the code or because it expired. A consumed code left on disk is a
+    credential nobody is watching any more.
+
+    ``revoke()`` is idempotent and never raises, so teardown can always call it.
+    """
+
+    def __init__(self, attempt_dir: Path, pairing: Any) -> None:
+        self.path = Path(attempt_dir) / PAIRING_CODE_FILENAME
+        self._pairing = pairing
+        self._watcher: "Optional[asyncio.Task[None]]" = None
+
+    def write(self, code: str) -> str:
+        """Create the code file 0600 and return its SHA-256 for the ledger.
+
+        ``O_EXCL`` is the point, not decoration. Without it a pre-existing file
+        is ADOPTED and truncated, and since a mode argument applies only at
+        creation, the code is written into whatever mode that file already had —
+        world-readable, until a following ``chmod`` repairs it. The previous
+        revision said O_EXCL in a comment and did not pass it (B3 fixes-2
+        review, finding 2). With it there is no window at any mode but 0600, and
+        no file we did not create.
+
+        There is deliberately no ``revoke()`` before the open. Unlinking first
+        would make ``O_EXCL`` unobservable — every pre-existing file would be
+        silently replaced, which is the behaviour this is meant to refuse. The
+        path is per-attempt (``attempts/<attempt-id>/``) and ``write`` is called
+        once per attempt, so a file already there was not put there by us.
+        """
+        import errno
+        import hashlib
+        import os
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        try:
+            fd = os.open(str(self.path), flags, 0o600)
+        except FileExistsError as exc:
+            raise RunnerError(
+                RunnerErrorCode.ACCESS_DENIED,
+                f"refusing to write the pairing code: {self.path} already exists and is not "
+                "ours to replace — the attempt is refused rather than adopting a file whose "
+                "mode and owner we did not choose",
+                delivery_state=DeliveryState.NOTHING_SENT,
+            ) from exc
+        except OSError as exc:
+            if exc.errno == errno.EEXIST:  # pragma: no cover - platform variance
+                raise RunnerError(
+                    RunnerErrorCode.ACCESS_DENIED,
+                    f"refusing to write the pairing code: {self.path} already exists",
+                    delivery_state=DeliveryState.NOTHING_SENT,
+                ) from exc
+            raise
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(code + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+    def revoke(self) -> None:
+        """Remove the file. Idempotent; safe in a finally."""
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:  # pragma: no cover - teardown must not mask a run
+            pass
+
+    def start_watch(self, *, interval: float = 1.0) -> "asyncio.Task[None]":
+        """Unlink the file as soon as the pairing stops being active."""
+
+        async def _watch() -> None:
+            try:
+                while True:
+                    if not self._pairing.has_active_session():
+                        self.revoke()
+                        return
+                    await asyncio.sleep(interval)
+            except asyncio.CancelledError:  # pragma: no cover - teardown path
+                raise
+
+        self._watcher = asyncio.ensure_future(_watch())
+        return self._watcher
+
+    async def stop_watch(self) -> None:
+        """Cancel the watcher and remove the file unconditionally."""
+        watcher = self._watcher
+        self._watcher = None
+        if watcher is not None and not watcher.done():
+            watcher.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await watcher
+        self.revoke()
+
+
+#: D9.1: the connector auth store is keyed by CONNECTOR IDENTITY — the public
+#: base URL the operator authorised — not by attempt. Pairing is a human step
+#: that takes a browser, a settings page and a typed code; making every attempt
+#: repeat it is what made the live turn unrunnable.
+CONNECTOR_AUTH_DIRNAME = "connector-auth"
+
+
+def connector_auth_dir(artifacts_dir: Path, public_base_url: str) -> Path:
+    """The durable auth-store directory for one connector identity, 0700.
+
+    Hashed rather than slugged because the URL is not a safe path component and
+    because the digest reads the same on every host. Sixteen hex characters is
+    plenty to separate the handful of connectors one operator runs, and the
+    value is not a secret — it is derived from a URL the model is told anyway.
+    """
+    import hashlib
+    import os
+
+    key = hashlib.sha256(public_base_url.encode("utf-8")).hexdigest()[:16]
+    path = Path(artifacts_dir) / CONNECTOR_AUTH_DIRNAME / key
+    path.mkdir(parents=True, exist_ok=True)
+    # mkdir's mode is umask-dependent; set it explicitly on every call so an
+    # inherited 0755 from an earlier build does not persist.
+    os.chmod(path, 0o700)
+    return path
+
+
+class PairingExpired(RuntimeError):
+    """The operator did not complete the pairing inside the code's lifetime."""
+
+
+async def await_pairing_consumed(
+    pairing: Any,
+    *,
+    expires_at: float,
+    announce: Any,
+    poll_interval: float = 1.0,
+    countdown_interval: float = 30.0,
+    clock: Any = None,
+) -> float:
+    """Block until the operator pairs, or raise :class:`PairingExpired`.
+
+    This is the operator gate. Pairing needs a human in a second tab: open
+    Settings, find the connector, click Connect, type the code. The runner used
+    to print the code and then spend 5-15 seconds launching the browser,
+    navigating and minting — on the very page the human would have to navigate
+    away from. Nothing waited, so the pairing could not be completed and the
+    audit came back empty.
+
+    Waiting HERE, before any profile touch, is what makes the gate cheap: a turn
+    the operator abandons costs no browser launch and no mint.
+
+    Returns the seconds waited. ``announce`` receives a countdown line roughly
+    every ``countdown_interval`` seconds so a blocked runner never looks hung.
+    """
+    import time as _time
+
+    now = clock or _time.monotonic
+    started = now()
+    deadline_in = max(0.0, expires_at - _time.time())
+    next_announce = 0.0
+    while True:
+        if not pairing.has_active_session():
+            # Consumed (or invalidated). Either way the gate is open: the
+            # authorisation either exists now or never will for this code.
+            return now() - started
+        waited = now() - started
+        remaining = deadline_in - waited
+        if remaining <= 0:
+            raise PairingExpired(
+                f"the pairing code expired after {waited:.0f}s with no authorization"
+            )
+        if waited >= next_announce:
+            announce(f"PULL-PAIRING-WAIT {remaining:.0f}s left — pair in ChatGPT Settings")
+            next_announce = waited + countdown_interval
+        await asyncio.sleep(min(poll_interval, remaining))

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import click
 
-from cli_agent_orchestrator.services.verification_service import find_workspace_file
+from cli_agent_orchestrator.public_api.workspace import find_workspace_file
 
 # Recognized status tokens (case-insensitive).
 _DRAINED_STATUSES = {"drained-pass", "drained-fail", "verified"}

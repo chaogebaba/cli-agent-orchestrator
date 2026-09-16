@@ -2,28 +2,81 @@
 
 Corpus *discovery* is skill knowledge: it globs ``orchestrator/blueprints/*.md``,
 ``doctrine/**/*.md`` and ``orchestrator/GOLDEN-TIPS.md``. The per-file analysis it
-drives stays in ``services/fold_service`` and is unchanged; only the discovery,
-the corpus aggregate and the command surface moved here (wp-arch-modular-core A.4).
+drives is unchanged and stays in infrastructure, reached across the seam through
+``public_api.markdown_fold.analyze_document`` (F1004 #852); the discovery, the
+corpus aggregate and the command surface live here (wp-arch-modular-core A.4).
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
 import click
 
-from cli_agent_orchestrator.services.fold_service import (
-    FoldCorpusResult,
+from cli_agent_orchestrator.public_api.markdown_fold import (
     FoldUsageError,
     P9Report,
     P10Report,
+    P10StatusCounts,
     RepoMapping,
-    _analyze_p9,
-    _analyze_p10,
-    _parse_structure,
-    _read_markdown,
+    analyze_document,
 )
+
+
+@dataclass(frozen=True)
+class FoldCorpusResult:
+    violations: tuple[str, ...]
+    p9_reports: tuple[P9Report, ...]
+    p9_unused_mappings: tuple[RepoMapping, ...]
+    p10_reports: tuple[P10Report, ...]
+
+    @property
+    def p9_summary_lines(self) -> tuple[str, ...]:
+        population = sum(report.population_eligible for report in self.p9_reports)
+        defects = sum(report.defect_count for report in self.p9_reports)
+        ambiguous = sum(report.ambiguous_basename for report in self.p9_reports)
+        resolved = sum(report.basename_resolved for report in self.p9_reports)
+        adjacency = sum(report.ambiguous_adjacency for report in self.p9_reports)
+        denominator = ambiguous + resolved
+        rate = (100.0 * ambiguous / denominator) if denominator else 0.0
+        return (
+            f"P9 POPULATION: {population}",
+            f"P9 COVERAGE: {population}/{population} graded",
+            f"P9 DENOMINATOR: {defects} path-missing defect firings",
+            f"P9 HYGIENE: ambiguous-basename={ambiguous}/{denominator} ({rate:.4f}%) "
+            f"ambiguous-adjacency={adjacency}",
+        )
+
+    @property
+    def p9_unused_mapping_lines(self) -> tuple[str, ...]:
+        return tuple(
+            f"P9 STATUS MAPPING-UNUSED - {mapping.name}={mapping.path}"
+            for mapping in self.p9_unused_mappings
+        )
+
+    @property
+    def p10_summary_lines(self) -> tuple[str, str, str, str]:
+        population = sum(report.population_eligible for report in self.p10_reports)
+        coverage = sum(report.covered for report in self.p10_reports if report.population_eligible)
+        denominator = sum(report.defect_count for report in self.p10_reports)
+        counts = P10StatusCounts(
+            skipped=sum(report.status_counts.skipped for report in self.p10_reports),
+            undeclared=sum(report.status_counts.undeclared for report in self.p10_reports),
+            no_parser=sum(report.status_counts.no_parser for report in self.p10_reports),
+            unparseable=sum(report.status_counts.unparseable for report in self.p10_reports),
+            ineligible=sum(report.status_counts.ineligible for report in self.p10_reports),
+        )
+        return (
+            f"P10 POPULATION: {population}",
+            f"P10 COVERAGE: {coverage}/{population} annotated",
+            f"P10 DENOMINATOR: {denominator} defect firings",
+            "P10 STATUS: "
+            f"skipped={counts.skipped} undeclared={counts.undeclared} "
+            f"no-parser={counts.no_parser} unparseable={counts.unparseable} "
+            f"ineligible={counts.ineligible}",
+        )
 
 
 def corpus_paths(root: Path) -> tuple[Path, ...]:
@@ -54,11 +107,10 @@ def check_corpus(root: Path, repos: Sequence[RepoMapping] = ()) -> FoldCorpusRes
     p9_reports: list[P9Report] = []
     reports: list[P10Report] = []
     for path in paths:
-        data = _read_markdown(path)
-        structure = _parse_structure(data)
-        violations.extend(violation.message for violation in structure.violations)
-        p9_reports.append(_analyze_p9(data, path.relative_to(root.resolve()).as_posix(), repos))
-        reports.append(_analyze_p10(data, path.relative_to(root.resolve()).as_posix()))
+        analysis = analyze_document(path, path.relative_to(root.resolve()).as_posix(), repos)
+        violations.extend(analysis.violations)
+        p9_reports.append(analysis.p9)
+        reports.append(analysis.p10)
     used_mappings = set().union(*(report.used_mappings for report in p9_reports))
     unused = tuple(mapping for mapping in repos if mapping.name not in used_mappings)
     return FoldCorpusResult(tuple(violations), tuple(p9_reports), unused, tuple(reports))

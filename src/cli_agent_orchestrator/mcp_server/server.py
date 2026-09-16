@@ -760,6 +760,7 @@ def _create_terminal(
     authority_files: Optional[List[Dict[str, str]]] = None,
     provider: Optional[str] = None,
     cell_request_class: str = "explicit",
+    cell_request_origin: Optional[str] = None,
     resume_from: Optional[str] = None,
     resume_inherit_pins: bool = True,
 ) -> Tuple[str, str]:
@@ -844,6 +845,16 @@ def _create_terminal(
         # already ran the guard client-side (adapter below); the server call is
         # the shared backstop that also covers direct HTTP.
         params["cell_request_class"] = cell_request_class
+        # F1006 #854: name the bare POSITION this profile was composed FROM, so
+        # the server derives the class from RESOLUTION PROVENANCE instead of the
+        # composed name's shape. ``assign`` runs resolve_assignment_target
+        # client-side, so by the time this POST is built ``agent_profile`` is
+        # already ``<position>-<provider>`` and looks EXPLICIT to a shape-only
+        # derivation — which is why every routing-driven assign 403'd. The
+        # server VERIFIES this against its own routing composition; declaring it
+        # for a cell routing would not choose buys nothing.
+        if cell_request_origin:
+            params["cell_request_origin"] = cell_request_origin
         # Record the creating terminal so send_message can route callbacks
         # structurally instead of parsing IDs out of message text (issue #284).
         params["caller_id"] = current_terminal_id
@@ -956,6 +967,9 @@ def _create_terminal(
         # CAO_TERMINAL_ID) is not re-classified EXPLICIT from its resolved
         # composed-literal name.
         params["cell_request_class"] = cell_request_class
+        # F1006 #854: same provenance declaration on the new-session route.
+        if cell_request_origin:
+            params["cell_request_origin"] = cell_request_origin
         if working_directory:
             params["working_directory"] = working_directory
         if provider == ProviderType.KIRO_CLI.value and engine is not None:
@@ -2678,6 +2692,10 @@ def _assign_impl(
                 _caller_agent_profile and _position_exists(_caller_agent_profile)
             )
             _cell_request_class = "explicit" if _resume_override else "resume"
+            # F1006 #854: a resume declares NO provenance — the server re-resolves
+            # provider/profile from the reaped identity (A2.1), so there is no
+            # client-side composition to account for.
+            _cell_request_origin: Optional[str] = None
             # Merge (r6): main's F838 (#695) guard-checked provider is initialized
             # only in the else (non-resume) branch below, but both branches
             # converge on the shared _create_terminal call whose
@@ -2710,6 +2728,13 @@ def _assign_impl(
                 _cell_request_class = "explicit" if _provider_source == "explicit" else "routing"
             else:
                 _cell_request_class = "legacy"
+            # F1006 #854: when the class is ROUTING, the composed name the POST
+            # below carries is this resolver's OWN output — record the bare
+            # position it came from so the server can re-derive (and verify) the
+            # same classification instead of reading the composed shape. Only the
+            # routing-driven arm declares provenance: an explicit provider= is
+            # the operator's own cell choice and stays EXPLICIT.
+            _cell_request_origin = _routing_position if _routing_driven else None
 
             try:
                 agent_profile, _resolved_provider = resolve_assignment_target(
@@ -3310,6 +3335,7 @@ def _assign_impl(
             authority_files=authority_files,
             provider=_resolved_provider or _f838_checked_provider,
             cell_request_class=_cell_request_class,
+            cell_request_origin=_cell_request_origin,
             resume_from=(_resume_prepared["resume_from"] if _resume_prepared else None),
             resume_inherit_pins=inherit_pins,
             **create_kwargs,

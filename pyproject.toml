@@ -671,6 +671,69 @@ forbidden_modules = ["cli_agent_orchestrator.adapters.store.gate"]
 # it exists to mandate.
 allow_indirect_imports = "true"
 
+# F1004 (#852): the skill CLI is a CONSUMER of a published API, not a tenant of the base
+# package. `CLAUDE.md`'s one-paragraph law — "skill -> public CAO APIs" — was cut with five
+# underscore-prefixed names (`fold_service._analyze_p9/_analyze_p10/_parse_structure/
+# _read_markdown`, `redeploy._atomic_copy`), which no contract could see because both sides
+# sat inside the legacy tree. The seam is now `cli_agent_orchestrator.public_api`, and this
+# contract is what keeps it there.
+#
+# Import-linter matches MODULES, not names, so "no private symbol" is enforced by
+# elimination: with every other base module forbidden to the seam, there is no module left
+# to take a private name from. Adding a package to `src/cli_agent_orchestrator/` means
+# adding it here too — the list is the base package's top level, minus `public_api`.
+#
+# `cli_agent_orchestrator.cli` is NOT listed as a whole: the seam modules live under it, and
+# `orchestrator_main` importing its own three commands is the intended structure. Its two
+# base-side halves, `cli.main` and `cli.commands`, are listed instead.
+[[tool.importlinter.contracts]]
+name = "skill-cli-only-via-public-api"
+type = "forbidden"
+source_modules = [
+    "cli_agent_orchestrator.cli.orchestrator_commands",
+    "cli_agent_orchestrator.cli.orchestrator_main",
+]
+forbidden_modules = [
+    "cli_agent_orchestrator.adapters",
+    "cli_agent_orchestrator.agent_store",
+    "cli_agent_orchestrator.api",
+    "cli_agent_orchestrator.app",
+    "cli_agent_orchestrator.backends",
+    "cli_agent_orchestrator.bootstrap",
+    "cli_agent_orchestrator.chatgpt_web_runner",
+    "cli_agent_orchestrator.cli.commands",
+    "cli_agent_orchestrator.cli.http",
+    "cli_agent_orchestrator.cli.main",
+    "cli_agent_orchestrator.clients",
+    "cli_agent_orchestrator.constants",
+    "cli_agent_orchestrator.core",
+    "cli_agent_orchestrator.ext_apps",
+    "cli_agent_orchestrator.graph",
+    "cli_agent_orchestrator.hooks",
+    "cli_agent_orchestrator.kernel",
+    "cli_agent_orchestrator.mcp_server",
+    "cli_agent_orchestrator.models",
+    "cli_agent_orchestrator.ops_mcp_server",
+    "cli_agent_orchestrator.plugins",
+    "cli_agent_orchestrator.providers",
+    "cli_agent_orchestrator.sandbox_bootstrap",
+    "cli_agent_orchestrator.schemas",
+    "cli_agent_orchestrator.security",
+    "cli_agent_orchestrator.services",
+    "cli_agent_orchestrator.sim",
+    "cli_agent_orchestrator.skills",
+    "cli_agent_orchestrator.telemetry",
+    "cli_agent_orchestrator.transcript_scrub",
+    "cli_agent_orchestrator.tui",
+    "cli_agent_orchestrator.utils",
+    "cli_agent_orchestrator.workspace_connector",
+]
+# DIRECT imports only, and that is the point rather than a concession: `public_api` itself
+# imports `services.fold_service`, `constants` and `services.verification_service`, so every
+# seam module reaches them transitively BY DESIGN. Without this the contract would forbid
+# the facade it exists to mandate. The rule is "no seam module may NAME a base module".
+allow_indirect_imports = "true"
+
 # Adapters are named in exactly one place: cli_agent_orchestrator/bootstrap.py, which builds
 # them and hands them to app as core.ports Protocols. bootstrap.py is deliberately absent
 # from the source list — that absence IS the exception.
