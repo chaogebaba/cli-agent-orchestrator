@@ -211,6 +211,34 @@ class AttemptOutcome(StrEnum):
                               not an operating state, and deterministic: the
                               next lease routes it identically, so it spends the
                               attempt budget and dies at 325 s with the finding.
+
+    WP-HERDR H2 adds the ninth live value, and exactly one (blueprint §4; the
+    2026-09-16 F1 ruling settles the two-owner contradiction the entry audit
+    found — H2 adds ``SUBMISSION_UNCERTAIN``, the ACP plane's S1 adds
+    ``ACP_BUSY_RETRY`` and nothing else).
+
+    ``SUBMISSION_UNCERTAIN`` — the prompt was handed to the runtime and the
+                              runtime could not say whether the agent took it.
+                              herdr's ``agent_prompt_stalled`` is the named
+                              case: the text and its Enter were written, and no
+                              ``working``/``blocked`` activity was observed
+                              inside herdr's own five-second gate, so the
+                              submission may have landed, may have been eaten by
+                              a composer, and may yet start a turn.  A caller
+                              ``timeout`` and a transport failure AFTER the
+                              request bytes were flushed are the same fact.
+
+                              It is D4's "unknown submission outcomes
+                              quarantine" as a value.  Neither ``delivered``
+                              (nothing acknowledged acceptance for the bound
+                              occupant) nor a refusal (something may well have
+                              been submitted), it is the only outcome in this
+                              vocabulary whose meaning is that the question is
+                              open.  It is deliberately NOT in
+                              ``ATTEMPT_BUDGET_OUTCOMES``: re-offering is what
+                              would double-submit, so the attempt budget is the
+                              wrong bound and ``dead_by`` is the only one that
+                              applies.
     """
 
     DELIVERED = "delivered"
@@ -222,12 +250,42 @@ class AttemptOutcome(StrEnum):
     WAKE_UNREACHABLE = "wake_unreachable"
     WAKE_UNRESOLVABLE = "wake_unresolvable"
     PASTE_ATTEMPTED = "paste_attempted"
+    SUBMISSION_UNCERTAIN = "submission_uncertain"
 
 
 #: D12's non-delivery outcomes, in one place so the retention rule and the
 #: accounting split cannot drift from each other.  All of them KEEP the row
 #: leased with ``lease_expires_at`` unchanged and write their attempt row;
 #: lease retention is what makes an outcome observable by ``reclaim`` at all.
+#:
+#: **``SUBMISSION_UNCERTAIN`` is a member, and H2-S1 decided that explicitly**
+#: (the entry audit's F2: this set is the THIRD closed set governing an outcome,
+#: neither blueprint names it, and a new value added without ruling on it makes
+#: the choice by omission).  The set's complement is what the decision turns on,
+#: because the complement is the outcomes that COUNT AS SENT:
+#:
+#: * ``DELIVERED`` — acknowledged acceptance for the bound occupant (D4).
+#: * ``EMITTED_UNVERIFIED`` — written and not confirmed, but the wake COUNTS AS
+#:   SENT and the open epoch is what the next lease re-wakes against.
+#: * ``LEGACY_OTHER`` — retired with shadow mode (#738); no live claim records
+#:   one, so it belongs to neither side.
+#:
+#: An uncertain submission is not in that company.  Nothing acknowledged it, and
+#: there is no open epoch waiting on an ack to re-wake against, so grouping it
+#: with the sent outcomes would assert a delivery the runtime explicitly
+#: declined to confirm.  It is a non-delivery whose lease must be retained for
+#: the same reason D12 retains the others: an outcome ``reclaim`` cannot see is
+#: an outcome that cannot bound the row (#604).
+#:
+#: What membership here does NOT carry, stated so a reader does not assume it:
+#: the "not re-offered" half of D4's quarantine.  The store has no per-row
+#: quarantine state, this set has no consumer in the store, and the tick
+#: releases no lease for any outcome — so retention alone leaves the row to be
+#: re-offered by ``reclaim`` when its lease expires, without spending an
+#: attempt.  The no-second-submission rule is enforced at the INJECTOR, where
+#: the runtime fact that would resolve the uncertainty lives (blueprint §6, "an
+#: unresolved earlier submission blocks later ones"); H2-S3 is where that
+#: lands.  Adding a quarantine column to the queue is not in H2's scope.
 NON_DELIVERY_OUTCOMES = frozenset(
     {
         AttemptOutcome.VETO_DIALOG,
@@ -236,6 +294,7 @@ NON_DELIVERY_OUTCOMES = frozenset(
         AttemptOutcome.WAKE_UNREACHABLE,
         AttemptOutcome.WAKE_UNRESOLVABLE,
         AttemptOutcome.PASTE_ATTEMPTED,
+        AttemptOutcome.SUBMISSION_UNCERTAIN,
     }
 )
 
@@ -254,6 +313,13 @@ NON_DELIVERY_OUTCOMES = frozenset(
 #: ``LEGACY_OTHER`` is absent because it was a 3a mirror-writer value, retired
 #: with shadow mode (#738); no live claim ever records one, so ``reclaim``
 #: never sees it.
+#:
+#: ``SUBMISSION_UNCERTAIN`` is absent by the blueprint's own rule (§4): an
+#: uncertain submission is quarantined rather than re-offered, so the attempt
+#: budget is the wrong bound and ``dead_by`` is the only one that applies.  Put
+#: it here and a row whose prompt may ALREADY be in the agent's composer would
+#: die at 325 s — the fast death is for conditions that cannot clear, and this
+#: one clears the moment the runtime reports a state change.
 ATTEMPT_BUDGET_OUTCOMES = frozenset(
     {
         AttemptOutcome.VETO_UNVERIFIED,
@@ -411,10 +477,18 @@ class ReclaimResult:
     only when the last recorded outcome was one of D12's attempt-budget
     outcomes, so a dialog-held row and a row whose seat carrier is refused are
     re-offered without moving the budget they are not on.
+
+    ``quarantined`` is DISJOINT from ``reoffered``: a row whose last outcome was
+    ``SUBMISSION_UNCERTAIN`` leaves its expired lease without becoming claimable
+    again (WP-HERDR, blueprint amendment (7)).  It is counted rather than
+    silently absent, because "the row stopped being delivered" and "the row was
+    never reached" look identical in a count of re-offers, and an operator
+    reading a tick report needs to tell them apart.
     """
 
     reoffered: int = 0
     incremented: int = 0
+    quarantined: int = 0
     dead: tuple[DeadRow, ...] = ()
 
     @property

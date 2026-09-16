@@ -97,6 +97,8 @@ def _poll_native_once(
         pane_id = backend.get_pane_id(
             terminal_id, metadata["tmux_session"], metadata["tmux_window"]
         )
+        if pane_id is None:
+            return None
         proof = monitor.prove_terminal_identity(terminal_id, depth="live")
         fetch = backend.fetch_native_status(metadata["tmux_session"], metadata["tmux_window"])
         fetched_at = time.monotonic()

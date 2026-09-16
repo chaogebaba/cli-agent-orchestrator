@@ -143,7 +143,6 @@ def test_report_written_before_exactly_one_callback(tmp_path, monkeypatch) -> No
     outcome = production.run_production_review(
         task_text="review it",
         artifact_path="/abs/pin.md",
-        bundle_path=None,
         verify_pin=lambda path: True,
         callback=_callback,
         browser_turn=lambda: _accepted(),
@@ -158,14 +157,18 @@ def test_report_written_before_exactly_one_callback(tmp_path, monkeypatch) -> No
 def test_findings_invalid_body_ends_findings_invalid_no_callback_ready(
     tmp_path, monkeypatch
 ) -> None:
+    """Schema validation is UNCONDITIONAL now.
+
+    At B1 it rode ``bool(bundle_path)``, so a run without an upload silently
+    skipped report validation. Amendment D deleted the upload (D10), which would
+    have turned validation off for every run; it is now always on, and this test
+    passes no attachment at all.
+    """
     monkeypatch.setenv("CAO_ARTIFACTS_DIR", str(tmp_path))
-    bundle = tmp_path / "bundle.txt"
-    bundle.write_text("some pinned blueprint bytes\n", encoding="utf-8")
     callbacks: list[str] = []
     outcome = production.run_production_review(
         task_text="review it",
         artifact_path="/abs/pin.md",
-        bundle_path=str(bundle),  # a findings run -> schema validation ON
         verify_pin=lambda path: True,
         callback=lambda m: callbacks.append(m),
         browser_turn=lambda: _accepted("Finding 1: no old quote, no replace."),
@@ -189,7 +192,6 @@ def test_reachability_verify_pin_called_at_start_and_before_publish(tmp_path, mo
     production.run_production_review(
         task_text="review it",
         artifact_path="/abs/pin.md",
-        bundle_path=None,
         verify_pin=_pin,
         callback=lambda m: None,
         browser_turn=lambda: _accepted(),
@@ -204,7 +206,6 @@ def test_reachability_pin_drift_before_publish_blocks_report(tmp_path, monkeypat
     outcome = production.run_production_review(
         task_text="review it",
         artifact_path="/abs/pin.md",
-        bundle_path=None,
         verify_pin=lambda path: next(seq),
         callback=lambda m: None,
         browser_turn=lambda: _accepted(),
@@ -273,8 +274,9 @@ def test_reachability_profile_lock_acquired_in_initialize_released_in_cleanup(mo
     asyncio.run(_run())
 
 
-# ── Reachability of enforce_no_api_egress + verify_attachment_on_turn on the ──
-# ── live browser path (Blocker 2). Stub the browser so _drive_browser runs. ──
+# ── Reachability of the ONE route dispatcher on the composed D path ──────────
+# ── (Blocker 2 + D10). Stub the browser so _drive_composed_turn runs far     ──
+# ── enough to install it.                                                   ──
 class _FakeLocator:
     def __init__(self, page):
         self._page = page
@@ -298,13 +300,19 @@ class _FakeLocator:
     async def inner_text(self):
         return ""
 
-    async def set_input_files(self, *a, **k):
-        return None
+
+class _FakeKeyboard:
+    def __init__(self):
+        self.typed: list = []
+
+    async def insert_text(self, text):
+        self.typed.append(text)
 
 
 class _FakePage:
     def __init__(self):
         self.routed: list = []
+        self.keyboard = _FakeKeyboard()
         self.url = "https://chatgpt.com/c/WEB:11111111-2222-3333-4444-555555555555"
 
     def locator(self, sel):
@@ -325,21 +333,44 @@ class _FakePage:
     async def evaluate(self, script, *a):
         return 999  # readback length; also generic evaluate return
 
-    async def keyboard_insert_text(self, text):
-        return None
+
+class _Route:
+    def __init__(self, url, method="GET", post_data=b""):
+        self.request = type(
+            "R",
+            (),
+            {"url": url, "method": method, "post_data_buffer": post_data, "headers": {}},
+        )()
+        self.aborted = False
+        self.continued = False
+
+    async def abort(self):
+        self.aborted = True
+
+    async def continue_(self):
+        self.continued = True
 
 
-def test_reachability_egress_guard_installed_and_calls_enforce(monkeypatch) -> None:
-    """_drive_browser must install a page route that calls enforce_no_api_egress
-    (D3/AC-11). We capture the installed guard and prove it calls the helper."""
-    import cli_agent_orchestrator.chatgpt_web_runner.in_page_transport as ipt
+def _composed_turn_with_fakes(monkeypatch, tmp_path, attempt_id="a1"):
+    """Run _drive_composed_turn far enough to install the dispatcher, and stop.
+
+    The mint never produces a held route here (the fake page's Enter does not
+    issue a POST), so the turn fails on the hold timeout. That is the point: the
+    dispatcher must already be installed BEFORE any composer action, so it is
+    reachable regardless of how the turn ends.
+    """
+    import asyncio
+
+    import cli_agent_orchestrator.chatgpt_web_runner.production as prod
     import cli_agent_orchestrator.chatgpt_web_runner.runtime as rt
-    import cli_agent_orchestrator.chatgpt_web_runner.snapshot_upload as su
 
     page = _FakePage()
 
     class _Ctx:
         pages = [page]
+
+        def on(self, event, handler):
+            return None
 
         async def close(self):
             return None
@@ -358,7 +389,63 @@ def test_reachability_egress_guard_installed_and_calls_enforce(monkeypatch) -> N
         raising=False,
     )
     monkeypatch.setattr(rt, "pin_fingerprint_seed", lambda p: "12345", raising=False)
+    monkeypatch.setattr(prod, "_HOLD_TIMEOUT_S", 0.05, raising=False)
 
+    from cli_agent_orchestrator.chatgpt_web_runner.stream_relay import get_relay_hub
+    from cli_agent_orchestrator.providers.chatgpt_web import ChatGptWebProvider
+
+    # The relay registry is process-global and transient; each test owns one
+    # attempt, so clear it rather than colliding on a reused id.
+    get_relay_hub().reset_for_tests()
+    ChatGptWebProvider.start_attempt(
+        run_id="r1", attempt_id=attempt_id, prompt_sha="0" * 64, artifacts_dir=tmp_path
+    )
+    from cli_agent_orchestrator.chatgpt_web_runner.send_intent import SendIntentLog
+
+    log = SendIntentLog(tmp_path / "attempts" / attempt_id)
+    log.load()
+    # Same single-writer rule run_production_review applies (see its comment):
+    # the relay must share this record, not the one start_attempt created.
+    get_relay_hub().get(attempt_id).intent_log = log
+
+    from cli_agent_orchestrator.chatgpt_web_runner.errors import RunnerError
+
+    with pytest.raises(RunnerError) as excinfo:
+        asyncio.run(
+            prod._drive_composed_turn(
+                task_text="x",
+                run_id="r1",
+                attempt_id=attempt_id,
+                prompt_sha="0" * 64,
+                intent_log=log,
+                manifest=[],
+                frozen_worktree=None,
+                reviewed_commit=None,
+                base_commit=None,
+                pull_evidence={},
+            )
+        )
+    return page, excinfo.value
+
+
+def test_one_dispatcher_installed_before_any_composer_action(tmp_path, monkeypatch) -> None:
+    """Exactly ONE route dispatcher, installed before the composer is touched."""
+    monkeypatch.setenv("CAO_ARTIFACTS_DIR", str(tmp_path))
+    page, error = _composed_turn_with_fakes(monkeypatch, tmp_path)
+
+    assert len(page.routed) == 1, f"expected one dispatcher, got {page.routed}"
+    assert page.routed[0][0] == "**/*"
+    # The mint produced no held POST, so the turn refuses rather than proceeding.
+    assert "no held conversation POST" in str(error)
+
+
+def test_dispatcher_denies_platform_api_egress(tmp_path, monkeypatch) -> None:
+    """D3/AC-11: a dynamically constructed OpenAI-API host is aborted at request time."""
+    import asyncio
+
+    import cli_agent_orchestrator.chatgpt_web_runner.snapshot_upload as su
+
+    monkeypatch.setenv("CAO_ARTIFACTS_DIR", str(tmp_path))
     egress_calls: list[str] = []
     real_enforce = su.enforce_no_api_egress
 
@@ -367,63 +454,133 @@ def test_reachability_egress_guard_installed_and_calls_enforce(monkeypatch) -> N
         return real_enforce(url)
 
     monkeypatch.setattr(su, "enforce_no_api_egress", _spy_enforce, raising=False)
+    page, _ = _composed_turn_with_fakes(monkeypatch, tmp_path)
+    dispatcher = page.routed[0][1]
 
-    # Make the Transport's submit fail fast so we don't need a full turn — the
-    # egress route is installed BEFORE navigation, so it is reached regardless.
-    class _FakeTransport:
-        def __init__(self, page, owned_conversation_id=None, intent_log=None):
-            # r6: production passes the durable SEND_INTENT log positionally-by-
-            # keyword; the double must accept the real signature or it hides a
-            # wiring break behind a TypeError.
-            self.page = page
-            self.owned_conversation_id = owned_conversation_id
-            self.intent_log = intent_log
+    forbidden = _Route("https://api.openai.com/v1/x")
+    asyncio.run(dispatcher(forbidden))
+    assert forbidden.aborted is True and forbidden.continued is False
+    assert "api.openai.com" in egress_calls[-1]
 
-        def arm_send_observer(self):
-            pass
 
-        async def type_prompt(self, text):
-            pass
-
-        async def submit_and_confirm(self, timeout_s=40.0):
-            from cli_agent_orchestrator.chatgpt_web_runner.errors import DeliveryState
-            from cli_agent_orchestrator.chatgpt_web_runner.in_page_transport import SubmitOutcome
-
-            return SubmitOutcome(delivery_state=DeliveryState.NOTHING_SENT, conversation_id=None)
-
-    monkeypatch.setattr(ipt, "Transport", _FakeTransport, raising=False)
-
+def test_dispatcher_continues_ordinary_page_traffic(tmp_path, monkeypatch) -> None:
+    """Non-conversation traffic keeps its normal behaviour, or the page cannot load."""
     import asyncio
 
-    from cli_agent_orchestrator.chatgpt_web_runner.errors import RunnerError
+    monkeypatch.setenv("CAO_ARTIFACTS_DIR", str(tmp_path))
+    page, _ = _composed_turn_with_fakes(monkeypatch, tmp_path)
+    dispatcher = page.routed[0][1]
 
-    with pytest.raises(RunnerError):
-        asyncio.run(
-            production._drive_browser(
-                task_text="x",
-                bundle_path=None,
-                manifest_identity=None,
-                run_id="r1",
-                bundle_sha="a" * 64,
-            )
-        )
-    # The egress guard route was installed; invoking it with an api.openai.com URL
-    # must call enforce_no_api_egress and abort.
-    assert page.routed, "no page.route egress guard installed"
-    guard = page.routed[0][1]
+    ordinary = _Route("https://chatgpt.com/static/app.js")
+    asyncio.run(dispatcher(ordinary))
+    assert ordinary.continued is True and ordinary.aborted is False
 
-    class _Route:
-        def __init__(self, url):
-            self.request = type("R", (), {"url": url})()
-            self.aborted = False
-            self.continued = False
 
-        async def abort(self):
-            self.aborted = True
+def test_dispatcher_never_continues_the_conversation_post(tmp_path, monkeypatch) -> None:
+    """D10: there is NO ``route.continue_()`` success branch for the send.
 
-        async def continue_(self):
-            self.continued = True
+    The conversation POST is captured and held. A dispatcher that continued it
+    would be Amendment A's browser-to-origin send, which is exactly the deletion
+    this test defends — so the assertion is that neither ``continue_()`` nor
+    ``abort()`` is ever reached for that request.
+    """
+    import asyncio
 
-    r = _Route("https://api.openai.com/v1/x")
-    asyncio.run(guard(r))
-    assert r.aborted is True and "api.openai.com" in egress_calls[-1]
+    monkeypatch.setenv("CAO_ARTIFACTS_DIR", str(tmp_path))
+    page, _ = _composed_turn_with_fakes(monkeypatch, tmp_path)
+    dispatcher = page.routed[0][1]
+
+    body = b'{"messages":[{"id":"u","author":{"role":"user"},"content":{"parts":["x"]}}]}'
+    send = _Route("https://chatgpt.com/backend-api/f/conversation", "POST", body)
+    asyncio.run(dispatcher(send))
+
+    assert send.continued is False, "the conversation POST was released to the origin"
+    assert send.aborted is False, "the conversation POST must be HELD, not aborted"
+
+
+def test_prepare_is_never_held(tmp_path, monkeypatch) -> None:
+    """The ``/prepare`` pre-warm is not the send and must pass through."""
+    import asyncio
+
+    monkeypatch.setenv("CAO_ARTIFACTS_DIR", str(tmp_path))
+    page, _ = _composed_turn_with_fakes(monkeypatch, tmp_path)
+    dispatcher = page.routed[0][1]
+
+    prepare = _Route("https://chatgpt.com/backend-api/f/conversation/prepare", "POST", b"{}")
+    asyncio.run(dispatcher(prepare))
+    assert prepare.continued is True
+
+
+# ── D3/D6: the relay binding window, and who owns it ─────────────────────────
+def test_the_runner_does_not_consume_the_single_relay_binding(tmp_path, monkeypatch) -> None:
+    """The one subscriber is whoever presented the token, not the runner.
+
+    ``AttemptRelay.bind`` mints the subscriber id and writes
+    RELAY_BOUND_OR_SKIPPED itself, so a runner that called it would take the
+    single binding and lock the real subscriber out with a 409.
+    """
+    monkeypatch.setenv("CAO_ARTIFACTS_DIR", str(tmp_path))
+    _composed_turn_with_fakes(monkeypatch, tmp_path, attempt_id="relay-a")
+
+    from cli_agent_orchestrator.chatgpt_web_runner.send_intent import SendIntentLog
+    from cli_agent_orchestrator.chatgpt_web_runner.stream_relay import get_relay_hub
+
+    relay = get_relay_hub().get("relay-a")
+    # Nothing bound, so the window closed as an explicit SKIP before the mint.
+    assert relay.is_bound is False
+    assert relay.status == "skipped"
+
+    log = SendIntentLog(tmp_path / "attempts" / "relay-a")
+    record = log.load()
+    assert record is not None
+    assert record.skipped_at is not None
+    assert record.subscriber_id is None
+
+
+def test_a_real_subscriber_keeps_its_binding_through_the_turn(tmp_path, monkeypatch) -> None:
+    """A subscriber that bound BEFORE the mint is still the bound one after."""
+    import asyncio
+
+    monkeypatch.setenv("CAO_ARTIFACTS_DIR", str(tmp_path))
+
+    from cli_agent_orchestrator.chatgpt_web_runner.stream_relay import get_relay_hub
+    from cli_agent_orchestrator.providers.chatgpt_web import ChatGptWebProvider
+
+    get_relay_hub().reset_for_tests()
+    handle = ChatGptWebProvider.start_attempt(
+        run_id="r2", attempt_id="relay-b", prompt_sha="0" * 64, artifacts_dir=tmp_path
+    )
+    relay = get_relay_hub().get("relay-b")
+    binding = asyncio.run(relay.bind(handle.relay_token))
+    assert relay.is_bound is True
+
+    # The turn runs (and fails on the hold timeout) without touching the binding.
+    _composed_turn_with_fakes(monkeypatch, tmp_path / "second", attempt_id="relay-b2")
+
+    assert relay.binding is binding
+    assert relay.status == "bound"
+
+
+def test_a_second_conversation_post_is_refused_not_held(tmp_path, monkeypatch) -> None:
+    """One mint per turn: a second conversation POST is aborted, not captured.
+
+    Without this the dispatcher would park a second handler forever (and would
+    replace the captured route under the attempt that owns it).
+    """
+    import asyncio
+
+    monkeypatch.setenv("CAO_ARTIFACTS_DIR", str(tmp_path))
+    page, _ = _composed_turn_with_fakes(monkeypatch, tmp_path, attempt_id="second-post")
+    dispatcher = page.routed[0][1]
+
+    body = b'{"messages":[{"id":"u","author":{"role":"user"},"content":{"parts":["x"]}}]}'
+    first = _Route("https://chatgpt.com/backend-api/f/conversation", "POST", body)
+    second = _Route("https://chatgpt.com/backend-api/f/conversation", "POST", body)
+
+    asyncio.run(dispatcher(first))
+    asyncio.run(dispatcher(second))
+
+    # The first is HELD (neither continued nor aborted); the second is refused.
+    assert first.continued is False and first.aborted is False
+    assert second.aborted is True, "a second conversation POST must not be held"
+    assert second.continued is False, "and must never be released to the origin"

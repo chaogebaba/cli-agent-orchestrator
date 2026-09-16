@@ -36,17 +36,10 @@ from cli_agent_orchestrator.chatgpt_web_runner.poll_gate import (
     evaluate_gate,
 )
 from cli_agent_orchestrator.chatgpt_web_runner.snapshot_upload import (
-    MAX_BUNDLE_BYTES,
-    MAX_BUNDLE_LINES,
-    AttachmentIdentity,
-    build_attachment_identity,
-    enforce_bundle_bounds,
     enforce_no_api_egress,
     enforce_read_allowed,
     is_enumeration_endpoint,
     is_same_origin_read_allowed,
-    readiness_reached,
-    verify_attachment_on_turn,
 )
 from cli_agent_orchestrator.chatgpt_web_runner.submit_ids import (
     SubmitObservation,
@@ -516,95 +509,6 @@ def test_conversation_id_regex() -> None:
 
 
 # ==========================================================================
-# AC-10 — over-limit bundle refused, no split/truncate
-# ==========================================================================
-def test_ac10_over_byte_limit_refused() -> None:
-    data = b"x" * (MAX_BUNDLE_BYTES + 1)
-    with pytest.raises(RunnerError) as ei:
-        enforce_bundle_bounds(data)
-    assert ei.value.code is RunnerErrorCode.CONTEXT_TOO_LARGE
-
-
-def test_ac10_over_line_limit_refused() -> None:
-    data = ("a\n" * (MAX_BUNDLE_LINES + 1)).encode("utf-8")
-    with pytest.raises(RunnerError) as ei:
-        enforce_bundle_bounds(data)
-    assert ei.value.code is RunnerErrorCode.CONTEXT_TOO_LARGE
-
-
-def test_ac10_at_limit_accepted() -> None:
-    data = b"a" * MAX_BUNDLE_BYTES
-    enforce_bundle_bounds(data)  # no raise
-
-
-# ==========================================================================
-# AC-9 — attachment identity + readiness
-# ==========================================================================
-def test_ac9_readiness_needs_both_calibrated_signals() -> None:
-    assert readiness_reached({"filename_chip", "document_label"}) is True
-    assert readiness_reached({"filename_chip"}) is False
-    # A spinner/percentage is NOT a permitted signal.
-    assert readiness_reached({"filename_chip", "spinner"}) is False
-
-
-def _ident(data: bytes, name: str, ref: "str | None") -> AttachmentIdentity:
-    import dataclasses as _dc
-
-    base = build_attachment_identity(data, name)
-    return _dc.replace(base, composer_attachment_ref=ref)
-
-
-def test_ac9_attachment_byte_mismatch_rejected() -> None:
-    manifest = _ident(b"hello\nworld\n", "bundle.txt", "chip-1")
-    tampered = _ident(b"hello\nWORLD\n", "bundle.txt", "chip-1")
-    with pytest.raises(RunnerError) as ei:
-        verify_attachment_on_turn(manifest, tampered, attachment_count=1)
-    assert ei.value.code is RunnerErrorCode.ATTACHMENT_IDENTITY
-
-
-def test_ac9_more_than_one_attachment_rejected() -> None:
-    manifest = _ident(b"hello\n", "bundle.txt", "chip-1")
-    with pytest.raises(RunnerError) as ei:
-        verify_attachment_on_turn(manifest, manifest, attachment_count=2)
-    assert ei.value.code is RunnerErrorCode.ATTACHMENT_IDENTITY
-
-
-def test_ac9_missing_composer_reference_rejected() -> None:
-    # r2 gate Blocker 3: an observed turn with no composer-side reference fails.
-    manifest = _ident(b"hello\nworld\n", "bundle.txt", None)  # manifest is byte-only
-    observed = _ident(b"hello\nworld\n", "bundle.txt", None)
-    with pytest.raises(RunnerError) as ei:
-        verify_attachment_on_turn(manifest, observed, attachment_count=1)
-    assert ei.value.code is RunnerErrorCode.ATTACHMENT_IDENTITY
-
-
-def test_ac9_mismatched_composer_reference_rejected() -> None:
-    # r2 gate Blocker 3 adversarial fixture: attach-time ref-A vs submitted ref-B.
-    manifest = _ident(b"hello\nworld\n", "bundle.txt", None)
-    observed = _ident(b"hello\nworld\n", "bundle.txt", "ref-B")
-    with pytest.raises(RunnerError) as ei:
-        verify_attachment_on_turn(manifest, observed, attachment_count=1, expected_ref="ref-A")
-    assert ei.value.code is RunnerErrorCode.ATTACHMENT_IDENTITY
-
-
-def test_ac9_matching_identity_and_reference_ok() -> None:
-    # Byte fields match the manifest AND the observed turn carries a non-empty
-    # reference equal to the attach-time reference.
-    manifest = _ident(b"hello\nworld\n", "bundle.txt", None)
-    observed = _ident(b"hello\nworld\n", "bundle.txt", "chip-xyz")
-    verify_attachment_on_turn(
-        manifest, observed, attachment_count=1, expected_ref="chip-xyz"
-    )  # no raise
-
-
-def test_ac9_matches_manifest_is_byte_only() -> None:
-    # matches_manifest compares byte fields only (the manifest carries no ref).
-    a = _ident(b"x\n", "b.txt", None)
-    assert _ident(b"x\n", "b.txt", "anyref").matches_manifest(a) is True
-    assert _ident(b"y\n", "b.txt", "anyref").matches_manifest(a) is False
-
-
-# ==========================================================================
 # AC-11 / AC-11b — egress + read containment
 # ==========================================================================
 def test_ac11_api_egress_refused() -> None:
@@ -798,81 +702,3 @@ def test_condition_attach_timeout_is_never_transient_overload() -> None:
 def test_condition_marker_only_for_chatgpt_web_provider() -> None:
     # The marker must not fire for another provider's pane.
     assert classify_condition("[chatgpt_web] CONDITION auth_wall", "codex") is None
-
-
-# --- r3: _wait_upload_complete upload-COMPLETE gate ---------------------------
-# The user observed the composer stuck at attach (spinner spinning, composer
-# empty, send disabled). The runner must WAIT for the upload-complete DOM state
-# (spinner gone + send enabled) with a BOUNDED timeout, and on timeout fail
-# closed with the typed ``attach_timeout`` condition (never hang to the process
-# watchdog). These exercise both edges with a fake page (no live browser).
-
-
-class _FakeUploadPage:
-    """Minimal page stub for _wait_upload_complete: yields a scripted sequence of
-    DOM-state dicts from evaluate(); wait_for_timeout is a no-op so the poll loop
-    is fast. ``url`` supports the stall-DOM recorder."""
-
-    def __init__(self, states: list) -> None:
-        self._states = list(states)
-        self.url = "https://chatgpt.com/"
-        self.evaluate_calls = 0
-
-    async def evaluate(self, script, *a):
-        self.evaluate_calls += 1
-        # Return the next scripted state; repeat the last one once exhausted so a
-        # never-clearing spinner keeps returning "still spinning".
-        if len(self._states) > 1:
-            return self._states.pop(0)
-        return self._states[0]
-
-    async def wait_for_timeout(self, ms):
-        return None
-
-
-def test_wait_upload_complete_returns_when_send_enabled_despite_lingering_spinner() -> None:
-    # Success path (live-observed edge): a page-global upload spinner can linger
-    # after the upload actually finishes. Send-enabled is the authoritative
-    # completion signal, so _wait_upload_complete must return even while
-    # `spinning` is still True — otherwise it falsely times out (user-confirmed:
-    # "the upload is done" with send already enabled).
-    import asyncio
-
-    page = _FakeUploadPage(
-        [
-            {"spinning": True, "send_present": True, "send_enabled": False},
-            {"spinning": True, "send_present": True, "send_enabled": True},
-        ]
-    )
-    from cli_agent_orchestrator.chatgpt_web_runner.in_page_transport import Transport
-
-    transport = Transport(page)
-    asyncio.run(transport._wait_upload_complete("bundle.txt", timeout_s=5.0))
-    assert page.evaluate_calls >= 2
-
-
-def test_wait_upload_complete_timeout_raises_attach_timeout_and_records_dom(
-    tmp_path, monkeypatch
-) -> None:
-    # Timeout path: the spinner NEVER clears (the exact user-observed stall). The
-    # bounded wait must raise the typed ATTACH_TIMEOUT condition and write a
-    # NON-SECRET DOM excerpt to CAO_ARTIFACTS_DIR — never hang.
-    import asyncio
-
-    monkeypatch.setenv("CAO_ARTIFACTS_DIR", str(tmp_path))
-    stuck = {"spinning": True, "send_present": True, "send_enabled": False}
-    page = _FakeUploadPage([stuck])
-    from cli_agent_orchestrator.chatgpt_web_runner.in_page_transport import Transport
-
-    transport = Transport(page)
-    with pytest.raises(RunnerError) as exc:
-        # Tiny timeout so the bounded loop exits fast; wait_for_timeout is a no-op.
-        asyncio.run(transport._wait_upload_complete("bundle.txt", timeout_s=0.05))
-    assert exc.value.code is RunnerErrorCode.ATTACH_TIMEOUT
-    assert exc.value.delivery_state is DeliveryState.NOTHING_SENT
-    # A stall-DOM excerpt was recorded (diagnostics), and it is non-secret.
-    recorded = list(tmp_path.glob("attach-stall-attach_timeout-*.json"))
-    assert recorded, "expected a stall-DOM excerpt to be written"
-    body = recorded[0].read_text(encoding="utf-8")
-    assert "attach_timeout" in body
-    assert "dom_state" in body

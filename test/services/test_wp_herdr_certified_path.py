@@ -163,28 +163,69 @@ def test_the_chrome_classifier_itself_is_still_present() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_the_watchdog_skips_certified_terminals(monkeypatch: pytest.MonkeyPatch) -> None:
-    """F506 Do-NOT #1: seam A must not become a second sampler, so a certified
-    terminal is never handed to ``pane_liveness.observe``."""
+def test_the_watchdog_withholds_only_the_lifecycle_rider_from_a_certified_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WP-HERDR §6 AS AMENDED — the gate moved from the LOOP onto the rider.
+
+    The earlier shape skipped a certified terminal's whole iteration, so it was
+    never handed to ``pane_liveness.observe`` at all.  That over-served the rule:
+    the blueprint's own amendment says the pane fallback "is disabled for
+    lifecycle kinds only (vendor conditions, dialog cards and ``process.exited``
+    keep applying, exactly the kinds AC6 already exempts)", and §4's mapping puts
+    ``blocked -> nothing`` with "the 'who must answer what' fact stays with
+    ``question_state.py``".  So for a certified lane the PANE is the only
+    producer the dialog card and the vendor cap have, and the wholesale skip
+    silenced both (WP-ARCH 2b: it also silenced ``status.pane_classified``, whose
+    only other call site is ``_apply_detection`` — unreachable on herdr, which
+    starts no FIFO reader).
+
+    What the amendment actually forbids is a SECOND SOURCE FOR THE LIFECYCLE
+    FACT, and there are exactly two of those off this sample:
+    ``resync_from_pane_tail`` here and ``fuse_status``'s rules 3a/3b.  Both are
+    gated on the predicate directly, which is what this test pins.
+    """
     monkeypatch.setenv(herdr_runtime_gate.HERDR_RUNTIME_ENV_VAR, "1")
     herdr_runtime_gate.bind_terminal("certified", True)
     herdr_runtime_gate.bind_terminal("plain", False)
 
     from cli_agent_orchestrator.services import pane_liveness as pl_mod
     from cli_agent_orchestrator.services import stalled_callback_watchdog as mod
+    from cli_agent_orchestrator.services import status_monitor as sm_mod
 
     observed: list[str] = []
+    resynced: list[str] = []
+    classified: list[str] = []
+
+    class _Retained:
+        filtered_tail = "tail"
+
     # The watchdog imports ``pane_liveness`` inside the method, so the patch has
     # to land on the singleton in its own module, not on a watchdog attribute.
     monkeypatch.setattr(
         pl_mod.pane_liveness,
         "observe",
-        lambda terminal_id, now, monitor: observed.append(terminal_id),
+        lambda terminal_id, now, monitor: (observed.append(terminal_id), _Retained())[1],
+    )
+    monkeypatch.setattr(pl_mod.pane_liveness, "peek", lambda terminal_id, now=None: _Retained())
+    monkeypatch.setattr(
+        sm_mod.status_monitor,
+        "resync_from_pane_tail",
+        lambda terminal_id, tail, now=None: resynced.append(terminal_id),
+    )
+    monkeypatch.setattr(
+        sm_mod.status_monitor,
+        "classify_pane_sample",
+        lambda terminal_id, tail: classified.append(terminal_id),
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database.list_all_terminals",
         lambda: [{"id": "certified"}, {"id": "plain"}],
     )
     watchdog = mod.StalledCallbackWatchdog()
+    monkeypatch.setattr(watchdog, "_reconcile_question_marker", lambda terminal_id: None)
     watchdog.refresh_screen_fingerprints(now=0.0)
-    assert observed == ["plain"]
+
+    assert observed == ["certified", "plain"], "one sample per terminal, as before"
+    assert resynced == ["plain"], "the lifecycle rider is the one the amendment withholds"
+    assert classified == ["certified", "plain"], "dialog cards and vendor caps keep applying"

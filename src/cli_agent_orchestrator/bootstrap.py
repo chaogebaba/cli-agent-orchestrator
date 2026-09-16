@@ -69,10 +69,12 @@ from cli_agent_orchestrator.app.worker_truth.health import SourceHealth
 from cli_agent_orchestrator.app.worker_truth.projector import Projector, StaticSourceRegistry
 from cli_agent_orchestrator.app.worker_truth.publisher import StatusPublisher
 from cli_agent_orchestrator.app.worker_truth.sweep import ProjectorSweep
+from cli_agent_orchestrator.core.delivery import InjectionResult
 from cli_agent_orchestrator.core.ports import (
     Clock,
     EventStore,
     FindingStore,
+    PaneInjector,
     QueueStore,
     StateStore,
 )
@@ -83,7 +85,7 @@ from cli_agent_orchestrator.core.status_cutover import (
     parse_status_switch,
     resolve_status_switch,
 )
-from cli_agent_orchestrator.core.switches import Rejected
+from cli_agent_orchestrator.core.switches import Rejected, boot_switch_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +99,7 @@ __all__ = [
     "build_readonly_diag_stores",
     "build_readonly_gate_store",
     "current_runtime",
+    "herdr_delivery_enabled",
     "ingest_enabled",
     "shutdown_worker_truth",
     "start_worker_truth",
@@ -112,6 +115,20 @@ INGEST_ENV_VAR = "CAO_WORKER_TRUTH_INGEST"
 STATUS_ENV_VAR = "CAO_WORKER_TRUTH_STATUS"
 STATUS_PROVIDERS_ENV_VAR = "CAO_WORKER_TRUTH_STATUS_PROVIDERS"
 
+#: WP-HERDR Seam B's own switch (H2, blueprint §4 and §8's H2 row).  A FOURTH
+#: variable for the reason the third one exists: one master flag would couple a
+#: Seam B rollback to a phase-2 rollback, and each phase must be backable out on
+#: its own.
+#:
+#: It is deliberately NOT ``CAO_HERDR_RUNTIME``.  That one arms Seam A — whom to
+#: BELIEVE about a terminal's lifecycle — and this one arms Seam B — how to
+#: SUBMIT a prompt to it.  A deployment that wants herdr's lifecycle truth while
+#: keeping the composer paste is a coherent position and was H1's whole shipping
+#: story; folding the two into one variable would delete it.  Seam B does still
+#: require the certified-cohort half of ``herdr_lifecycle_authoritative``, which
+#: is a per-terminal fact rather than a switch position.
+HERDR_DELIVERY_ENV_VAR = "CAO_HERDR_DELIVERY"
+
 
 def ingest_enabled(env: dict[str, str] | None = None) -> bool:
     """True when ``CAO_WORKER_TRUTH_INGEST=1`` is set in the process environment.
@@ -122,6 +139,24 @@ def ingest_enabled(env: dict[str, str] | None = None) -> bool:
     """
     source = os.environ if env is None else env
     return source.get(INGEST_ENV_VAR) == "1"
+
+
+def herdr_delivery_enabled(env: dict[str, str] | None = None) -> bool:
+    """Is WP-HERDR Seam B armed for this process?
+
+    Default OFF, strictly ``"1"``, through the shared
+    :func:`~core.switches.boot_switch_enabled` idiom.  OFF is not a degraded
+    mode: with this unset, ``_build_delivery_tick`` wires the bare
+    ``PaneWorkerInjector`` it wired before H2 and the herdr injector is never
+    constructed, so the delivery path is byte-identical to ``ad4339e9``.
+
+    Read per call rather than cached at import, matching
+    :func:`~utils.herdr_runtime_gate.herdr_runtime_enabled`: the composition root
+    reads it once at boot, and a test that sets the variable must not have to
+    reload a module.
+    """
+    source = os.environ if env is None else env
+    return boot_switch_enabled(HERDR_DELIVERY_ENV_VAR, source)
 
 
 def status_position(env: dict[str, str] | None = None) -> StatusPosition | Rejected:
@@ -374,18 +409,28 @@ def _build_sampler_tick() -> Callable[[Sequence[TerminalRef]], None]:
        rules 3a/3b read through ``peek``;
     2. ``status_monitor.resync_from_pane_tail`` (F521 D15) — the forced re-derive
        after a signalled stream drop, plus the low-frequency PROCESSING/ERROR
-       backstop, read off the tail the sample already retained;
-    3. the F507 question-marker reconcile — level-triggered, cheap, and
+       backstop, read off the tail the sample already retained.  Skipped for a
+       terminal whose lifecycle is authoritative from herdr (§6): it is the
+       pane's lifecycle move, and that cohort takes lifecycle from the source;
+    3. ``status_monitor.classify_pane_sample`` (WP-ARCH 2b) — D1c/D1f on a
+       backend that feeds no chunk pipeline.  Inert on tmux, where
+       ``_apply_detection`` already classifies on every chunk; on herdr it is the
+       ONLY driver of ``status.pane_classified``, ``usage.capped`` and
+       ``prompt.awaiting``/``prompt.answered``.  NOT gated on the herdr
+       predicate — none of those three is a lifecycle kind, and the amendment
+       keeps dialog cards and vendor conditions coming from the pane even for a
+       certified terminal;
+    4. the F507 question-marker reconcile — level-triggered, cheap, and
        sampler-independent.
 
-    (3) still lives on the watchdog object as a private method, so it is called
+    (4) still lives on the watchdog object as a private method, so it is called
     defensively through ``getattr`` and skipped if it is gone.  Duplicating it
     here would mean a second copy of a transcript-walking heal in the composition
     root; the honest alternative is for 3c slice 4 to lift it to a service and
     for this call to follow it there.  Named to that lane.
 
     The ``peek`` guard is what makes this a hand-off rather than a second
-    sampler, and it gates ALL THREE consumers rather than only the capture.  A
+    sampler, and it gates ALL the riders rather than only the capture.  A
     fresh sample means another driver took it and is driving its riders; this
     tick then does nothing at all.  Only the tick that actually TAKES a sample
     drives the three things that read it — which is the watchdog's own shape,
@@ -413,6 +458,9 @@ def _build_sampler_tick() -> Callable[[Sequence[TerminalRef]], None]:
 
         from cli_agent_orchestrator.services.pane_liveness import pane_liveness
         from cli_agent_orchestrator.services.status_monitor import status_monitor
+        from cli_agent_orchestrator.utils.herdr_runtime_gate import (
+            herdr_lifecycle_authoritative,
+        )
 
         now = time.monotonic()
         for member in fleet:
@@ -429,9 +477,11 @@ def _build_sampler_tick() -> Callable[[Sequence[TerminalRef]], None]:
                     continue
                 retained = pane_liveness.peek(terminal_id, now=now)
                 if retained is not None:
-                    status_monitor.resync_from_pane_tail(
-                        terminal_id, retained.filtered_tail, now=now
-                    )
+                    if not herdr_lifecycle_authoritative(terminal_id):
+                        status_monitor.resync_from_pane_tail(
+                            terminal_id, retained.filtered_tail, now=now
+                        )
+                    status_monitor.classify_pane_sample(terminal_id, retained.filtered_tail)
                 _reconcile_question_marker(terminal_id)
             except Exception:
                 logger.debug("worker-truth: pane sample failed for %s", terminal_id, exc_info=True)
@@ -638,6 +688,103 @@ def _start_delivery(
     return True, store, tick
 
 
+class _CertifiedInjectorDispatch:
+    """One :class:`~core.ports.PaneInjector` that picks a carrier per terminal.
+
+    WP-HERDR §4 says Seam B's injector is "selected per certified terminal in the
+    one place adapters are named".  That place is this module — but
+    :class:`~app.delivery.wake.WakeService` holds ONE injector for ALL terminals
+    (``wake.py:117``/``:123``), so "per terminal" is not expressible by handing it
+    a different object.  The 2026-09-16 amendment (3) resolves it here: a
+    dispatching implementation of the SAME port, built in the composition root,
+    that answers the certification question inside ``inject()`` and delegates.
+
+    Three properties this shape has that the rejected alternative does not.  The
+    alternative was widening ``WakeService.__init__`` to take a factory:
+
+    * the port is unchanged, so ``app`` learns nothing new about terminals;
+    * ``app/delivery/wake.py`` is not edited at all, so H2 does not collide with
+      the ACP plane's own edit to that file (audit F4);
+    * both carriers are still NAMED only here, which is what
+      ``adapters-only-via-composition-root`` and this module's own rule are for.
+
+    **The herdr injector is built LAZILY and only once**, on the first certified
+    terminal.  With the switch off — the default — ``factory`` is never called
+    and no herdr object exists in the process, so the delivery path is what it
+    was before H2 down to the object graph, not merely in behaviour.
+    """
+
+    def __init__(
+        self,
+        pane: PaneInjector,
+        factory: Callable[[], PaneInjector],
+        predicate: Callable[[str], bool],
+    ) -> None:
+        self._pane = pane
+        self._factory = factory
+        self._predicate = predicate
+        self._herdr: PaneInjector | None = None
+
+    def inject(self, *, terminal_id: str, line: str) -> InjectionResult:
+        if not self._predicate(terminal_id):
+            return self._pane.inject(terminal_id=terminal_id, line=line)
+        if self._herdr is None:
+            self._herdr = self._factory()
+        return self._herdr.inject(terminal_id=terminal_id, line=line)
+
+
+def _seam_b_selected(terminal_id: str) -> bool:
+    """Is THIS terminal on Seam B?
+
+    **The switch is NOT re-read here, and that is the r2 correction** (review r1
+    §1/§10.6).  r1 asked ``herdr_delivery_enabled()`` on every ``inject()``, an
+    ``os.environ`` lookup per injection, and the two readings disagreed about
+    what the position meant: unsetting the variable in a running process silently
+    moved every terminal back to paste, while setting it did nothing.
+
+    The switch is STRUCTURAL.  ``_build_injector`` reads it once at boot and
+    returns the bare paste injector when it is off, so this function is only ever
+    reached from inside a dispatch that exists because the switch was on.  Asking
+    again could only contradict the object graph.
+
+    What is left is the per-terminal half: the cell must carry a PASS
+    ``herdr_certification`` row — the D9 predicate, resolved once at terminal
+    create and cached by ``utils/herdr_runtime_gate`` so a position file edited
+    mid-run cannot move a live occupant between carriers (§8: never switch truth
+    sources mid-occupant; the same rule applies to switching its CARRIER).
+
+    Fail-closed: an unbound terminal or an unreadable answer keeps the composer
+    paste, which is the pre-H2 behaviour.  Reading the gate through a wrapped
+    import rather than at module scope keeps a boot that cannot import it on the
+    paste path instead of failing.
+    """
+    try:
+        from cli_agent_orchestrator.utils.herdr_runtime_gate import terminal_certified
+
+        return terminal_certified(terminal_id)
+    except Exception:  # noqa: BLE001 — an unanswerable predicate is "not certified"
+        logger.debug("herdr delivery: certification unreadable for %s", terminal_id, exc_info=True)
+        return False
+
+
+def _build_injector(
+    pane: PaneInjector,
+    herdr_factory: Callable[[], PaneInjector],
+    *,
+    predicate: Callable[[str], bool] | None = None,
+) -> PaneInjector:
+    """The injector the tick gets: the bare paste, or the dispatch.
+
+    With ``CAO_HERDR_DELIVERY`` unset this returns the SAME object
+    ``_build_delivery_tick`` passed before H2 — not a wrapper around it.  That is
+    the rollback property stated as code: switch off is not "the dispatch chooses
+    paste every time", it is that no dispatch exists.
+    """
+    if not herdr_delivery_enabled():
+        return pane
+    return _CertifiedInjectorDispatch(pane, herdr_factory, predicate or _seam_b_selected)
+
+
 def _build_delivery_tick(
     store: QueueStore,
     clock: Clock,
@@ -661,6 +808,7 @@ def _build_delivery_tick(
     """
     try:
         from cli_agent_orchestrator.services.queue_carrier import (
+            HerdrPromptInjector,
             LegacyInboxAdoption,
             LegacyReceiverDirectory,
             NativeSeatCarrier,
@@ -672,7 +820,7 @@ def _build_delivery_tick(
             store=store,
             directory=directory,
             carrier=NativeSeatCarrier(),
-            injector=PaneWorkerInjector(),
+            injector=_build_injector(PaneWorkerInjector(), HerdrPromptInjector),
             clock=clock,
         )
         return DeliveryTick(

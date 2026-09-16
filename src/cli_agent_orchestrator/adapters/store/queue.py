@@ -304,6 +304,38 @@ class SqliteQueueStore:
         :func:`~core.delivery.spends_attempt`, and a lease that expired with
         nothing recorded spends one because nothing was observed.
 
+        **One outcome does not come back at all: ``SUBMISSION_UNCERTAIN``**
+        (WP-HERDR Seam B, blueprint amendment (7)).  The text was handed to a
+        runtime that would not say whether the agent took it, so re-offering the
+        row is how the SAME id is submitted a second time — which is the one
+        thing a carrier that cannot see its own receipt must never do.  Its lease
+        is released like any other (an expired lease must not be left owned), but
+        ``available_at`` is pushed past ``dead_by``, which is the existing bound
+        the row already carries: ``claim`` filters on ``available_at <= now`` so
+        nothing can ever claim it again, and the ``dead_by`` sweep below reaps it
+        on the next tick after the deadline, as ``max_lifetime``.
+
+        **What it stops is a second SUBMISSION, not a second ANNOUNCEMENT**
+        (review r2 §7, which ran the probe).  A quarantined row is still
+        ``ready`` in the table, so the epoch digest composed for a LATER message
+        to the same receiver lists its id again.  That is the A2 at-least-once
+        contract and not this quarantine's business: the reviewer's control shows
+        a row taken to ``DELIVERED`` and left unacked behaves identically, and it
+        is true of the paste carrier too.  The hazard r1 found is the composer
+        CONCATENATION — a second ``agent.prompt`` carrying the same text — and no
+        second prompt is sent.  A reader who takes "never offered again" to mean
+        "the worker never hears about this id twice" has read more than is
+        written here, and that was never true of any carrier.
+
+        Why the deadline and not a new state: ``dead_by`` is stamped ONCE at
+        enqueue and is the row's whole life (D12), so a quarantine that ends
+        there adds no bound anyone has to reason about, needs no schema change,
+        and cannot outlive the row.  And the row stays SETTLEABLE the whole time
+        — ``settle_through`` ignores state and claim — so an uncertain submission
+        that did in fact land still closes normally when the worker drains its
+        mailbox.  Only a submission that was genuinely lost reaches the
+        dead-letter, which is exactly the residual the outcome names.
+
         Three ways a row can die here, and each is reported rather than counted:
 
         * the attempt budget ran out — ``max_attempts``;
@@ -327,6 +359,7 @@ class SqliteQueueStore:
         )
         reoffered = 0
         incremented = 0
+        quarantined = 0
         dead: list[DeadRow] = []
 
         with immediate_transaction(conn):
@@ -338,6 +371,15 @@ class SqliteQueueStore:
             for row in expired:
                 message = _row_to_message(row)
                 outcome = self._last_outcome_in(conn, message.msg_id, message.claim_id)
+                if outcome is AttemptOutcome.SUBMISSION_UNCERTAIN:
+                    conn.execute(
+                        "UPDATE delivery_msg SET state = 'ready', claim_id = claim_id + 1, "
+                        "available_at = ?, lease_owner = NULL, lease_expires_at = NULL "
+                        "WHERE msg_id = ? AND state = 'leased'",
+                        (_quarantine_until(message), message.msg_id),
+                    )
+                    quarantined += 1
+                    continue
                 spends = spends_attempt(outcome)
                 conn.execute(
                     "UPDATE delivery_msg SET state = 'ready', claim_id = claim_id + 1, "
@@ -375,7 +417,12 @@ class SqliteQueueStore:
                 self._kill(conn, message, reason=reason, now=now)
                 dead.append(_dead_row(message, reason))
 
-        return ReclaimResult(reoffered=reoffered, incremented=incremented, dead=tuple(dead))
+        return ReclaimResult(
+            reoffered=reoffered,
+            incremented=incremented,
+            quarantined=quarantined,
+            dead=tuple(dead),
+        )
 
     @staticmethod
     def _last_outcome_in(
@@ -1189,6 +1236,18 @@ def _row_to_message(row: sqlite3.Row) -> QueueMessage:
         created_at=parse_timestamp(row["created_at"]),
         terminated_at=_maybe_time(row["terminated_at"]),
     )
+
+
+def _quarantine_until(message: QueueMessage) -> str:
+    """The ``available_at`` that makes a row unclaimable for the rest of its life.
+
+    One second PAST ``dead_by``, not equal to it.  ``run_once`` reclaims before
+    it claims, so an equal stamp would already be safe — but the two comparisons
+    are ``dead_by <= now`` and ``available_at <= now``, and a caller that ever
+    claimed first would find the row on the tick that was about to reap it.  A
+    second of margin costs nothing and removes the ordering assumption.
+    """
+    return render_timestamp(datetime.fromtimestamp(message.dead_by.timestamp() + 1.0, tz=UTC))
 
 
 def _dead_reason_for(message: QueueMessage, *, now: datetime) -> DeadReason:

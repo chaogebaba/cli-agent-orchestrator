@@ -21,6 +21,7 @@ D4 mapping (code -> condition/status intent, resolved in the provider, NOT here)
     net_interrupted    -> NET_INTERRUPTED (reconnect + re-observe SAME conv once)
     proc_exited        -> PROC_EXITED
     access_denied      -> ERROR (unknown 403 fails closed, human-gated)
+    source_correlation -> ERROR (AC-33 pull-plane correlation failed)
 """
 
 from __future__ import annotations
@@ -62,6 +63,15 @@ class RunnerErrorCode(str, Enum):
 
     # --- Report integrity ---------------------------------------------------
     REPORT_INVALID = "report_invalid"
+
+    # --- Pull-plane correlation (D5/AC-33) ----------------------------------
+    #: The accepted answer could not be correlated to what the connector
+    #: actually served: missing audit, denied source, substituted digest, a
+    #: second access token, or the wrong conversation branch. Publication is
+    #: refused; there is no in-attempt recovery, because a retry would be a
+    #: second generation. Unmapped in the condition plane on purpose, so it
+    #: surfaces as a plain ERROR like the other integrity codes.
+    SOURCE_CORRELATION = "source_correlation"
 
 
 class DeliveryState(str, Enum):

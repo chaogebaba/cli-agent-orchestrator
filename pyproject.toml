@@ -87,6 +87,13 @@ dependencies = [
     "markdown-it-py>=4.0.0",
     # not just a dev dependency — or every `cao` command would fail to import.
     "psutil>=5.9.0,<7",
+    # F862 Amendment D's one-shot origin sender. 0.13.0 is the posture measured
+    # by the pinned browser replay probes; newer impersonation tables are not
+    # silently accepted by this lane without a new live calibration.
+    "curl-cffi==0.13.0",
+    # F862 Amendment D workspace connector: gitignore-semantics matcher used by
+    # workspace_connector/ignore_rules.py for manifest containment.
+    "pathspec>=0.12.0",
 ]
 
 [project.optional-dependencies]
@@ -400,6 +407,13 @@ dev = [
     # own pilot and must not be a permanently-skipped hole in the baseline.
     "textual>=8,<9",
     "import-linter>=2.3",
+    # F862 Amendment D AC-25: the real-browser disposition oracle
+    # (test/providers/test_f862_real_browser_oracle.py) drives a real Chromium
+    # page through the production route handler. The PYTHON package is a dev
+    # dep so the module imports and its skip reason is honest; the ~150 MB
+    # BROWSER build is deliberately NOT vendored, so the module skips itself on
+    # a machine that never ran `playwright install chromium`.
+    "playwright>=1.49",
 ]
 
 [tool.black]
@@ -442,6 +456,7 @@ markers = [
     "requires_git_object: test requires a specific git object reachable in the repo",
     "requires_tmux: test requires tmux on PATH",
     "serial_only: quarantined test that must run serial (xdist_group quarantine-serial)",
+    "browser_oracle: F862 Amendment D origin-receipt oracle. Needs a real Chromium (`uv run playwright install chromium`) and is ALSO e2e+slow, so the ordinary merge selection deselects it. The CI arm selects it explicitly with CAO_F862_REQUIRE_BROWSER=1, which turns an absent browser into a failure instead of a skip — see scripts/ci-f862-browser-oracle.sh",
     "xdist_group(name): pytest-xdist grouping mark; registered here so collection does not INTERNALERROR under -p no:xdist + --strict-markers (the plugin registers it only when loaded)",
 ]
 asyncio_mode = "strict"

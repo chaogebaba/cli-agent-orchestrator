@@ -19,6 +19,17 @@ live:
   A1's carrier is named without ambiguity.
 * :class:`PaneWorkerInjector` — D7's worker seam, unchanged, with legacy's two
   vetoes in force and a hard refusal for a supervisor-role target.
+* :class:`HerdrPromptInjector` — WP-HERDR Seam B, the SAME port for a certified
+  herdr cohort: the digest goes to the runtime's own ``agent.prompt`` instead of
+  being typed into a composer.  Fourth implementation in this module, which
+  wp-acp-plane §10 calls the intended shape.
+
+Why Seam B lands HERE and not under ``adapters/``: it needs the herdr transport
+leaf (``adapters/herdr/client.py``) AND two legacy facts — the CAO terminal's
+herdr pane id, which only ``backends`` can resolve, and the role probe.  An
+``adapters/`` home could not import either (``adapters-are-leaves``).  On the
+legacy side both are ordinary imports, and ``adapters/truth/herdr_runtime.py``
+records this same rule in its own comment.
 
 **Nothing here decides what a refusal MEANS.** Every reason string is passed up
 verbatim and classified by :func:`core.delivery.classify_wake_reason`, which is
@@ -53,6 +64,7 @@ __all__ = [
     "queue_owns_new_traffic",
     "queue_runtime",
     "write_through_enqueue",
+    "HerdrPromptInjector",
     "NativeSeatCarrier",
     "PaneWorkerInjector",
     "PersistentEnqueueRejection",
@@ -553,3 +565,202 @@ class PaneWorkerInjector:
                 detail=f"safety_unverified:{exc.__class__.__name__}",
             )
         return InjectionResult(outcome=AttemptOutcome.DELIVERED, detail="pane")
+
+
+# ---------------------------------------------------------------------------
+# WP-HERDR Seam B — the same port, a runtime submission instead of a paste.
+# ---------------------------------------------------------------------------
+
+
+def _herdr_client(socket_path: str) -> Any:
+    """The one place Seam B constructs a herdr transport.
+
+    A module-level function rather than an inline constructor so a test can
+    substitute the transport without a real unix socket, and so that a reader
+    grepping for "who opens a herdr connection on the delivery path" finds one
+    answer.  The import is deferred for the reason every import in this module
+    is: the composition root must be able to build the tick without pulling the
+    adapter tree in.
+    """
+    from cli_agent_orchestrator.adapters.herdr.client import HerdrClient
+
+    return HerdrClient(socket_path)
+
+
+def _run_blocking(coro: Any, timeout_s: float) -> Any:
+    """Run one coroutine to completion from a SYNCHRONOUS caller, on its own loop.
+
+    ``PaneInjector.inject`` is synchronous and is called from inside the server's
+    event loop (``DeliveryTick._run`` awaits nothing around ``run_once``), so
+    ``asyncio.run`` here would raise "cannot be called from a running event
+    loop" and ``run_coroutine_threadsafe`` onto that same loop would deadlock —
+    the loop is the thread that is blocked waiting.  A fresh thread with a fresh
+    loop is the one shape that works from both a live loop and a plain test.
+
+    A thread per injection rather than a pool: the tick serves receivers one at a
+    time at a ten-second cadence, so the rate is trivial, and a pool whose single
+    worker is stuck on a hung socket would stall every later injection behind it.
+    The thread is a daemon and is JOINED with a bound — a submission that
+    outlives its bound is reported, never waited on forever, and the delivery
+    tick keeps its liveness.
+
+    Blocking the loop for the duration is the pre-existing shape, not a new cost:
+    ``PaneWorkerInjector._send`` blocks it on ``send_prepared_input`` today.
+
+    **On the timeout path this LEAKS the thread, deliberately** (review r1
+    §10.7).  ``asyncio.run`` cannot be interrupted from outside, and the socket
+    work it is doing belongs to a loop this thread does not own, so the only ways
+    to reclaim it are to thread a cancellation token through every awaited call
+    or to kill the loop from under it.  Both are more machinery than the
+    condition deserves: the thread is a daemon, it holds one unix socket and one
+    reply buffer, it ends on its own as soon as herdr answers or its own socket
+    timeout fires (bounded by ``request_timeout_s``, which is well under this
+    join), and the process is the outer bound in the worst case.  What it must
+    NOT do is come back and write anything — it cannot: its result is dropped on
+    the floor by the join above, and the injector has held no per-terminal state
+    since r2, so a late thread has nothing to race with.
+    """
+    import asyncio
+
+    box: dict[str, Any] = {}
+
+    def runner() -> None:
+        try:
+            box["value"] = asyncio.run(coro)
+        except BaseException as exc:  # noqa: BLE001 — carried, not swallowed
+            box["error"] = exc
+
+    thread = threading.Thread(target=runner, name="herdr-inject", daemon=True)
+    thread.start()
+    thread.join(timeout_s)
+    if thread.is_alive():
+        raise TimeoutError(f"herdr submission did not finish within {timeout_s}s")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+class HerdrPromptInjector:
+    """Seam B: hand the digest to herdr's ``agent.prompt`` (WP-HERDR §4, H2-S3).
+
+    The same ``core.ports.PaneInjector`` the paste implements — the port is NOT
+    widened (wp-acp-plane §10 forbids it), so the A2 fenced owner calls one
+    method and never learns which carrier ran.
+
+    **The supervisor refusal is re-asserted at entry**, exactly as
+    :class:`PaneWorkerInjector` does and for the same reason: K8's kill is a
+    property of the call graph, and a dispatch defect that routed a seat row here
+    must be loud.  A herdr submission into a human's own pane would be worse than
+    a paste, not better, because the runtime would press Enter.
+
+    **The no-second-submission rule is NOT here, and that is the r2 correction.**
+    r1 implemented it as a per-TERMINAL block that cleared itself once the pane's
+    ``state_change_seq`` advanced, and review r1 §2 showed the property does not
+    hold: this injector is handed ``(terminal_id, line)`` and never learns a
+    ``msg_id``, the digest it submits covers MANY ids at once, and the clearing
+    condition — the pane moved — is the condition under which the first copy most
+    likely LANDED.  A stalled submission was therefore re-offered by ``reclaim``
+    and submitted a second time, journalled ``delivered``.
+
+    Blueprint amendment (7) rules the quarantine is PER ID and must hold through
+    ANY path, so it lives where ids exist: ``SqliteQueueStore.reclaim`` does not
+    return a row whose last outcome was ``SUBMISSION_UNCERTAIN`` to the claimable
+    pool at all.  That is strictly stronger than anything expressible here, and
+    it removes this class's marker, its lock and both of the wedges the marker
+    produced (review r1 §4) by construction rather than by another rule.
+
+    What remains here is a pure function of one call: resolve the pane, submit
+    once, project the answer.  No state between injections, so there is nothing
+    to wedge, nothing to persist, and nothing that a server restart forgets.
+    """
+
+    # -- the port -----------------------------------------------------------
+
+    def inject(self, *, terminal_id: str, line: str) -> InjectionResult:
+        from cli_agent_orchestrator.services.mailbox_service import probe_supervisor_role
+
+        if probe_supervisor_role(terminal_id):
+            return InjectionResult(outcome=AttemptOutcome.PASTE_ATTEMPTED, detail="paste_attempted")
+
+        try:
+            target, socket_path = self._resolve(terminal_id)
+        except Exception as exc:  # noqa: BLE001
+            # No herdr pane for this terminal is the same fact the paste seam
+            # calls ``no_terminal``: nothing to write to, attempt budget.
+            logger.debug("herdr inject: no target for %s", terminal_id, exc_info=True)
+            return InjectionResult(
+                outcome=AttemptOutcome.PANE_ABSENT,
+                detail=f"herdr:no_target:{exc.__class__.__name__}",
+            )
+
+        try:
+            return self._submit(target, socket_path, line)
+        except TimeoutError:
+            # The submission outlived its own bound AFTER the request went out,
+            # so it may have landed: uncertain, not failed.  The store's
+            # quarantine is what stops the row being offered again.
+            return InjectionResult(
+                outcome=AttemptOutcome.SUBMISSION_UNCERTAIN, detail="herdr:inject_timeout"
+            )
+        except Exception as exc:  # noqa: BLE001 — a carrier may not raise into the tick
+            logger.debug("herdr inject failed for %s", terminal_id, exc_info=True)
+            return InjectionResult(
+                outcome=AttemptOutcome.VETO_UNVERIFIED,
+                detail=f"herdr:unverified:{exc.__class__.__name__}",
+            )
+
+    # -- internals ----------------------------------------------------------
+
+    @staticmethod
+    def _resolve(terminal_id: str) -> tuple[str, str]:
+        """The CAO terminal id to (herdr target, herdr socket path).
+
+        Two namespaces meet here and nowhere else.  The backend owns the pane
+        map — it is the thing that created the pane and the only code that can
+        rebuild the map from a snapshot — and it also owns which herdr SESSION
+        the server is running, which decides the socket.  Both come off the live
+        backend rather than from configuration, so a server started with
+        ``--terminal herdr --herdr-session X`` cannot be submitted to on session
+        ``cao``'s socket.
+        """
+        from cli_agent_orchestrator.adapters.herdr.client import default_socket_path
+        from cli_agent_orchestrator.backends.registry import get_backend
+        from cli_agent_orchestrator.services.terminal_service import get_terminal_metadata
+
+        backend = get_backend()
+        session = getattr(backend, "herdr_session", None)
+        if not isinstance(session, str):
+            raise RuntimeError("active terminal backend is not herdr")
+        metadata = get_terminal_metadata(terminal_id)
+        if not metadata:
+            raise ValueError(f"terminal {terminal_id} not found")
+        pane_id = backend.get_pane_id(
+            terminal_id, metadata.get("tmux_session", ""), metadata.get("tmux_window", "")
+        )
+        if not pane_id:
+            raise ValueError(f"terminal {terminal_id} has no herdr pane")
+        return pane_id, default_socket_path(session)
+
+    @staticmethod
+    def _submit(target: str, socket_path: str, line: str) -> InjectionResult:
+        """One submission, and the detail string passed through unchanged.
+
+        r1 wrote ``f"herdr:{submission.detail}"`` onto a detail the client had
+        already prefixed, so every live row read ``herdr:herdr:working`` (review
+        r1 §5/§10.4).  The client is now the single place the prefix is applied
+        — every detail it returns carries exactly one — which also makes
+        ``detail LIKE 'herdr:%'`` the exact predicate for "this row went through
+        Seam B", the observability the shared ``carrier=pane`` value costs.
+        """
+        from cli_agent_orchestrator.core.timing import (
+            DELIVERY_INJECT_BUDGET_S,
+            HERDR_PROMPT_WAIT_MS,
+        )
+
+        submission = _run_blocking(
+            _herdr_client(socket_path).prompt_agent(
+                target=target, text=line, wait_timeout_ms=HERDR_PROMPT_WAIT_MS
+            ),
+            DELIVERY_INJECT_BUDGET_S,
+        )
+        return InjectionResult(outcome=submission.outcome, detail=submission.detail)

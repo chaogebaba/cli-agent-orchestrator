@@ -3586,6 +3586,8 @@ async def create_terminal(
         if svc:
             try:
                 pane_id = get_backend().get_pane_id(terminal_id, session_name, window_name)
+                if pane_id is None:
+                    raise RuntimeError("herdr_pane_unresolved")
                 is_kiro = provider == ProviderType.KIRO_CLI.value
                 svc.register_terminal(terminal_id, pane_id, is_kiro)
             except Exception as e:

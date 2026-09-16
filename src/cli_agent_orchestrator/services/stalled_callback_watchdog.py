@@ -405,14 +405,28 @@ class StalledCallbackWatchdog:
         )
 
         for terminal_id in sample_ids:
-            if herdr_lifecycle_authoritative(terminal_id):
-                continue
+            # WP-ARCH 2b: the certified gate moved from the LOOP onto the one
+            # rider it is about. Skipping the whole iteration also skipped the
+            # classification pass, and on the herdr backend that pass is the ONLY
+            # producer of the dialog and vendor-cap kinds the §6 amendment says
+            # still apply from the pane for a certified terminal. What the
+            # amendment forbids is the pane moving a certified terminal's
+            # LIFECYCLE, which is `resync_from_pane_tail` here and rules 3a/3b in
+            # `fuse_status` — both now gated on the predicate themselves.
+            lifecycle_from_herdr = herdr_lifecycle_authoritative(terminal_id)
             observation = pane_liveness.observe(terminal_id, now=now, monitor=status_monitor)
             if observation is None:
                 continue
             retained = pane_liveness.peek(terminal_id, now=now)
             if retained is not None:
-                status_monitor.resync_from_pane_tail(terminal_id, retained.filtered_tail, now=now)
+                if not lifecycle_from_herdr:
+                    status_monitor.resync_from_pane_tail(
+                        terminal_id, retained.filtered_tail, now=now
+                    )
+                # WP-ARCH 2b D1c/D1f: a no-op on a pipe-pane backend, where
+                # `_apply_detection` already classifies on every chunk. It is the
+                # herdr path's only classification driver.
+                status_monitor.classify_pane_sample(terminal_id, retained.filtered_tail)
             self._reconcile_question_marker(terminal_id)
 
     def _reconcile_question_marker(self, terminal_id: str) -> None:
