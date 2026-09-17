@@ -189,6 +189,9 @@ class TestMcpConfig:
         assert server["env"]["CAO_TERMINAL_ID"] == "tABCDEF1"
         assert server["env"]["CAO_TERMINAL_TOKEN"] == "tok-abc"
         assert server["env"]["CAO_ENDPOINT"] == "http://127.0.0.1:8999"
+        from cli_agent_orchestrator.constants import local_agent_store_dir
+
+        assert server["env"]["CAO_HOME_DIR"] == str(local_agent_store_dir().parent.resolve())
         assert cfg["settings"]["requestTimeoutMs"] >= _PI_MCP_TIMEOUT_MS_FLOOR
 
     @patch("cli_agent_orchestrator.providers.pi_cli.get_provider_defaults")
@@ -215,9 +218,14 @@ class TestMcpConfig:
         # stdio transport: a command is launched, no url/file/pipe field.
         assert "command" in server and "url" not in server
         assert server["env"]["CAO_ENDPOINT"].startswith("http")
-        # No arg or env value routes delivery through /data or /tmp.
-        blob = json.dumps(server)
-        assert "/data" not in blob and "/tmp" not in blob
+        # No delivery argument or non-identity env value routes through /data or /tmp.
+        # CAO_HOME_DIR is intentionally an absolute store path (F1009), so it is
+        # excluded from this transport assertion.
+        assert all(
+            "/data" not in str(value) and "/tmp" not in str(value)
+            for key, value in server["env"].items()
+            if key != "CAO_HOME_DIR"
+        )
 
     def test_runtime_root_relocates_with_cao_home(self) -> None:
         """AC5: the config root derives from CAO_HOME_DIR (relocatable), never a

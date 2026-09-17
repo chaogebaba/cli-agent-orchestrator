@@ -536,9 +536,12 @@ class ClineCliProvider(BaseProvider):
         if terminal_token:
             env_block["CAO_TERMINAL_TOKEN"] = terminal_token
         # Forward endpoint so MCP server can reach the API
+        from cli_agent_orchestrator.constants import local_agent_store_dir
         from cli_agent_orchestrator.utils.http import resolve_endpoint
 
         env_block["CAO_ENDPOINT"] = resolve_endpoint()
+        # F1009: persisted MCP settings must follow the server's routing store.
+        env_block["CAO_HOME_DIR"] = str(local_agent_store_dir().parent.resolve())
         instance_id = os.environ.get("CAO_INSTANCE_ID", "")
         if instance_id:
             env_block["CAO_INSTANCE_ID"] = instance_id

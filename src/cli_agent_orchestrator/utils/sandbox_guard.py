@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from cli_agent_orchestrator.utils.persona_context import PersonaPlan
 
-IDENTITY_ENV_KEYS = ("CAO_TERMINAL_ID", "CAO_INSTANCE_ID", "CAO_ENDPOINT")
+IDENTITY_ENV_KEYS = ("CAO_TERMINAL_ID", "CAO_INSTANCE_ID", "CAO_ENDPOINT", "CAO_HOME_DIR")
 
 
 class SandboxMutationForbidden(RuntimeError):
@@ -36,17 +36,21 @@ def require_provider_admitted(provider: str) -> None:
 
 
 def bind_mcp_server_identity(config: dict[str, Any], terminal_id: str) -> dict[str, Any]:
-    """Force terminal, instance, and endpoint identity into an MCP config copy."""
+    """Force terminal, instance, endpoint, and store identity into an MCP config copy."""
     result = dict(config)
     if "command" not in result:
         return result
     env = dict(result.get("env") or {})
+    from cli_agent_orchestrator.constants import local_agent_store_dir
     from cli_agent_orchestrator.utils.http import resolve_endpoint
 
     expected = {
         "CAO_TERMINAL_ID": terminal_id,
         "CAO_INSTANCE_ID": os.environ.get("CAO_INSTANCE_ID", ""),
         "CAO_ENDPOINT": resolve_endpoint(),
+        # F1009: MCP children must compose cells from the server's store, even
+        # when the provider does not inherit the pane environment.
+        "CAO_HOME_DIR": str(local_agent_store_dir().parent.resolve()),
     }
     # F332: Forward CAO_TERMINAL_TOKEN so MCP servers can authenticate callbacks
     terminal_token = os.environ.get("CAO_TERMINAL_TOKEN", "")
@@ -70,12 +74,16 @@ def bind_pane_identity(
 ) -> dict[str, str]:
     """Force immutable terminal/instance affinity into a pane environment."""
     result = dict(environment or {})
+    from cli_agent_orchestrator.constants import local_agent_store_dir
     from cli_agent_orchestrator.utils.http import resolve_endpoint
 
     expected = {
         "CAO_TERMINAL_ID": terminal_id,
         "CAO_INSTANCE_ID": os.environ.get("CAO_INSTANCE_ID", ""),
         "CAO_ENDPOINT": resolve_endpoint(),
+        # F1009: carriers may predate this server and inherit a different home.
+        # Resolve before forwarding because a child can launch in another cwd.
+        "CAO_HOME_DIR": str(local_agent_store_dir().parent.resolve()),
     }
     # F138: inject incarnation token for process-bearing providers
     if incarnation_token is not None:

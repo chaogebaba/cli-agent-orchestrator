@@ -541,9 +541,13 @@ class PiCliProvider(BaseProvider):
         terminal_token = os.environ.get("CAO_TERMINAL_TOKEN", "")
         if terminal_token:
             env_block["CAO_TERMINAL_TOKEN"] = terminal_token
+        from cli_agent_orchestrator.constants import local_agent_store_dir
         from cli_agent_orchestrator.utils.http import resolve_endpoint
 
         env_block["CAO_ENDPOINT"] = resolve_endpoint()
+        # F1009: pi persists this MCP config and may launch it with a stale
+        # carrier environment; pin the server's routing store explicitly.
+        env_block["CAO_HOME_DIR"] = str(local_agent_store_dir().parent.resolve())
         instance_id = os.environ.get("CAO_INSTANCE_ID", "")
         if instance_id:
             env_block["CAO_INSTANCE_ID"] = instance_id

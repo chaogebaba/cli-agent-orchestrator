@@ -974,10 +974,13 @@ def test_emitted_plane_env_and_cross_instance_affinity(
         },
     )
     emitted = bind_pane_identity({}, "cafebabe")
+    from cli_agent_orchestrator.constants import local_agent_store_dir
+
     assert emitted == {
         "CAO_TERMINAL_ID": "cafebabe",
         "CAO_INSTANCE_ID": "deadbeef",
         "CAO_ENDPOINT": "http://127.0.0.1:19876",
+        "CAO_HOME_DIR": str(local_agent_store_dir().parent.resolve()),
         "CODEX_HOME": str(codex.home),
         "CLAUDE_CONFIG_DIR": str(claude_home),
     }
